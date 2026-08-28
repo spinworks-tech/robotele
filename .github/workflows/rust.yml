@@ -25,6 +25,10 @@ jobs:
         if: steps.flatc-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch v1.11.0 https://github.com/google/flatbuffers.git /tmp/flatbuffers-src
+          # v1.11.0's CMakeLists.txt hardcodes -Werror, which turns modern GCC's
+          # stricter warnings (e.g. -Wstringop-overflow on GCC 13) into build
+          # failures for this 2019-era codebase. Downgrade to non-fatal warnings.
+          sed -i -E 's/-Werror=/-W/g; s/-Werror\b//g' /tmp/flatbuffers-src/CMakeLists.txt
           cmake -S /tmp/flatbuffers-src -B /tmp/flatbuffers-build -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_TESTS=OFF
           cmake --build /tmp/flatbuffers-build --target flatc -j"$(nproc)"
           sudo install -m 755 /tmp/flatbuffers-build/flatc /usr/local/bin/flatc
@@ -50,6 +54,10 @@ jobs:
         if: steps.flatc-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch v1.11.0 https://github.com/google/flatbuffers.git /tmp/flatbuffers-src
+          # v1.11.0's CMakeLists.txt hardcodes -Werror, which turns modern GCC's
+          # stricter warnings (e.g. -Wstringop-overflow on GCC 13) into build
+          # failures for this 2019-era codebase. Downgrade to non-fatal warnings.
+          sed -i -E 's/-Werror=/-W/g; s/-Werror\b//g' /tmp/flatbuffers-src/CMakeLists.txt
           cmake -S /tmp/flatbuffers-src -B /tmp/flatbuffers-build -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_TESTS=OFF
           cmake --build /tmp/flatbuffers-build --target flatc -j"$(nproc)"
           sudo install -m 755 /tmp/flatbuffers-build/flatc /usr/local/bin/flatc
