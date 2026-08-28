@@ -30,6 +30,6 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install ruff
-        run: pip install ruff
+        run: pip install ruff==0.16.5
       - name: Ruff check (simulator, benchmark, replay tooling)
         run: ruff check simulator benchmark tools/replay
