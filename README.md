@@ -38,6 +38,37 @@ Existing internet protocols (TCP, WebSockets, gRPC, and standard WebRTC) were de
 
 ---
 
+## Supported Robot Profiles
+
+RoboProtocol doesn't hardcode a single robot's joint layout into the wire format. Each session starts with a `SESSION_DESCRIBE`/`SESSION_ACCEPT` exchange (Channel C) that negotiates a `RobotProfile` — the robot's degrees of freedom, body regions, per-region command semantics, and base morphology — which both endpoints then use to derive the same Channel B byte layout (see [Protocol Architecture § SESSION_DESCRIBE](docs/02-protocol-architecture.md#session_describe--session_accept--robot--media-profile)).
+
+### Base morphology types
+
+A profile declares one `BaseType` — a hardware fact, not a negotiable capability — that governs safety-relevant behavior like whether Whole-Body Controller balance override is meaningful and whether lateral velocity makes sense for the base:
+
+| Base type | Description |
+| --- | --- |
+| `Stationary` | Fixed-base manipulator, no locomotion at all. |
+| `WheeledStandard` | Differential/Ackermann drive — lateral motion not independently commandable. |
+| `WheeledHolonomic` | Mecanum/omni wheels — lateral motion independently commandable. |
+| `BipedLegs` | Two legs, dynamically balanced — WBC/ZMP balance override is load-bearing. |
+| `QuadrupedLegs` | Four or more legs, statically stable — WBC/ZMP balance override is a documented no-op. |
+| `Other` | A morphology not covered above (tracked, aerial, etc.) — reserved for forward compatibility. |
+
+### Per-region command shapes
+
+Each body region within a profile (an arm, a leg group, a wheeled base) also declares a `CommandShape`, since not every region is commanded the same way:
+
+- **`Kinematic`** — one command field per joint (direct per-joint targets).
+- **`VelocityAttitude`** — whole-robot body velocity/attitude (`vx`, `vy`, `turn`, `roll`, `pitch`, `yaw`). Shared across every region tagged this way rather than commanded per-region, since a legged or wheeled base doesn't have an independent velocity per leg or wheel.
+- **`CartesianEndEffector`** — target position + gripper, independently targetable per region (e.g. each arm of a dual-arm robot).
+
+### What ships today
+
+v0 ships exactly one concrete robot profile: the **XGO-Lite V2** quadruped (with the optional arm/gripper accessory) — 15 DoF across 5 regions (4 leg regions as `QuadrupedLegs`/`VelocityAttitude`, 1 arm region as `CartesianEndEffector`), streaming a single front-facing H.264 camera. See the [XGO-Lite V2 Guide](docs/06-xgo-lite-guide.md) to run it. Authoring new profiles for other hardware (a URDF + build-config pipeline, rather than a hand-written Rust constant) is on the roadmap — see [Design Review & Roadmap](docs/09-design-review-and-roadmap.md).
+
+---
+
 ## Documentation
 
 Browsable, organized documentation covering the protocol specification and the
