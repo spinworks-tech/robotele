@@ -12,8 +12,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install FlatBuffers compiler
-        run: sudo apt-get update && sudo apt-get install -y flatbuffers-compiler
+      - name: Cache flatc v1.11.0
+        id: flatc-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/flatc
+          key: flatc-1.11.0-${{ runner.os }}
+      - name: Build flatc v1.11.0 (matches Cargo.lock's flatbuffers = 0.7 crate)
+        if: steps.flatc-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v1.11.0 https://github.com/google/flatbuffers.git /tmp/flatbuffers-src
+          cmake -S /tmp/flatbuffers-src -B /tmp/flatbuffers-build -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_TESTS=OFF
+          cmake --build /tmp/flatbuffers-build --target flatc -j"$(nproc)"
+          sudo install -m 755 /tmp/flatbuffers-build/flatc /usr/local/bin/flatc
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run localhost integration smoke test
