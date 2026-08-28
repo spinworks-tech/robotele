@@ -25,7 +25,6 @@ If you're new here, read in this order:
 ```text
 RoboProtocol/
 ├── README.md              Project pitch and motivation
-├── REVIEW.md                Critical review and adoption roadmap
 ├── BENCHMARK.md            Network benchmarking runbook
 ├── LICENSE                  PolyForm Noncommercial License 1.0.0
 ├── docs/                    You are here — curated, browsable documentation

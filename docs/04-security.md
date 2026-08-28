@@ -84,7 +84,8 @@ current spec, and flagged in [Design Review & Roadmap](09-design-review-and-road
 
 - **No device discovery or pairing mechanism.** The protocol assumes the operator
   already knows the robot's address and both sides are already provisioned with
-  certificates — there's no mDNS/QR-code/NFC pairing flow defined yet.
+  certificates — there's no mDNS/QR-code/NFC pairing flow defined yet. Tracked in
+  [#2](https://github.com/spinworks-tech/robotele/issues/2).
 - **No cloud discovery / OAuth2 story** for remote WAN teleoperation.
 
 These are adoption gaps for a consumer product, not weaknesses in the cryptographic

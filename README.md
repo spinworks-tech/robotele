@@ -48,7 +48,6 @@ source of truth for exact spec wording.
 ## Repository Structure
 
 * [README.md](README.md): Project overview and motivation.
-* [REVIEW.md](REVIEW.md): Critical review identifying strengths, weaknesses, and a prioritized roadmap for consumer adoption.
 * [xgo_bridge/RUNME.md](xgo_bridge/RUNME.md): Operational runbook for running `robot-edge`/`operator-console` against a real XGO-Lite V2 — launching both sides, keybindings, and local recording.
 * [LICENSE](LICENSE): PolyForm Noncommercial License 1.0.0.
 

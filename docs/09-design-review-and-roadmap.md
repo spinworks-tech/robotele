@@ -1,9 +1,14 @@
 # Design Review & Roadmap
 
-Source of truth: `REVIEW.md` (a critical internal review) and `INTERLATENT.md` (a
-comparison against a competing open-source teleoperation SDK). Both are worth reading
-directly for full detail; this page summarizes the verdicts and tracks which gaps
-this repository has since closed.
+This page summarizes the verdicts of two internal documents — a critical review
+(formerly `REVIEW.md`) and a comparison against a competing open-source
+teleoperation SDK (`INTERLATENT.md`) — neither of which is part of this public
+repository, and tracks which gaps this repository has since closed. The items
+still open as of the review are tracked as GitHub issues/discussions:
+[#2](https://github.com/spinworks-tech/robotele/issues/2) (device discovery/pairing),
+[#3](https://github.com/spinworks-tech/robotele/issues/3) (ROS 2 bridge), and
+[#4](https://github.com/spinworks-tech/robotele/discussions/4) (shared autonomy
+semantics).
 
 ## What's genuinely novel
 
@@ -34,9 +39,9 @@ directly in `DESIGN.md`/`REQUIREMENTS.md` and this codebase:
 | P0 | No version negotiation or extension mechanism | **Addressed.** The `HELLO` capability handshake (`DESIGN.md` §1.2, `roboprotocol-core::hello`) does exactly this. |
 | P1 | QUIC not evaluated as a transport alternative | **Addressed and adopted.** The protocol is now built on QUIC (RFC 9000) + RFC 9221 datagrams throughout, implemented via `quiche` — see [Protocol Architecture](02-protocol-architecture.md). |
 | P0/P1 | No reference implementation — "only the original authors can implement it" | **Addressed for one hardware target.** `robot-edge`/`operator-console`/`xgo_bridge` are a real, running implementation against the XGO-Lite V2 — see [Reference Implementation](05-reference-implementation.md). Third-party interoperability (a second independent implementation) is still unproven. |
-| P1 | Define ROS2/DDS bridge specification | **Specified, not yet implemented.** `DESIGN.md`/`REQUIREMENTS.md` FR-5 defines the bridge; no `rclcpp` node exists in this codebase yet. |
-| P1 | No device discovery or pairing mechanism | **Partially addressed.** NAT traversal / relay fallback is now specified (`DESIGN.md` §1.4); mDNS/QR-code *pairing* (as opposed to path establishment to an already-known peer) is still open. |
-| P2 | No shared autonomy / AI-assisted control semantics | **Open.** `FR-4.1.2` names Semi-Autonomous Mode but the protocol semantics for autonomy-level negotiation remain undefined. |
+| P1 | Define ROS2/DDS bridge specification | **Specified, not yet implemented.** `DESIGN.md`/`REQUIREMENTS.md` FR-5 defines the bridge; no `rclcpp` node exists in this codebase yet. Tracked in [#3](https://github.com/spinworks-tech/robotele/issues/3). |
+| P1 | No device discovery or pairing mechanism | **Partially addressed.** NAT traversal / relay fallback is now specified (`DESIGN.md` §1.4); mDNS/QR-code *pairing* (as opposed to path establishment to an already-known peer) is still open. Tracked in [#2](https://github.com/spinworks-tech/robotele/issues/2). |
+| P2 | No shared autonomy / AI-assisted control semantics | **Open.** `FR-4.1.2` names Semi-Autonomous Mode but the protocol semantics for autonomy-level negotiation remain undefined. Discussed in [#4](https://github.com/spinworks-tech/robotele/discussions/4). |
 | P2 | Telesurgery (Class A) scope creep | **Resolved by simplification.** The current Task Class taxonomy runs B–E; a Class A medical extension profile is not part of the core spec. |
 | P2 | Publish a reference SDK | **In progress.** One Rust reference implementation exists; a second-language SDK doesn't yet. |
 | P3 | Submit to a standards body | **Not started.** |
