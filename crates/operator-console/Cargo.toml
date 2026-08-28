@@ -1,0 +1,23 @@
+[package]
+name = "operator-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+roboprotocol-core = { path = "../roboprotocol-core" }
+roboprotocol-proto = { path = "../roboprotocol-proto" }
+roboprotocol-recording = { path = "../roboprotocol-recording" }
+quiche = "0.22"
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "time", "io-util", "sync", "signal"] }
+flatbuffers = "0.7"
+crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.29"
+tokio-stream = "0.1"
+anyhow = "1"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+openh264 = "0.6"
+minifb = "0.27"

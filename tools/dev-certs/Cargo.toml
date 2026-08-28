@@ -1,0 +1,10 @@
+[package]
+name = "dev-certs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rcgen = { version = "0.13", features = ["pem"] }
+anyhow = "1"

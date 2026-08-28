@@ -1,0 +1,12 @@
+[package]
+name = "replay-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+roboprotocol-core = { path = "../../crates/roboprotocol-core" }
+roboprotocol-proto = { path = "../../crates/roboprotocol-proto" }
+flatbuffers = "0.7"
+anyhow = "1"

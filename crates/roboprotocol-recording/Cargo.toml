@@ -1,0 +1,12 @@
+[package]
+name = "roboprotocol-recording"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+roboprotocol-core = { path = "../roboprotocol-core" }
+
+[dev-dependencies]
+tempfile = "3"
