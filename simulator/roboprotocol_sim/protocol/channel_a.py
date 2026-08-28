@@ -19,7 +19,6 @@ import itertools
 import random
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
 
 from ..core.scheduler import Scheduler
 from ..network.failures import FailureTimeline

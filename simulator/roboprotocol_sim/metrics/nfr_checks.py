@@ -17,17 +17,14 @@ protocol defect.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import pandas as pd
 
 from ..protocol.safety_state_machine import (
     RESUME_STABILITY_WINDOW_S,
-    TASK_CLASS_THRESHOLDS,
     WATCHDOG_BLACKOUT_MS,
 )
 from ..protocol.sizing import HAPTIC_MIN_TIER
-from .collector import MetricsCollector
 
 
 @dataclass

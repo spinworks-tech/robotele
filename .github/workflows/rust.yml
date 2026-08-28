@@ -1,0 +1,39 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: Build & test workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (all crates and tools)
+        run: cargo build --workspace --all-targets --verbose
+      - name: Test
+        run: cargo test --workspace --verbose
+
+  lint:
+    name: Lint (fmt + clippy, advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+        continue-on-error: true

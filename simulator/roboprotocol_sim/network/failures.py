@@ -17,7 +17,7 @@ followed by a hard switch to the new NetworkProfile.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from .profiles import NetworkProfile

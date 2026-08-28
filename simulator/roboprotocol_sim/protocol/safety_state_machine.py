@@ -18,7 +18,7 @@ Two axes, evaluated concurrently and independently, matching the spec:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Optional
 

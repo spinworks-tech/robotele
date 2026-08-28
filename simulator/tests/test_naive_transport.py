@@ -1,4 +1,3 @@
-import pytest
 
 from roboprotocol_sim.core.scheduler import Scheduler
 from roboprotocol_sim.network.failures import FailureTimeline

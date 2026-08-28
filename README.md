@@ -1,5 +1,10 @@
 # RoboProtocol: Secure Low-Latency Robotic Teleoperation
 
+[![Rust CI](https://github.com/spinworks-tech/robotele/actions/workflows/rust.yml/badge.svg)](https://github.com/spinworks-tech/robotele/actions/workflows/rust.yml)
+[![Python CI](https://github.com/spinworks-tech/robotele/actions/workflows/python.yml/badge.svg)](https://github.com/spinworks-tech/robotele/actions/workflows/python.yml)
+[![Smoke Test](https://github.com/spinworks-tech/robotele/actions/workflows/smoke-test.yml/badge.svg)](https://github.com/spinworks-tech/robotele/actions/workflows/smoke-test.yml)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE)
+
 RoboProtocol is a specialized network protocol and safety architecture designed for real-time, high-fidelity teleoperation of physical systems, particularly humanoid robots and high-DoF manipulators.
 
 ## Why Design a Protocol Specifically for Robot Teleoperation?
