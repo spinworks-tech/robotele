@@ -4,6 +4,9 @@ Source of truth: `REQUIREMENTS.md` FR-9/NFR-6, `DESIGN.md` §10. Implemented in
 [`roboprotocol-recording`](05-reference-implementation.md#roboprotocol-recording-library),
 with playback/conversion tooling in `tools/replay-decode` and `tools/replay/`.
 
+A real captured session — raw `.rec` segments plus their converted MP4/CSV output —
+lives in [`docs/examples/recordings/`](examples/recordings/README.md).
+
 ## Design goal
 
 Both endpoints can independently record their own Channel A/B/C traffic to local
