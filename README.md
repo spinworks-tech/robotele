@@ -4,6 +4,7 @@
 [![Python CI](https://github.com/spinworks-tech/robotele/actions/workflows/python.yml/badge.svg)](https://github.com/spinworks-tech/robotele/actions/workflows/python.yml)
 [![Smoke Test](https://github.com/spinworks-tech/robotele/actions/workflows/smoke-test.yml/badge.svg)](https://github.com/spinworks-tech/robotele/actions/workflows/smoke-test.yml)
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/spinworks-tech/robotele?label=release)](https://github.com/spinworks-tech/robotele/releases/latest)
 
 RoboProtocol is a specialized network protocol and safety architecture designed for real-time, high-fidelity teleoperation of physical systems, particularly humanoid robots and high-DoF manipulators.
 
@@ -65,7 +66,7 @@ Each body region within a profile (an arm, a leg group, a wheeled base) also dec
 
 ### What ships today
 
-v0 ships exactly one concrete robot profile: the **[XGO-Lite V2](https://wiki.elecfreaks.com/en/pico/cm4-xgo-robot-kit/product-introduction/xgo-lite-v2-product-instruction/)** quadruped (with the optional arm/gripper accessory) — a Raspberry Pi CM4-based kit with 12 leg servos plus a 3-DoF Cartesian-commanded arm/gripper — 15 DoF across 5 regions (4 leg regions as `QuadrupedLegs`/`VelocityAttitude`, 1 arm region as `CartesianEndEffector`), streaming a single front-facing H.264 camera. See the [XGO-Lite V2 Guide](docs/06-xgo-lite-guide.md) to run it. Authoring new profiles for other hardware (a URDF + build-config pipeline, rather than a hand-written Rust constant) is on the roadmap — see [Design Review & Roadmap](docs/09-design-review-and-roadmap.md).
+v0 ships exactly one concrete robot profile: the **[XGO-Lite V2](https://wiki.elecfreaks.com/en/pico/cm4-xgo-robot-kit/product-introduction/xgo-lite-v2-product-instruction/)** quadruped (with the optional arm/gripper accessory) — a Raspberry Pi CM4-based kit with 12 leg servos plus a 3-DoF Cartesian-commanded arm/gripper — 15 DoF across 5 regions (4 leg regions as `QuadrupedLegs`/`VelocityAttitude`, 1 arm region as `CartesianEndEffector`), streaming a single front-facing H.264 camera. See the [XGO-Lite V2 Guide](docs/06-xgo-lite-guide.md) to run it — or skip building on the Pi entirely with the prebuilt `robot-edge` binary from the [latest release](https://github.com/spinworks-tech/robotele/releases/latest). Authoring new profiles for other hardware (a URDF + build-config pipeline, rather than a hand-written Rust constant) is on the roadmap — see [Design Review & Roadmap](docs/09-design-review-and-roadmap.md).
 
 ### Operator console, live
 

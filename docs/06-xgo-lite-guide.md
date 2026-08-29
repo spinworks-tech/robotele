@@ -78,6 +78,14 @@ If a *different* process holds the port, check what it is before killing it.
 
 ## 3. Sync + build on the Pi
 
+**Skip this step** if you just want to run the reference build: download
+`robot-edge-*-aarch64-unknown-linux-gnu.tar.gz` from the
+[latest release](https://github.com/spinworks-tech/robotele/releases/latest),
+`scp` it to the Pi, and run the extracted `robot-edge` binary directly — it's a
+static-ish, self-contained build (only `libc`/`libpthread`/`libdl`, all present on
+stock Raspberry Pi OS) cross-compiled for glibc ≤ 2.31, matching the stock XGO-Lite
+V2 image. Build from source instead if you've changed `crates/*` locally.
+
 `/home/pi/RoboProtocol` on the Pi is a plain directory, not a git clone — it doesn't
 auto-update. `deploy.sh pi@<ip> [--release]` handles this; by hand, after any local
 change to `crates/*` or `xgo_bridge/xgo_bridge.py`:
