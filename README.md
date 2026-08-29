@@ -78,6 +78,12 @@ The `operator-console` TUI against a real XGO-Lite V2 — telemetry, commands, a
 
 Left: the watchdog has latched an **E-Stop** (`robot=xgo_real`, 15 DoF, 50 Hz tick) — the banner, telemetry, and command panels are all driven by live Channel B/C traffic. Right: the same session `armed`, with the `--video-backend native` path open in a second window — Channel A's H.264 stream decoded via `openh264` and displayed directly, no external player required.
 
+An 8-second clip from the arm reaching for a ball, taken from the recorded Channel A stream in [`docs/examples/recordings/`](docs/examples/recordings/README.md) — the same overlays as above (crosshair, live fps/kbps, `capture_us`, arm x/z/claw state) are burned in by `tools/replay/convert_recordings.sh`:
+
+<p>
+  <img src="screenshots/xgo-lite-recording.gif" alt="An 8-second animated clip of the XGO-Lite V2's arm reaching down toward a blue ball on a table, decoded from a recorded Channel A session with crosshair, fps/kbps, capture_us, and arm x/z/claw overlays burned in." width="480">
+</p>
+
 ---
 
 ## Documentation
