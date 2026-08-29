@@ -65,7 +65,18 @@ Each body region within a profile (an arm, a leg group, a wheeled base) also dec
 
 ### What ships today
 
-v0 ships exactly one concrete robot profile: the **XGO-Lite V2** quadruped (with the optional arm/gripper accessory) — 15 DoF across 5 regions (4 leg regions as `QuadrupedLegs`/`VelocityAttitude`, 1 arm region as `CartesianEndEffector`), streaming a single front-facing H.264 camera. See the [XGO-Lite V2 Guide](docs/06-xgo-lite-guide.md) to run it. Authoring new profiles for other hardware (a URDF + build-config pipeline, rather than a hand-written Rust constant) is on the roadmap — see [Design Review & Roadmap](docs/09-design-review-and-roadmap.md).
+v0 ships exactly one concrete robot profile: the **[XGO-Lite V2](https://wiki.elecfreaks.com/en/pico/cm4-xgo-robot-kit/product-introduction/xgo-lite-v2-product-instruction/)** quadruped (with the optional arm/gripper accessory) — a Raspberry Pi CM4-based kit with 12 leg servos plus a 3-DoF Cartesian-commanded arm/gripper — 15 DoF across 5 regions (4 leg regions as `QuadrupedLegs`/`VelocityAttitude`, 1 arm region as `CartesianEndEffector`), streaming a single front-facing H.264 camera. See the [XGO-Lite V2 Guide](docs/06-xgo-lite-guide.md) to run it. Authoring new profiles for other hardware (a URDF + build-config pipeline, rather than a hand-written Rust constant) is on the roadmap — see [Design Review & Roadmap](docs/09-design-review-and-roadmap.md).
+
+### Operator console, live
+
+The `operator-console` TUI against a real XGO-Lite V2 — telemetry, commands, and per-channel wire rates all update live in the terminal:
+
+<p>
+  <img src="screenshots/xgo-lite-emergency.png" alt="operator-console TUI showing a tripped watchdog E-Stop: a full-width red 'E-STOPPED -- press c to clear' banner above live per-leg telemetry (battery 96%, roll/pitch/yaw, each leg's lower/middle/upper joint angles) and the Channel A/B/C rate panel." width="480">
+  <img src="screenshots/xgo-lite-tu-lite.png" alt="The same session armed (not E-Stopped), with a second 'RoboProtocol -- native video' window open showing Channel A's H.264 stream decoded in-process via openh264 and displayed directly -- the robot's live front-camera view of a table with a bowl and a ball." width="480">
+</p>
+
+Left: the watchdog has latched an **E-Stop** (`robot=xgo_real`, 15 DoF, 50 Hz tick) — the banner, telemetry, and command panels are all driven by live Channel B/C traffic. Right: the same session `armed`, with the `--video-backend native` path open in a second window — Channel A's H.264 stream decoded via `openh264` and displayed directly, no external player required.
 
 ---
 
