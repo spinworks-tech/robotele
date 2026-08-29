@@ -1,6 +1,7 @@
 mod action_trigger_handler;
 mod camera_control_handler;
 mod channel_b;
+mod gamepad;
 mod hello_handler;
 mod input;
 mod quic_client;

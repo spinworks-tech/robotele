@@ -180,6 +180,11 @@ pub struct HudState {
     /// `quic_client.rs`'s `DEFAULT_RECORD_CATEGORIES`.
     pub recording_active: bool,
     pub recording_started_at: Option<Instant>,
+    /// Mirrors `GamepadReader::is_connected` -- refreshed every tick (see
+    /// `Client::on_tick`), so unplugging/replugging a controller mid-session
+    /// shows up here without any other action. `false` under `--headless`
+    /// or if the platform gamepad backend couldn't initialize at all.
+    pub gamepad_connected: bool,
     /// Summed `CategoryStats::records_dropped` across the default
     /// categories, polled fresh each render -- the one visible signal
     /// that FR-9.3's "degrade under pressure, never block" behavior is
@@ -231,6 +236,7 @@ impl HudState {
             telemetry_last_seq: None,
             recording_active: false,
             recording_started_at: None,
+            gamepad_connected: false,
             recording_dropped: 0,
         }
     }
@@ -287,12 +293,13 @@ fn print_status_line(hud: &HudState) {
         _ => "--/--/--".to_string(),
     };
     print!(
-        "\rphase={} rtt={}ms estop={} battery={}% rpy={}    ",
+        "\rphase={} rtt={}ms estop={} battery={}% rpy={} gamepad={}    ",
         hud.phase.label(),
         rtt,
         hud.estopped,
         battery,
-        rpy
+        rpy,
+        hud.gamepad_connected
     );
     let _ = std::io::stdout().flush();
 }
@@ -409,6 +416,14 @@ fn recording_span(hud: &HudState) -> Span<'static> {
     }
 }
 
+fn gamepad_span(hud: &HudState) -> Span<'static> {
+    if hud.gamepad_connected {
+        Span::styled("gamepad: connected", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("gamepad: none", Style::default().fg(Color::DarkGray))
+    }
+}
+
 fn draw_header(f: &mut Frame, area: Rect, hud: &HudState) {
     let elapsed = hud.session_start.elapsed();
     let robot_line = match (&hud.robot_id, hud.dof_count) {
@@ -422,6 +437,8 @@ fn draw_header(f: &mut Frame, area: Rect, hud: &HudState) {
             Span::styled(hud.phase.label(), Style::default().fg(Color::Cyan)),
             Span::raw("  "),
             recording_span(hud),
+            Span::raw("  "),
+            gamepad_span(hud),
         ]),
         Line::from(format!(
             "{robot_line}  peer={} tick={}Hz  session={}s",

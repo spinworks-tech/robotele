@@ -24,6 +24,7 @@ use crate::action_trigger_handler;
 use crate::camera_control_handler;
 use crate::channel_b::{self, ChannelBCategory, ChannelBFrameData, TeleopCommand, ALL_REGIONS};
 use crate::hello_handler;
+use crate::gamepad::GamepadReader;
 use crate::input::{InputReader, TeleopInput};
 use crate::session_cache;
 use crate::session_handler::{self, SessionDescribeInfo};
@@ -295,6 +296,10 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         session_info: None,
         console: Console::init(args.headless),
         input: (!args.headless).then(InputReader::new),
+        // `GamepadReader::new()` itself returns `Option` (gamepad support
+        // is optional even when interactive -- see its doc), hence the
+        // `.flatten()` on top of headless's own `Option`.
+        gamepad: (!args.headless).then(GamepadReader::new).flatten(),
         video_rx: ChannelAReceiver::new(),
         video_tx,
         native_video_tx,
@@ -355,6 +360,9 @@ struct Client {
     phase: Phase,
     session_info: Option<SessionDescribeInfo>,
     input: Option<InputReader>,
+    /// `None` under `--headless` (same as `input`) or if the platform
+    /// gamepad backend couldn't initialize -- see `GamepadReader::new`.
+    gamepad: Option<GamepadReader>,
     video_rx: ChannelAReceiver,
     /// `watch`, not a queue -- see `playback.rs`'s module doc for why a
     /// queue in front of `ffplay` is exactly the unbounded-video-lag bug
@@ -436,23 +444,14 @@ impl Client {
                     self.console.render(&self.hud);
                 }
                 Some(input) = recv_input(&mut self.input) => {
-                    // Logged here, not in `on_input`, specifically so
-                    // `Quit` is captured too -- the arm below returns
-                    // early for it, before `on_input` ever runs.
-                    self.recorder.enqueue(
-                        roboprotocol_recording::Category::KeyPress,
-                        roboprotocol_recording::Record {
-                            capture_us: roboprotocol_core::timestamp::now_micros(),
-                            control_source: roboprotocol_core::recording::CONTROL_SOURCE_SENTINEL,
-                            payload: format!("{input:?}").into_bytes(),
-                        },
-                    );
-                    if matches!(input, TeleopInput::Quit) {
-                        let _ = self.conn.close(true, 0x0, b"operator quit");
-                        flush_once(&mut self.conn, &socket).await?;
+                    if self.dispatch_teleop_input(input, &socket).await? {
                         return Ok(());
                     }
-                    self.on_input(input);
+                }
+                Some(input) = recv_gamepad(&mut self.gamepad) => {
+                    if self.dispatch_teleop_input(input, &socket).await? {
+                        return Ok(());
+                    }
                 }
             }
 
@@ -505,6 +504,11 @@ impl Client {
                         }
                         None // nothing left to control while disconnected; keep retrying
                     }
+                    // Drain-only: the gamepad never emits `Quit` (see
+                    // `gamepad.rs`'s doc), so there's nothing to act on here
+                    // -- this just keeps its unbounded channel from piling
+                    // up held-stick refreshes for the length of the outage.
+                    _ = recv_gamepad(&mut self.gamepad) => None,
                 }
             };
 
@@ -539,6 +543,7 @@ impl Client {
                                 return Ok(false);
                             }
                         }
+                        _ = recv_gamepad(&mut self.gamepad) => {} // drain-only, see above
                     }
                 }
                 None => {} // input branch already handled above; loop back
@@ -850,6 +855,29 @@ impl Client {
         self.console.render(&self.hud);
     }
 
+    /// Shared by the keyboard and gamepad `select!` arms in `run` -- logs
+    /// the input (here rather than in `on_input`, specifically so `Quit`
+    /// is captured too, since the caller returns before `on_input` ever
+    /// sees it), then either starts a clean shutdown (`Quit`, returning
+    /// `Ok(true)` so the caller knows to exit the loop) or dispatches it.
+    async fn dispatch_teleop_input(&mut self, input: TeleopInput, socket: &UdpSocket) -> Result<bool> {
+        self.recorder.enqueue(
+            roboprotocol_recording::Category::KeyPress,
+            roboprotocol_recording::Record {
+                capture_us: roboprotocol_core::timestamp::now_micros(),
+                control_source: roboprotocol_core::recording::CONTROL_SOURCE_SENTINEL,
+                payload: format!("{input:?}").into_bytes(),
+            },
+        );
+        if matches!(input, TeleopInput::Quit) {
+            let _ = self.conn.close(true, 0x0, b"operator quit");
+            flush_once(&mut self.conn, socket).await?;
+            return Ok(true);
+        }
+        self.on_input(input);
+        Ok(false)
+    }
+
     fn on_input(&mut self, input: TeleopInput) {
         match input {
             TeleopInput::Move { vx, vy } => {
@@ -981,6 +1009,8 @@ impl Client {
             return;
         }
 
+        self.hud.gamepad_connected = self.gamepad.as_ref().is_some_and(GamepadReader::is_connected);
+
         // Refreshed every tick, ahead of the render that follows this
         // call in `run`'s select loop -- the one visible signal that
         // FR-9.3's "drop oldest under pressure, never block" is actually
@@ -1044,6 +1074,13 @@ impl Client {
 async fn recv_input(input: &mut Option<InputReader>) -> Option<TeleopInput> {
     match input {
         Some(input) => input.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn recv_gamepad(gamepad: &mut Option<GamepadReader>) -> Option<TeleopInput> {
+    match gamepad {
+        Some(gamepad) => gamepad.next().await,
         None => std::future::pending().await,
     }
 }
