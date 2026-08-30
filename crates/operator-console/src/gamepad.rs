@@ -15,37 +15,50 @@
 //! working exactly as before.
 //!
 //! Button mapping deliberately covers only the "main controls" -- move,
-//! turn, arm/claw nudge, body pitch nudge, stand/sit, recording, and
-//! E-Stop. Roll/yaw-twist attitude nudge and the camera image-quality
-//! controls (brightness/contrast/EV/shutter, minus a single reset) have no
-//! gamepad binding in this first cut -- they stay keyboard-only (see
-//! `input.rs`). `Quit` also has no gamepad binding on purpose: an
-//! accidental button press ending the session mid-teleop is worse than not
-//! having a shortcut for it; 'q'/Esc on the keyboard still works.
+//! turn, arm/claw nudge, roll/yaw/pitch nudge, stand/sit, recording, and
+//! E-Stop. The camera image-quality controls (brightness/contrast/EV/
+//! shutter, minus a single reset) have no gamepad binding -- they stay
+//! keyboard-only (see `input.rs`). `Quit` also has no gamepad binding on
+//! purpose: an accidental button press ending the session mid-teleop is
+//! worse than not having a shortcut for it; 'q'/Esc on the keyboard still
+//! works.
 //!
-//! E-Stop safety design: stopping is a single reachable combo (both
-//! bumpers held together), clearing it is a *different* two-hand combo
-//! (both stick clicks held together) -- asymmetric on purpose, so
-//! panic-stopping is as easy as a single gesture and resuming motion can't
-//! happen from one stray button press.
+//! E-Stop safety design: stopping is reachable two ways -- a single combo
+//! (both bumpers held together, which also nudge the claw individually,
+//! see below) or the Back button, which toggles Estop/EstopClear based on
+//! `Client.estopped` (see `TeleopInput::EstopToggle`'s doc -- this module
+//! has no view of that state itself, only the connected `Client` does).
+//! Clearing latches from the *bumper* combo specifically also works via
+//! pressing L3 into R3 (or vice versa) -- see `StickXMode`'s doc for why
+//! that's a press-into-an-already-held-button gesture rather than a
+//! "hold both" one.
 //!
 //! Layout (Xbox naming; `gilrs`'s `Button`/`Axis` are logical positions, so
 //! this maps identically on any SDL-recognized pad):
 //!   left stick        -> move (vx/vy)
-//!   right stick X     -> turn
-//!   right stick Y     -> body pitch nudge
+//!   right stick X     -> turn (default) / roll / yaw-twist, whichever
+//!                        `StickXMode` is currently latched (see its doc)
+//!   right stick Y     -> body pitch nudge (up = look up)
 //!   D-pad             -> arm nudge (up/down = Z, left/right = X)
-//!   LT / RT           -> claw open / close
-//!   A / B             -> stand / sit
+//!   LB / RB           -> claw open / close; held together -> E-Stop
+//!   A                 -> full neutral-pose reset (attitude + arm + claw,
+//!                        same values the console starts with at boot)
+//!   B                 -> attitude reset (level RPY only, same as Y)
 //!   X                 -> camera reset
-//!   Y                 -> attitude reset (level)
+//!   Y                 -> attitude reset (level, same as B)
 //!   Start             -> toggle recording
-//!   LB+RB held        -> E-Stop
-//!   L3+R3 held        -> E-Stop clear
+//!   Back              -> E-Stop toggle (Estop if clear, EstopClear if latched)
+//!   L3 / R3           -> latch right-stick-X mode to yaw / roll (press the
+//!                        active one again to return to turn); pressing
+//!                        one while the other is already held instead
+//!                        fires E-Stop clear (see `StickXMode`'s doc)
+//!
+//! Stand/sit have no gamepad binding as of this mapping -- A/B were
+//! reassigned to the resets above. Only keyboard '1'/'2' reach them.
 
 use crate::input::TeleopInput;
 use gilrs::{Axis, Button, EventType, Gilrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -54,13 +67,12 @@ use tokio::sync::mpsc;
 /// already applies each pad's own deadzone from its SDL mapping, this is a
 /// second, coarser guard against drift on cheap third-party pads.
 const STICK_DEADZONE: f32 = 0.15;
-const TRIGGER_DEADZONE: f32 = 0.1;
 
-/// How often held stick/trigger/D-pad deflection is re-sent so it doesn't
-/// go stale and get auto-zeroed by `quic_client.rs`'s `move_stale` (400ms
-/// default) -- `gilrs` only fires `AxisChanged`/`ButtonChanged` on value
-/// changes, unlike a held keyboard key, which the terminal keeps
-/// re-delivering via OS auto-repeat.
+/// How often held sticks/buttons are re-sent so a steady deflection or a
+/// held button doesn't go stale and get auto-zeroed by `quic_client.rs`'s
+/// `move_stale` (400ms default) -- `gilrs` only fires
+/// `AxisChanged`/`ButtonChanged` on value changes, unlike a held keyboard
+/// key, which the terminal keeps re-delivering via OS auto-repeat.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Matches `input.rs`'s w/s vx magnitude.
@@ -74,10 +86,45 @@ const TURN_SCALE: f32 = 60.0;
 /// over roughly a second of holding the stick over, the analog-stick
 /// equivalent of `input.rs`'s held-arrow-key auto-repeat ramp.
 const PITCH_TICK_STEP_DEG: f32 = 0.6;
+/// Roll/yaw-twist nudge applied per `REFRESH_INTERVAL` tick at full right
+/// stick X deflection, while L3 or R3 is held as a modifier (see the
+/// module doc's Layout) -- same proportional-ramp shape as
+/// `PITCH_TICK_STEP_DEG`, just on a different axis pair.
+const ROLL_YAW_TICK_STEP_DEG: f32 = 0.6;
 /// Matches `input.rs`'s `ARM_STEP_MM`.
 const ARM_STEP_MM: i16 = 10;
-/// Claw nudge applied per `REFRESH_INTERVAL` tick at full trigger pull.
+/// Claw nudge per LB/RB press or `REFRESH_INTERVAL` tick while held --
+/// matches `input.rs`'s `CLAW_STEP`... roughly (that one's 20, this is a
+/// bit gentler since a held bumper repeats fast).
 const CLAW_TICK_STEP: i8 = 8;
+
+/// What the right stick's X axis currently does -- latched by pressing L3
+/// or R3 (not held, see the module doc's Layout), since holding a
+/// stick-click down while also tilting that same stick sideways turned
+/// out to be an awkward simultaneous two-motion gesture on real hardware.
+/// Pressing the button for the mode that's already active returns to
+/// `Turn`; pressing one while the *other* is still physically held down
+/// instead fires E-Stop clear (see `handle_button_press`) rather than
+/// latching a mode, so that combo keeps working without a mode change as
+/// an unwanted side effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+enum StickXMode {
+    #[default]
+    Turn = 0,
+    Roll = 1,
+    Yaw = 2,
+}
+
+impl StickXMode {
+    fn label(self) -> &'static str {
+        match self {
+            StickXMode::Turn => "turn",
+            StickXMode::Roll => "roll",
+            StickXMode::Yaw => "yaw",
+        }
+    }
+}
 
 pub struct GamepadReader {
     rx: mpsc::UnboundedReceiver<TeleopInput>,
@@ -85,6 +132,12 @@ pub struct GamepadReader {
     /// connected/none" without threading a `TeleopInput` variant through
     /// just for connection status, which isn't a control at all.
     connected: Arc<AtomicBool>,
+    /// Mirrors the polling thread's `PadState.stick_x_mode` (as a
+    /// `StickXMode` discriminant) so the HUD can show which mode is
+    /// latched -- see `StickXMode`'s doc for why this needs showing at
+    /// all (it's sticky now, not something held down that's visibly
+    /// still being pressed).
+    stick_mode: Arc<AtomicU8>,
 }
 
 impl GamepadReader {
@@ -101,13 +154,15 @@ impl GamepadReader {
         };
         let initially_connected = gilrs.gamepads().any(|(_, g)| g.is_connected());
         let connected = Arc::new(AtomicBool::new(initially_connected));
+        let stick_mode = Arc::new(AtomicU8::new(StickXMode::default() as u8));
         let (tx, rx) = mpsc::unbounded_channel();
         let thread_connected = Arc::clone(&connected);
+        let thread_stick_mode = Arc::clone(&stick_mode);
         std::thread::Builder::new()
             .name("gamepad-poll".into())
-            .spawn(move || gamepad_thread(gilrs, tx, thread_connected))
+            .spawn(move || gamepad_thread(gilrs, tx, thread_connected, thread_stick_mode))
             .expect("spawning gamepad polling thread");
-        Some(Self { rx, connected })
+        Some(Self { rx, connected, stick_mode })
     }
 
     pub async fn next(&mut self) -> Option<TeleopInput> {
@@ -116,6 +171,16 @@ impl GamepadReader {
 
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    /// "turn"/"roll"/"yaw" -- whichever `StickXMode` the right stick's X
+    /// axis is currently latched to, for the HUD.
+    pub fn stick_mode_label(&self) -> &'static str {
+        match self.stick_mode.load(Ordering::Relaxed) {
+            1 => StickXMode::Roll.label(),
+            2 => StickXMode::Yaw.label(),
+            _ => StickXMode::Turn.label(),
+        }
     }
 }
 
@@ -127,19 +192,18 @@ struct PadState {
     left_y: f32,
     right_x: f32,
     right_y: f32,
-    left_trigger: f32,
-    right_trigger: f32,
     lb_held: bool,
     rb_held: bool,
     l3_held: bool,
     r3_held: bool,
+    stick_x_mode: StickXMode,
     dpad_up: bool,
     dpad_down: bool,
     dpad_left: bool,
     dpad_right: bool,
 }
 
-fn gamepad_thread(mut gilrs: Gilrs, tx: mpsc::UnboundedSender<TeleopInput>, connected: Arc<AtomicBool>) {
+fn gamepad_thread(mut gilrs: Gilrs, tx: mpsc::UnboundedSender<TeleopInput>, connected: Arc<AtomicBool>, stick_mode: Arc<AtomicU8>) {
     let mut state = PadState::default();
     loop {
         if tx.is_closed() {
@@ -150,7 +214,7 @@ fn gamepad_thread(mut gilrs: Gilrs, tx: mpsc::UnboundedSender<TeleopInput>, conn
                 EventType::Connected | EventType::Disconnected => {
                     connected.store(gilrs.gamepads().any(|(_, g)| g.is_connected()), Ordering::Relaxed);
                 }
-                other => handle_event(other, &mut state, &tx),
+                other => handle_event(other, &mut state, &tx, &stick_mode),
             }
         }
         send_refresh(&state, &tx);
@@ -158,7 +222,7 @@ fn gamepad_thread(mut gilrs: Gilrs, tx: mpsc::UnboundedSender<TeleopInput>, conn
     }
 }
 
-fn handle_event(event: EventType, state: &mut PadState, tx: &mpsc::UnboundedSender<TeleopInput>) {
+fn handle_event(event: EventType, state: &mut PadState, tx: &mpsc::UnboundedSender<TeleopInput>, stick_mode: &AtomicU8) {
     match event {
         EventType::AxisChanged(axis, value, _) => match axis {
             Axis::LeftStickX => state.left_x = value,
@@ -167,36 +231,52 @@ fn handle_event(event: EventType, state: &mut PadState, tx: &mpsc::UnboundedSend
             Axis::RightStickY => state.right_y = value,
             _ => {}
         },
-        EventType::ButtonChanged(Button::LeftTrigger2, value, _) => state.left_trigger = value,
-        EventType::ButtonChanged(Button::RightTrigger2, value, _) => state.right_trigger = value,
-        EventType::ButtonPressed(button, _) => handle_button_press(button, state, tx),
+        EventType::ButtonPressed(button, _) => handle_button_press(button, state, tx, stick_mode),
         EventType::ButtonReleased(button, _) => handle_button_release(button, state),
         _ => {}
     }
 }
 
-fn handle_button_press(button: Button, state: &mut PadState, tx: &mpsc::UnboundedSender<TeleopInput>) {
+fn handle_button_press(button: Button, state: &mut PadState, tx: &mpsc::UnboundedSender<TeleopInput>, stick_mode: &AtomicU8) {
     match button {
-        Button::South => send(tx, TeleopInput::Action(2)),  // stand -- matches '1' in input.rs
-        Button::East => send(tx, TeleopInput::Action(12)),  // sit -- matches '2' in input.rs
+        Button::South => send(tx, TeleopInput::NeutralPose), // green "A" button -- full reset to boot pose
+        Button::East => send(tx, TeleopInput::AttitudeReset), // level RPY only
         Button::West => send(tx, TeleopInput::CameraReset),
         Button::North => send(tx, TeleopInput::AttitudeReset),
         Button::Start => send(tx, TeleopInput::ToggleRecording),
+        // Back's actual E-Stop/clear choice needs `Client.estopped`, which
+        // this module can't see -- see `TeleopInput::EstopToggle`'s doc.
+        Button::Select => send(tx, TeleopInput::EstopToggle),
         Button::LeftTrigger => {
             state.lb_held = true;
+            send(tx, TeleopInput::ClawNudge { delta: -CLAW_TICK_STEP }); // LB: open
             check_estop_combo(state, tx);
         }
         Button::RightTrigger => {
             state.rb_held = true;
+            send(tx, TeleopInput::ClawNudge { delta: CLAW_TICK_STEP }); // RB: close
             check_estop_combo(state, tx);
         }
+        // See `StickXMode`'s doc: pressing into an already-held opposite
+        // stick-click fires E-Stop clear instead of latching a mode, so
+        // the two gestures (mode-toggle vs. clear-combo) don't collide.
         Button::LeftThumb => {
             state.l3_held = true;
-            check_estop_clear_combo(state, tx);
+            if state.r3_held {
+                send(tx, TeleopInput::EstopClear);
+            } else {
+                state.stick_x_mode = if state.stick_x_mode == StickXMode::Yaw { StickXMode::Turn } else { StickXMode::Yaw };
+                stick_mode.store(state.stick_x_mode as u8, Ordering::Relaxed);
+            }
         }
         Button::RightThumb => {
             state.r3_held = true;
-            check_estop_clear_combo(state, tx);
+            if state.l3_held {
+                send(tx, TeleopInput::EstopClear);
+            } else {
+                state.stick_x_mode = if state.stick_x_mode == StickXMode::Roll { StickXMode::Turn } else { StickXMode::Roll };
+                stick_mode.store(state.stick_x_mode as u8, Ordering::Relaxed);
+            }
         }
         Button::DPadUp => {
             state.dpad_up = true;
@@ -234,18 +314,12 @@ fn handle_button_release(button: Button, state: &mut PadState) {
 
 /// Fires E-Stop the instant both bumpers are held together -- a single
 /// reachable two-finger gesture, deliberately not gated on anything else.
+/// LB/RB still individually nudge the claw open/close on their own (see
+/// `handle_button_press`); this only adds the combo on top, it doesn't
+/// take away the individual action.
 fn check_estop_combo(state: &PadState, tx: &mpsc::UnboundedSender<TeleopInput>) {
     if state.lb_held && state.rb_held {
         send(tx, TeleopInput::Estop);
-    }
-}
-
-/// Clearing E-Stop needs a *different* combo (both stick clicks) so
-/// resuming motion can't happen from the same gesture, or a stray single
-/// button, that just stopped it.
-fn check_estop_clear_combo(state: &PadState, tx: &mpsc::UnboundedSender<TeleopInput>) {
-    if state.l3_held && state.r3_held {
-        send(tx, TeleopInput::EstopClear);
     }
 }
 
@@ -265,10 +339,16 @@ fn send_refresh(state: &PadState, tx: &mpsc::UnboundedSender<TeleopInput>) {
         send(tx, TeleopInput::Move { vx, vy });
     }
     if state.right_x.abs() > STICK_DEADZONE {
-        // input.rs: Left-arrow (turn left) = +turn, Right-arrow = -turn.
-        // gilrs' right-stick +X is physically right, so turning right
-        // (stick right) needs a negative turn value.
-        send(tx, TeleopInput::Turn { turn: -state.right_x * TURN_SCALE });
+        match state.stick_x_mode {
+            // Confirmed on real hardware 2026-08-30: needs the opposite
+            // sign from roll's below to feel right.
+            StickXMode::Yaw => send(tx, TeleopInput::AttitudeNudge { axis: 'y', delta: -state.right_x * ROLL_YAW_TICK_STEP_DEG }),
+            StickXMode::Roll => send(tx, TeleopInput::AttitudeNudge { axis: 'r', delta: state.right_x * ROLL_YAW_TICK_STEP_DEG }),
+            // input.rs: Left-arrow (turn left) = +turn, Right-arrow =
+            // -turn. gilrs' right-stick +X is physically right, so
+            // turning right (stick right) needs a negative turn value.
+            StickXMode::Turn => send(tx, TeleopInput::Turn { turn: -state.right_x * TURN_SCALE }),
+        }
     }
     if state.right_y.abs() > STICK_DEADZONE {
         // input.rs: Up-arrow (look up) sends a *negative* pitch delta
@@ -277,13 +357,11 @@ fn send_refresh(state: &PadState, tx: &mpsc::UnboundedSender<TeleopInput>) {
         // mirrors that same inversion.
         send(tx, TeleopInput::AttitudeNudge { axis: 'p', delta: -state.right_y * PITCH_TICK_STEP_DEG });
     }
-    if state.left_trigger > TRIGGER_DEADZONE {
-        // LT = open, matching input.rs's 'u' (also an unverified polarity
-        // guess there -- see its comment).
-        send(tx, TeleopInput::ClawNudge { delta: -((state.left_trigger * CLAW_TICK_STEP as f32) as i8) });
+    if state.lb_held {
+        send(tx, TeleopInput::ClawNudge { delta: -CLAW_TICK_STEP }); // LB: open
     }
-    if state.right_trigger > TRIGGER_DEADZONE {
-        send(tx, TeleopInput::ClawNudge { delta: (state.right_trigger * CLAW_TICK_STEP as f32) as i8 });
+    if state.rb_held {
+        send(tx, TeleopInput::ClawNudge { delta: CLAW_TICK_STEP }); // RB: close
     }
     if state.dpad_up {
         send(tx, TeleopInput::ArmNudge { dx: 0, dz: ARM_STEP_MM });

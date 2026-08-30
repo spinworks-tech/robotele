@@ -23,6 +23,14 @@ pub enum TeleopInput {
     Action(u8),
     Estop,
     EstopClear,
+    /// Toggle E-Stop based on whatever `Client.estopped` currently is --
+    /// unlike `Estop`/`EstopClear` above, this is never emitted by
+    /// `InputReader` (the keyboard has dedicated 'e'/'c' keys, so it
+    /// already knows which one it means). It exists for `gamepad.rs`'s
+    /// Back button, which has no separate keys to dedicate and no view of
+    /// `Client.estopped` from its own polling thread -- `Client::on_input`
+    /// is what actually resolves this into a concrete `Estop`/`EstopClear`.
+    EstopToggle,
     /// Nudge the held arm position (mm) -- not a velocity, see
     /// `quic_client.rs`'s `Client.last_command` docs.
     ArmNudge { dx: i16, dz: i16 },
@@ -38,6 +46,12 @@ pub enum TeleopInput {
     /// nudge doesn't mean counting opposite-direction keypresses back to
     /// zero by hand.
     AttitudeReset,
+    /// Full reset to the same neutral pose `Client::run` starts with at
+    /// boot -- attitude level (like `AttitudeReset`) *and* arm/claw back
+    /// to their own neutral values (`arm_x`/`arm_z` 0, claw
+    /// `ARM_CLAW_NEUTRAL`). Never emitted by `InputReader` (no keyboard
+    /// key for it); `gamepad.rs`'s "A" button is the only source.
+    NeutralPose,
     /// Nudge a held camera image-quality control -- `param` is
     /// 'b'(rightness)/'c'(ontrast)/'v'(EV/exposure)/'s'(hutter), matching
     /// no particular wire field name, just this module's own dispatch key.

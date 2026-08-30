@@ -185,6 +185,12 @@ pub struct HudState {
     /// shows up here without any other action. `false` under `--headless`
     /// or if the platform gamepad backend couldn't initialize at all.
     pub gamepad_connected: bool,
+    /// Mirrors `GamepadReader::stick_mode_label` -- "turn"/"roll"/"yaw",
+    /// whichever `gamepad.rs`'s `StickXMode` is currently latched to.
+    /// Worth showing precisely because it's now sticky rather than held
+    /// (see `StickXMode`'s doc), so it can silently stay in roll/yaw mode
+    /// with nothing on the controller itself showing that.
+    pub gamepad_stick_mode: &'static str,
     /// Summed `CategoryStats::records_dropped` across the default
     /// categories, polled fresh each render -- the one visible signal
     /// that FR-9.3's "degrade under pressure, never block" behavior is
@@ -237,6 +243,7 @@ impl HudState {
             recording_active: false,
             recording_started_at: None,
             gamepad_connected: false,
+            gamepad_stick_mode: "turn",
             recording_dropped: 0,
         }
     }
@@ -293,13 +300,14 @@ fn print_status_line(hud: &HudState) {
         _ => "--/--/--".to_string(),
     };
     print!(
-        "\rphase={} rtt={}ms estop={} battery={}% rpy={} gamepad={}    ",
+        "\rphase={} rtt={}ms estop={} battery={}% rpy={} gamepad={} stick_mode={}    ",
         hud.phase.label(),
         rtt,
         hud.estopped,
         battery,
         rpy,
-        hud.gamepad_connected
+        hud.gamepad_connected,
+        hud.gamepad_stick_mode
     );
     let _ = std::io::stdout().flush();
 }
@@ -418,7 +426,12 @@ fn recording_span(hud: &HudState) -> Span<'static> {
 
 fn gamepad_span(hud: &HudState) -> Span<'static> {
     if hud.gamepad_connected {
-        Span::styled("gamepad: connected", Style::default().fg(Color::Green))
+        // Stick mode is latched, not held (see `StickXMode`'s doc), so
+        // it's shown unconditionally next to "connected" -- otherwise
+        // "roll"/"yaw" staying active with nothing pressed would be
+        // invisible until the operator wonders why the right stick isn't
+        // turning.
+        Span::styled(format!("gamepad: connected [{}]", hud.gamepad_stick_mode), Style::default().fg(Color::Green))
     } else {
         Span::styled("gamepad: none", Style::default().fg(Color::DarkGray))
     }

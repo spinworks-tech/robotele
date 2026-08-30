@@ -944,6 +944,19 @@ impl Client {
                 self.hud.attitude_p_cmd = 0.0;
                 self.hud.attitude_y_cmd = 0.0;
             }
+            // Arm/claw back to the same neutral values `Client::run`
+            // constructs `last_command` with at boot, plus a reused
+            // `AttitudeReset` for the level part -- see
+            // `TeleopInput::NeutralPose`'s doc.
+            TeleopInput::NeutralPose => {
+                self.last_command.arm_x = 0;
+                self.last_command.arm_z = 0;
+                self.last_command.claw = ARM_CLAW_NEUTRAL;
+                self.hud.arm_x = 0;
+                self.hud.arm_z = 0;
+                self.hud.claw = ARM_CLAW_NEUTRAL;
+                self.on_input(TeleopInput::AttitudeReset);
+            }
             TeleopInput::CameraNudge { param, delta } => {
                 match param {
                     'b' => {
@@ -990,6 +1003,11 @@ impl Client {
                 let _ = self.conn.dgram_send(&d.encode());
                 let _ = self.conn.stream_send(ESTOP_STREAM_ID, &d.encode(), false);
             }
+            // See `TeleopInput::EstopToggle`'s doc -- resolved here since
+            // this is the one place that actually knows `self.estopped`.
+            TeleopInput::EstopToggle => {
+                self.on_input(if self.estopped { TeleopInput::EstopClear } else { TeleopInput::Estop });
+            }
             TeleopInput::ToggleRecording => {
                 let new_state = !self.hud.recording_active;
                 for category in DEFAULT_RECORD_CATEGORIES {
@@ -1010,6 +1028,7 @@ impl Client {
         }
 
         self.hud.gamepad_connected = self.gamepad.as_ref().is_some_and(GamepadReader::is_connected);
+        self.hud.gamepad_stick_mode = self.gamepad.as_ref().map_or("turn", GamepadReader::stick_mode_label);
 
         // Refreshed every tick, ahead of the render that follows this
         // call in `run`'s select loop -- the one visible signal that
