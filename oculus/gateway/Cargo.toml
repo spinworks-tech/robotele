@@ -1,0 +1,26 @@
+[package]
+name = "oculus-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+roboprotocol-core = { path = "../../crates/roboprotocol-core" }
+roboprotocol-proto = { path = "../../crates/roboprotocol-proto" }
+quiche = "0.22"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
+flatbuffers = "0.7"
+anyhow = "1"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+openh264 = "0.8"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+tower-http = { version = "0.6", features = ["fs"] }
+futures-util = "0.3"
+rcgen = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -6,6 +6,7 @@ members = [
     "crates/roboprotocol-recording",
     "crates/robot-edge",
     "crates/operator-console",
+    "oculus/gateway",
     "tools/dev-certs",
     "tools/replay-decode",
 ]

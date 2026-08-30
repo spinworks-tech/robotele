@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>RoboProtocol Oculus Monitor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0d10; color: #d7dee5; font-family: system-ui, sans-serif; }
+    #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1rem; text-align: center; padding: 1rem; }
+    #enter-vr { font-size: 1.1rem; padding: 0.75rem 1.5rem; border-radius: 8px; border: 1px solid #3a4551; background: #1a2129; color: #d7dee5; cursor: pointer; }
+    #enter-vr:disabled { opacity: 0.5; cursor: default; }
+    #status { font-size: 0.9rem; color: #8a97a5; max-width: 32rem; }
+    canvas#preview { max-width: 90vw; max-height: 40vh; border: 1px solid #2a333d; border-radius: 4px; }
+    #hint { font-size: 0.8rem; color: #5c6773; }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <h1 style="margin:0 0 0.25rem 0; font-weight: 600;">RoboProtocol &mdash; Quest 2 Monitor</h1>
+    <div id="status">connecting to gateway&hellip;</div>
+    <canvas id="preview" width="640" height="360"></canvas>
+    <button id="enter-vr" disabled>Enter VR</button>
+    <div id="hint">Read-only telemetry + video monitor (Option 0, see discussion #12). No control path.</div>
+  </div>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three/build/three.module.js",
+        "three/addons/": "./vendor/three/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module" src="main.js"></script>
+</body>
+</html>
