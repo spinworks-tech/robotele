@@ -4,6 +4,7 @@
 //! no connection migration).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -158,6 +159,10 @@ pub struct ClientArgs {
     /// within this many ms -- see `Client::on_tick`'s staleness check.
     pub move_stale_ms: u64,
     pub recording: roboprotocol_recording::RecorderConfig,
+    /// Where `TeleopInput::SaveFrame` ('p'/gamepad Y) writes PNGs --
+    /// `<--record-dir>/screenshots/` if given, else `./screenshots/` (see
+    /// `main.rs`). Only consulted under `VideoBackend::Native`.
+    pub screenshot_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +284,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
                 let (child, tx, overlay) = playback::spawn_playback(&args.ffplay_bin, args.video_overlay)?;
                 (Some(child), Some(tx), None, overlay)
             }
-            VideoBackend::Native => (None, None, Some(native_playback::spawn_native_playback()), None),
+            VideoBackend::Native => (None, None, Some(native_playback::spawn_native_playback(args.screenshot_dir.clone())), None),
         }
     } else {
         (None, None, None, None)
@@ -1007,6 +1012,14 @@ impl Client {
             // this is the one place that actually knows `self.estopped`.
             TeleopInput::EstopToggle => {
                 self.on_input(if self.estopped { TeleopInput::EstopClear } else { TeleopInput::Estop });
+            }
+            TeleopInput::SaveFrame => {
+                match &self.native_video_tx {
+                    Some(tx) => tx.request_screenshot(),
+                    None => tracing::info!(
+                        "screenshot requested but not available (needs --video --video-backend native)"
+                    ),
+                }
             }
             TeleopInput::ToggleRecording => {
                 let new_state = !self.hud.recording_active;

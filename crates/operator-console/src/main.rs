@@ -144,7 +144,8 @@ impl Cli {
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
                          [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n\n\
                          Keys: w/a/s/d move, left/right turn, space stop, i/j/k/l arm, u/o claw,\n  \
-                         1 stand, 2 sit, e E-Stop, c clear, r start/stop recording, q quit.\n\
+                         1 stand, 2 sit, e E-Stop, c clear, r start/stop recording, p save video\n  \
+                         frame, q quit.\n\
                          Movement keys set a held velocity (XGO's own move_x/move_y/turn are continuous\n  \
                          setpoints, not one-shot moves) -- if no movement key event refreshes it within\n  \
                          --move-stale-ms (default 400, relies on your terminal's normal key-repeat-while-held\n  \
@@ -162,7 +163,10 @@ impl Cli {
                          with this flag on, so leave it off rather than guess.\n\
                          --video-backend native decodes in-process (openh264 + minifb) instead of\n  \
                          spawning ffplay -- experimental, and incompatible with --video-overlay (which\n  \
-                         is implemented as an ffplay-specific filter)."
+                         is implemented as an ffplay-specific filter). 'p' (save video frame) only works\n  \
+                         with --video-backend native -- ffplay decodes in its own subprocess, so there's\n  \
+                         no frame in this process to save; it's a harmless no-op otherwise. Saved PNGs go\n  \
+                         to <--record-dir>/screenshots/ if given, else ./screenshots/."
                     );
                     std::process::exit(0);
                 }
@@ -280,6 +284,11 @@ async fn main() -> Result<()> {
     // fields out of `cli` -- `recorder_config` borrows `cli` as a whole,
     // which a partially-moved-from `cli` can't satisfy.
     let recording = cli.recorder_config();
+    // Alongside the recording session's own output if one was requested,
+    // else a plain relative fallback -- see `ClientArgs::screenshot_dir`'s
+    // doc. Computed here (not in `recorder_config`) since it's independent
+    // of whether recording categories are configured at all.
+    let screenshot_dir = cli.record_dir.clone().map_or_else(|| PathBuf::from("screenshots"), |dir| dir.join("screenshots"));
 
     let args = ClientArgs {
         connect: cli.connect,
@@ -298,6 +307,7 @@ async fn main() -> Result<()> {
         demo_action: cli.demo_action,
         move_stale_ms: cli.move_stale_ms,
         recording,
+        screenshot_dir,
     };
 
     // Interactive mode enters the alternate screen inside `ui::Console`

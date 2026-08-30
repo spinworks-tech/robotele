@@ -15,13 +15,13 @@
 //! working exactly as before.
 //!
 //! Button mapping deliberately covers only the "main controls" -- move,
-//! turn, arm/claw nudge, roll/yaw/pitch nudge, stand/sit, recording, and
-//! E-Stop. The camera image-quality controls (brightness/contrast/EV/
-//! shutter, minus a single reset) have no gamepad binding -- they stay
-//! keyboard-only (see `input.rs`). `Quit` also has no gamepad binding on
-//! purpose: an accidental button press ending the session mid-teleop is
-//! worse than not having a shortcut for it; 'q'/Esc on the keyboard still
-//! works.
+//! turn, arm/claw nudge, roll/yaw/pitch nudge, stand/sit, recording,
+//! screenshot, and E-Stop. The camera image-quality controls (brightness/
+//! contrast/EV/shutter, minus a single reset) have no gamepad binding --
+//! they stay keyboard-only (see `input.rs`). `Quit` also has no gamepad
+//! binding on purpose: an accidental button press ending the session
+//! mid-teleop is worse than not having a shortcut for it; 'q'/Esc on the
+//! keyboard still works.
 //!
 //! E-Stop safety design: stopping is reachable two ways -- a single combo
 //! (both bumpers held together, which also nudge the claw individually,
@@ -45,7 +45,9 @@
 //!                        same values the console starts with at boot)
 //!   B                 -> attitude reset (level RPY only, same as Y)
 //!   X                 -> camera reset
-//!   Y                 -> attitude reset (level, same as B)
+//!   Y                 -> save video frame (PNG) -- only takes effect
+//!                        under `--video-backend native`, see
+//!                        `TeleopInput::SaveFrame`'s doc
 //!   Start             -> toggle recording
 //!   Back              -> E-Stop toggle (Estop if clear, EstopClear if latched)
 //!   L3 / R3           -> latch right-stick-X mode to yaw / roll (press the
@@ -242,7 +244,7 @@ fn handle_button_press(button: Button, state: &mut PadState, tx: &mpsc::Unbounde
         Button::South => send(tx, TeleopInput::NeutralPose), // green "A" button -- full reset to boot pose
         Button::East => send(tx, TeleopInput::AttitudeReset), // level RPY only
         Button::West => send(tx, TeleopInput::CameraReset),
-        Button::North => send(tx, TeleopInput::AttitudeReset),
+        Button::North => send(tx, TeleopInput::SaveFrame), // Y -- was a duplicate of B's attitude reset
         Button::Start => send(tx, TeleopInput::ToggleRecording),
         // Back's actual E-Stop/clear choice needs `Client.estopped`, which
         // this module can't see -- see `TeleopInput::EstopToggle`'s doc.

@@ -677,7 +677,7 @@ fn draw_channels_panel(f: &mut Frame, area: Rect, hud: &HudState) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect) {
-    let text = "w/a/s/d move | left/right turn | up/down (or =/-) pitch | [/] roll | ,/. yaw | 0 level attitude | b/B brightness f/F contrast v/V ev h/H shutter | 9 reset camera | space stop | i/j/k/l arm | u/o claw | 1 stand | 2 sit | e E-Stop | c clear | r record | q quit";
+    let text = "w/a/s/d move | left/right turn | up/down (or =/-) pitch | [/] roll | ,/. yaw | 0 level attitude | b/B brightness f/F contrast v/V ev h/H shutter | 9 reset camera | space stop | i/j/k/l arm | u/o claw | 1 stand | 2 sit | e E-Stop | c clear | r record | p screenshot | q quit";
     f.render_widget(Paragraph::new(text).style(Style::default().fg(Color::DarkGray)), area);
 }
 

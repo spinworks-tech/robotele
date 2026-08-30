@@ -20,6 +20,8 @@
 //! built from `std::sync` primitives instead of `tokio::sync` since this
 //! side of the channel is a synchronous thread, not an async task.
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -56,6 +58,9 @@ impl LatestSlot {
 pub struct NativeVideoTx {
     critical_tx: mpsc::Sender<Vec<u8>>,
     latest_delta: Arc<LatestSlot>,
+    /// Set by `request_screenshot`, cleared by the render thread once it's
+    /// saved the next frame it displays -- see that method's doc.
+    screenshot_requested: Arc<AtomicBool>,
 }
 
 impl NativeVideoTx {
@@ -72,26 +77,45 @@ impl NativeVideoTx {
             self.latest_delta.set(bytes);
         }
     }
+
+    /// Asks the render thread to save the next frame it displays as a PNG
+    /// under the `screenshot_dir` given to `spawn_native_playback`. Just
+    /// sets a flag rather than grabbing a frame synchronously here --
+    /// this call comes from the async `Client` side, which has no direct
+    /// access to the render thread's decoded pixel buffer (it lives on a
+    /// separate OS thread, see this module's doc). Coalesces naturally:
+    /// a second request before the first is serviced is a harmless no-op
+    /// overwrite of the same `true`.
+    pub fn request_screenshot(&self) {
+        self.screenshot_requested.store(true, Ordering::Relaxed);
+    }
 }
 
-pub fn spawn_native_playback() -> NativeVideoTx {
+pub fn spawn_native_playback(screenshot_dir: PathBuf) -> NativeVideoTx {
     let (critical_tx, critical_rx) = mpsc::channel();
     let latest_delta = Arc::new(LatestSlot::new());
     let render_delta = latest_delta.clone();
+    let screenshot_requested = Arc::new(AtomicBool::new(false));
+    let render_screenshot_requested = Arc::clone(&screenshot_requested);
 
     std::thread::Builder::new()
         .name("native-video-render".to_string())
         .spawn(move || {
-            if let Err(e) = render_loop(critical_rx, render_delta) {
+            if let Err(e) = render_loop(critical_rx, render_delta, render_screenshot_requested, screenshot_dir) {
                 tracing::warn!(error = %e, "native video render thread exited");
             }
         })
         .expect("spawning native-video-render thread");
 
-    NativeVideoTx { critical_tx, latest_delta }
+    NativeVideoTx { critical_tx, latest_delta, screenshot_requested }
 }
 
-fn render_loop(critical_rx: mpsc::Receiver<Vec<u8>>, latest_delta: Arc<LatestSlot>) -> anyhow::Result<()> {
+fn render_loop(
+    critical_rx: mpsc::Receiver<Vec<u8>>,
+    latest_delta: Arc<LatestSlot>,
+    screenshot_requested: Arc<AtomicBool>,
+    screenshot_dir: PathBuf,
+) -> anyhow::Result<()> {
     let mut decoder = Decoder::new().context("creating openh264 decoder")?;
     let mut window: Option<minifb::Window> = None;
     let mut rgb_buf: Vec<u8> = Vec::new();
@@ -113,6 +137,12 @@ fn render_loop(critical_rx: mpsc::Receiver<Vec<u8>>, latest_delta: Arc<LatestSlo
                 Ok(Some(image)) => {
                     display_frame(&image, &mut window, &mut rgb_buf, &mut pixel_buf)?;
                     displayed = true;
+                    // After `display_frame` so `rgb_buf` holds this exact
+                    // frame's pixels, not a stale one from before it.
+                    if screenshot_requested.swap(false, Ordering::Relaxed) {
+                        let (w, h) = image.dimensions();
+                        save_screenshot(&screenshot_dir, &rgb_buf, w, h);
+                    }
                 }
                 Ok(None) => {} // header-only NAL (e.g. bare SPS/PPS) -- no picture yet
                 Err(e) => tracing::warn!(error = %e, "openh264 decode error"),
@@ -158,4 +188,50 @@ fn display_frame(image: &DecodedYUV, window: &mut Option<minifb::Window>, rgb_bu
     }
 
     win.update_with_buffer(pixel_buf, w, h).context("presenting decoded frame")
+}
+
+/// Writes one already-decoded RGB8 frame out as a PNG, creating
+/// `dir` if it doesn't exist yet. Named by capture time (microseconds
+/// since epoch, matching `roboprotocol_core::recording`'s own convention
+/// for `capture_us`) so files sort chronologically with no counter to
+/// track. Logs and returns on any error rather than propagating -- a
+/// failed screenshot (e.g. a read-only `--record-dir`) shouldn't take
+/// down the render thread and the live video with it.
+fn save_screenshot(dir: &Path, rgb: &[u8], w: usize, h: usize) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, dir = %dir.display(), "failed to create screenshot directory");
+        return;
+    }
+    let path = dir.join(format!("{}.png", roboprotocol_core::timestamp::now_micros()));
+    match image::save_buffer(&path, rgb, w as u32, h as u32, image::ColorType::Rgb8) {
+        Ok(()) => tracing::info!(path = %path.display(), "saved video frame"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "failed to save video frame"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saves_a_readable_png_creating_the_dir_if_needed() {
+        let base = tempfile::tempdir().unwrap();
+        // Not-yet-existing subdirectory, matching the real `--record-dir`
+        // case where `<dir>/screenshots/` doesn't exist until the first
+        // screenshot -- `save_screenshot` must create it.
+        let dir = base.path().join("screenshots");
+
+        let (w, h) = (4usize, 3usize);
+        let rgb = vec![200u8; w * h * 3];
+        save_screenshot(&dir, &rgb, w, h);
+
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(entries.len(), 1, "expected exactly one saved PNG");
+        let path = entries.into_iter().next().unwrap().unwrap().path();
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+
+        let decoded = image::open(&path).unwrap().into_rgb8();
+        assert_eq!((decoded.width(), decoded.height()), (w as u32, h as u32));
+        assert!(decoded.pixels().all(|p| p.0 == [200, 200, 200]));
+    }
 }

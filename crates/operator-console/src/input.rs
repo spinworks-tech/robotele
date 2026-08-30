@@ -2,7 +2,8 @@
 //! camera pitch, [/] roll, ,/. yaw twist, 0 reset attitude to level, b/f/v/h
 //! (shift = increase) brightness/contrast/exposure/shutter, 9 reset camera
 //! controls, space stop, e/c E-Stop/clear, 1/2 canned stand/sit actions,
-//! i/j/k/l arm, u/o claw, r start/stop recording, q quit). A stopgap
+//! i/j/k/l arm, u/o claw, r start/stop recording, p save video frame,
+//! q quit). A stopgap
 //! terminal UI, not NFR-2.3's fuller operator console.
 //!
 //! Each key press sets an absolute `vx`/`vy`/`turn`, not a delta -- there
@@ -65,6 +66,11 @@ pub enum TeleopInput {
     CameraReset,
     /// Nudge the held claw/gripper position (0-255).
     ClawNudge { delta: i8 },
+    /// Save the currently-displayed video frame to disk as a PNG -- only
+    /// takes effect with `VideoBackend::Native` (see `native_playback.rs`),
+    /// since that's the only path where a decoded frame ever exists in
+    /// this process; a no-op (with a log line) otherwise.
+    SaveFrame,
     /// Starts/stops local recording (FR-9) -- see `quic_client.rs`'s
     /// `on_input` handling for what the default toggled-on category set
     /// is.
@@ -187,6 +193,7 @@ impl InputReader {
                 KeyCode::Char('u') => TeleopInput::ClawNudge { delta: -CLAW_STEP },
                 KeyCode::Char('o') => TeleopInput::ClawNudge { delta: CLAW_STEP },
                 KeyCode::Char('r') => TeleopInput::ToggleRecording,
+                KeyCode::Char('p') => TeleopInput::SaveFrame,
                 KeyCode::Char('q') | KeyCode::Esc => TeleopInput::Quit,
                 _ => continue,
             };
