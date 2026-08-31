@@ -190,6 +190,33 @@ const RESUME_ESTABLISH_TIMEOUT: Duration = Duration::from_millis(1500);
 /// `Client::reconnect_until_success_or_quit`.
 const RECONNECT_ERROR_BACKOFF: Duration = Duration::from_millis(500);
 
+/// Independent, protocol-level-agnostic backstop on top of
+/// `conn.is_closed()`: if nothing has arrived from the peer for this long,
+/// force the connection closed and enter the reconnect path regardless of
+/// what quiche's own state says.
+///
+/// Why this exists at all: `max_idle_timeout` (both sides, 10s -- see
+/// `build_quiche_config`) is a *mutual* silence timeout per the QUIC spec
+/// -- it resets on any packet *sent* just as much as received. This
+/// client sends a Channel B command on every tick (`on_tick`) regardless
+/// of whether the peer is answering, so from quiche's perspective the
+/// connection is never idle even when the peer has gone completely dark;
+/// a truly dead peer is instead only caught by quiche's own loss-recovery/
+/// PTO backoff, which has no fixed bound and can legitimately take
+/// minutes of wall-clock time to give up. Confirmed on real hardware over
+/// a lossy Wi-Fi link 2026-08-31: `is_closed()` stayed `false` -- with the
+/// HUD showing a perfectly normal "operating" screen the whole time, no
+/// indication anything was wrong beyond a slowly climbing "last recv"
+/// counter -- for just over 3 minutes of total silence before a retried
+/// 0-RTT reconnect finally landed on its own.
+///
+/// Comfortably longer than `max_idle_timeout` so a connection that's
+/// genuinely idle in both directions (nobody touching the controls, robot
+/// still ticking telemetry back) still gets quiche's own -- much faster --
+/// detection first; this is purely a backstop for the "we're sending,
+/// they're not answering" case that mechanism doesn't cover.
+const RECV_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// One connection attempt: build config, generate a fresh SCID, connect,
 /// and optionally offer `session` for 0-RTT resumption. Returns the
 /// connection and whether a session was actually offered.
@@ -333,6 +360,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         demo_action: args.demo_action,
         last_move_input_at: None,
         move_stale: Duration::from_millis(args.move_stale_ms),
+        last_recv_at: std::time::Instant::now(),
         last_saved_session: None,
         args,
         recorder,
@@ -403,6 +431,10 @@ struct Client {
     /// has ever been pressed (nothing to go stale yet).
     last_move_input_at: Option<std::time::Instant>,
     move_stale: Duration,
+    /// Wall-clock time we last actually received *anything* from the
+    /// peer -- see `RECV_WATCHDOG_TIMEOUT`'s doc for why this exists
+    /// alongside `conn.is_closed()` rather than relying on it alone.
+    last_recv_at: std::time::Instant,
     /// Last TLS session ticket written to `.session-cache/` -- lets
     /// `after_recv` skip redundant disk writes when `conn.session()`
     /// hasn't actually changed since the last check.
@@ -431,6 +463,10 @@ impl Client {
             tokio::select! {
                 recv = socket.recv_from(&mut buf) => {
                     let (len, from) = recv.context("socket recv_from failed")?;
+                    // Any datagram at all, valid or not, is evidence the
+                    // peer (or at least the network path to it) is alive
+                    // -- see `RECV_WATCHDOG_TIMEOUT`'s doc.
+                    self.last_recv_at = std::time::Instant::now();
                     let info = quiche::RecvInfo { from, to: self.local_addr };
                     match self.conn.recv(&mut buf[..len], info) {
                         Ok(_) | Err(quiche::Error::Done) => {}
@@ -460,7 +496,22 @@ impl Client {
                 }
             }
 
-            if self.conn.is_closed() {
+            let recv_stale = !self.conn.is_closed() && self.last_recv_at.elapsed() > RECV_WATCHDOG_TIMEOUT;
+            if recv_stale {
+                // Force it: quiche's own idle-timeout/PTO machinery either
+                // hasn't caught this yet or won't for a long while longer
+                // -- see `RECV_WATCHDOG_TIMEOUT`'s doc. `close` schedules
+                // the local teardown so the `is_closed()` check just below
+                // picks it up through the exact same path as a normal
+                // quiche-detected closure, not a separate one.
+                tracing::warn!(
+                    silent_for_secs = self.last_recv_at.elapsed().as_secs(),
+                    "no packets from peer in too long, forcing connection closed"
+                );
+                let _ = self.conn.close(true, 0x1, b"recv watchdog: peer silent too long");
+            }
+
+            if self.conn.is_closed() || recv_stale {
                 self.hud.phase = ConnPhase::Closed;
                 self.hud.disconnected_at = Some(std::time::Instant::now());
                 self.hud.reconnect_attempts = 0;
@@ -527,6 +578,10 @@ impl Client {
                     self.hud.dof_count = None;
                     self.hud.camera_shape = None;
                     self.hud.disconnected_at = None;
+                    // Otherwise `RECV_WATCHDOG_TIMEOUT` could immediately
+                    // re-trip on this brand-new connection using a
+                    // timestamp from before the outage even started.
+                    self.last_recv_at = std::time::Instant::now();
                     tracing::info!("reconnected");
                     // Same deadlock hazard as the startup path in `run` --
                     // see its comment for why this call is needed here too.
