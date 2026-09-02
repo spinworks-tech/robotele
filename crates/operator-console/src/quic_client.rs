@@ -1097,6 +1097,7 @@ impl Client {
 
         self.hud.gamepad_connected = self.gamepad.as_ref().is_some_and(GamepadReader::is_connected);
         self.hud.gamepad_stick_mode = self.gamepad.as_ref().map_or("turn", GamepadReader::stick_mode_label);
+        self.hud.gamepad_arm_fine = self.gamepad.as_ref().is_some_and(GamepadReader::arm_fine_mode);
 
         // Refreshed every tick, ahead of the render that follows this
         // call in `run`'s select loop -- the one visible signal that

@@ -39,7 +39,13 @@
 //!   right stick X     -> turn (default) / roll / yaw-twist, whichever
 //!                        `StickXMode` is currently latched (see its doc)
 //!   right stick Y     -> body pitch nudge (up = look up)
-//!   D-pad             -> arm nudge (up/down = Z, left/right = X)
+//!   D-pad             -> arm nudge (up/down = Z, left/right = X), step
+//!                        size toggled coarse/fine by LT (see below)
+//!   LT                -> toggle D-pad arm nudge between coarse
+//!                        (`ARM_STEP_MM`) and fine (`ARM_STEP_FINE_MM`)
+//!                        step size -- a latch like `StickXMode`, not
+//!                        held, since it's operated by the same hand as
+//!                        the D-pad it modifies
 //!   LB / RB           -> claw open / close; held together -> E-Stop
 //!   A                 -> full neutral-pose reset (attitude + arm + claw,
 //!                        same values the console starts with at boot)
@@ -95,6 +101,9 @@ const PITCH_TICK_STEP_DEG: f32 = 0.6;
 const ROLL_YAW_TICK_STEP_DEG: f32 = 0.6;
 /// Matches `input.rs`'s `ARM_STEP_MM`.
 const ARM_STEP_MM: i16 = 10;
+/// D-pad arm nudge step while fine mode (LT toggle) is on -- 5x finer for
+/// precise positioning, e.g. lining the claw up on a small object.
+const ARM_STEP_FINE_MM: i16 = 2;
 /// Claw nudge per LB/RB press or `REFRESH_INTERVAL` tick while held --
 /// matches `input.rs`'s `CLAW_STEP`... roughly (that one's 20, this is a
 /// bit gentler since a held bumper repeats fast).
@@ -140,6 +149,10 @@ pub struct GamepadReader {
     /// all (it's sticky now, not something held down that's visibly
     /// still being pressed).
     stick_mode: Arc<AtomicU8>,
+    /// Mirrors the polling thread's `PadState.arm_fine_mode` -- same
+    /// reasoning as `stick_mode`: LT toggles it rather than requiring it
+    /// held, so it's sticky and needs showing on the HUD to stay visible.
+    arm_fine: Arc<AtomicBool>,
 }
 
 impl GamepadReader {
@@ -157,14 +170,16 @@ impl GamepadReader {
         let initially_connected = gilrs.gamepads().any(|(_, g)| g.is_connected());
         let connected = Arc::new(AtomicBool::new(initially_connected));
         let stick_mode = Arc::new(AtomicU8::new(StickXMode::default() as u8));
+        let arm_fine = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::unbounded_channel();
         let thread_connected = Arc::clone(&connected);
         let thread_stick_mode = Arc::clone(&stick_mode);
+        let thread_arm_fine = Arc::clone(&arm_fine);
         std::thread::Builder::new()
             .name("gamepad-poll".into())
-            .spawn(move || gamepad_thread(gilrs, tx, thread_connected, thread_stick_mode))
+            .spawn(move || gamepad_thread(gilrs, tx, thread_connected, thread_stick_mode, thread_arm_fine))
             .expect("spawning gamepad polling thread");
-        Some(Self { rx, connected, stick_mode })
+        Some(Self { rx, connected, stick_mode, arm_fine })
     }
 
     pub async fn next(&mut self) -> Option<TeleopInput> {
@@ -184,6 +199,12 @@ impl GamepadReader {
             _ => StickXMode::Turn.label(),
         }
     }
+
+    /// Whether the D-pad's arm nudge is currently in fine (LT-toggled)
+    /// step mode, for the HUD.
+    pub fn arm_fine_mode(&self) -> bool {
+        self.arm_fine.load(Ordering::Relaxed)
+    }
 }
 
 /// Cached analog/held state, since `gilrs` only reports *changes* -- see
@@ -199,13 +220,29 @@ struct PadState {
     l3_held: bool,
     r3_held: bool,
     stick_x_mode: StickXMode,
+    arm_fine_mode: bool,
     dpad_up: bool,
     dpad_down: bool,
     dpad_left: bool,
     dpad_right: bool,
 }
 
-fn gamepad_thread(mut gilrs: Gilrs, tx: mpsc::UnboundedSender<TeleopInput>, connected: Arc<AtomicBool>, stick_mode: Arc<AtomicU8>) {
+/// D-pad arm nudge magnitude for the current mode -- see `ARM_STEP_FINE_MM`.
+fn arm_step(state: &PadState) -> i16 {
+    if state.arm_fine_mode {
+        ARM_STEP_FINE_MM
+    } else {
+        ARM_STEP_MM
+    }
+}
+
+fn gamepad_thread(
+    mut gilrs: Gilrs,
+    tx: mpsc::UnboundedSender<TeleopInput>,
+    connected: Arc<AtomicBool>,
+    stick_mode: Arc<AtomicU8>,
+    arm_fine: Arc<AtomicBool>,
+) {
     let mut state = PadState::default();
     loop {
         if tx.is_closed() {
@@ -216,7 +253,7 @@ fn gamepad_thread(mut gilrs: Gilrs, tx: mpsc::UnboundedSender<TeleopInput>, conn
                 EventType::Connected | EventType::Disconnected => {
                     connected.store(gilrs.gamepads().any(|(_, g)| g.is_connected()), Ordering::Relaxed);
                 }
-                other => handle_event(other, &mut state, &tx, &stick_mode),
+                other => handle_event(other, &mut state, &tx, &stick_mode, &arm_fine),
             }
         }
         send_refresh(&state, &tx);
@@ -224,7 +261,7 @@ fn gamepad_thread(mut gilrs: Gilrs, tx: mpsc::UnboundedSender<TeleopInput>, conn
     }
 }
 
-fn handle_event(event: EventType, state: &mut PadState, tx: &mpsc::UnboundedSender<TeleopInput>, stick_mode: &AtomicU8) {
+fn handle_event(event: EventType, state: &mut PadState, tx: &mpsc::UnboundedSender<TeleopInput>, stick_mode: &AtomicU8, arm_fine: &AtomicBool) {
     match event {
         EventType::AxisChanged(axis, value, _) => match axis {
             Axis::LeftStickX => state.left_x = value,
@@ -233,14 +270,22 @@ fn handle_event(event: EventType, state: &mut PadState, tx: &mpsc::UnboundedSend
             Axis::RightStickY => state.right_y = value,
             _ => {}
         },
-        EventType::ButtonPressed(button, _) => handle_button_press(button, state, tx, stick_mode),
+        EventType::ButtonPressed(button, _) => handle_button_press(button, state, tx, stick_mode, arm_fine),
         EventType::ButtonReleased(button, _) => handle_button_release(button, state),
         _ => {}
     }
 }
 
-fn handle_button_press(button: Button, state: &mut PadState, tx: &mpsc::UnboundedSender<TeleopInput>, stick_mode: &AtomicU8) {
+fn handle_button_press(button: Button, state: &mut PadState, tx: &mpsc::UnboundedSender<TeleopInput>, stick_mode: &AtomicU8, arm_fine: &AtomicBool) {
     match button {
+        // LT -- was fully unmapped (claw moved to LB/RB, see the module
+        // doc); a toggle rather than a hold for the same reason as
+        // `StickXMode`'s L3/R3 -- holding LT while also pressing the
+        // D-pad with the same hand is an awkward simultaneous gesture.
+        Button::LeftTrigger2 => {
+            state.arm_fine_mode = !state.arm_fine_mode;
+            arm_fine.store(state.arm_fine_mode, Ordering::Relaxed);
+        }
         Button::South => send(tx, TeleopInput::NeutralPose), // green "A" button -- full reset to boot pose
         Button::East => send(tx, TeleopInput::AttitudeReset), // level RPY only
         Button::West => send(tx, TeleopInput::CameraReset),
@@ -282,19 +327,19 @@ fn handle_button_press(button: Button, state: &mut PadState, tx: &mpsc::Unbounde
         }
         Button::DPadUp => {
             state.dpad_up = true;
-            send(tx, TeleopInput::ArmNudge { dx: 0, dz: ARM_STEP_MM });
+            send(tx, TeleopInput::ArmNudge { dx: 0, dz: arm_step(state) });
         }
         Button::DPadDown => {
             state.dpad_down = true;
-            send(tx, TeleopInput::ArmNudge { dx: 0, dz: -ARM_STEP_MM });
+            send(tx, TeleopInput::ArmNudge { dx: 0, dz: -arm_step(state) });
         }
         Button::DPadLeft => {
             state.dpad_left = true;
-            send(tx, TeleopInput::ArmNudge { dx: -ARM_STEP_MM, dz: 0 });
+            send(tx, TeleopInput::ArmNudge { dx: -arm_step(state), dz: 0 });
         }
         Button::DPadRight => {
             state.dpad_right = true;
-            send(tx, TeleopInput::ArmNudge { dx: ARM_STEP_MM, dz: 0 });
+            send(tx, TeleopInput::ArmNudge { dx: arm_step(state), dz: 0 });
         }
         _ => {}
     }
@@ -366,16 +411,16 @@ fn send_refresh(state: &PadState, tx: &mpsc::UnboundedSender<TeleopInput>) {
         send(tx, TeleopInput::ClawNudge { delta: CLAW_TICK_STEP }); // RB: close
     }
     if state.dpad_up {
-        send(tx, TeleopInput::ArmNudge { dx: 0, dz: ARM_STEP_MM });
+        send(tx, TeleopInput::ArmNudge { dx: 0, dz: arm_step(state) });
     }
     if state.dpad_down {
-        send(tx, TeleopInput::ArmNudge { dx: 0, dz: -ARM_STEP_MM });
+        send(tx, TeleopInput::ArmNudge { dx: 0, dz: -arm_step(state) });
     }
     if state.dpad_left {
-        send(tx, TeleopInput::ArmNudge { dx: -ARM_STEP_MM, dz: 0 });
+        send(tx, TeleopInput::ArmNudge { dx: -arm_step(state), dz: 0 });
     }
     if state.dpad_right {
-        send(tx, TeleopInput::ArmNudge { dx: ARM_STEP_MM, dz: 0 });
+        send(tx, TeleopInput::ArmNudge { dx: arm_step(state), dz: 0 });
     }
 }
 

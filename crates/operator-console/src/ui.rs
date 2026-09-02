@@ -191,6 +191,10 @@ pub struct HudState {
     /// (see `StickXMode`'s doc), so it can silently stay in roll/yaw mode
     /// with nothing on the controller itself showing that.
     pub gamepad_stick_mode: &'static str,
+    /// Mirrors `GamepadReader::arm_fine_mode` -- whether the D-pad's arm
+    /// nudge is in fine-step mode (LT toggle). Same "sticky, needs
+    /// showing" reasoning as `gamepad_stick_mode`.
+    pub gamepad_arm_fine: bool,
     /// Summed `CategoryStats::records_dropped` across the default
     /// categories, polled fresh each render -- the one visible signal
     /// that FR-9.3's "degrade under pressure, never block" behavior is
@@ -244,6 +248,7 @@ impl HudState {
             recording_started_at: None,
             gamepad_connected: false,
             gamepad_stick_mode: "turn",
+            gamepad_arm_fine: false,
             recording_dropped: 0,
         }
     }
@@ -300,14 +305,15 @@ fn print_status_line(hud: &HudState) {
         _ => "--/--/--".to_string(),
     };
     print!(
-        "\rphase={} rtt={}ms estop={} battery={}% rpy={} gamepad={} stick_mode={}    ",
+        "\rphase={} rtt={}ms estop={} battery={}% rpy={} gamepad={} stick_mode={} arm_fine={}    ",
         hud.phase.label(),
         rtt,
         hud.estopped,
         battery,
         rpy,
         hud.gamepad_connected,
-        hud.gamepad_stick_mode
+        hud.gamepad_stick_mode,
+        hud.gamepad_arm_fine
     );
     let _ = std::io::stdout().flush();
 }
@@ -426,12 +432,13 @@ fn recording_span(hud: &HudState) -> Span<'static> {
 
 fn gamepad_span(hud: &HudState) -> Span<'static> {
     if hud.gamepad_connected {
-        // Stick mode is latched, not held (see `StickXMode`'s doc), so
-        // it's shown unconditionally next to "connected" -- otherwise
-        // "roll"/"yaw" staying active with nothing pressed would be
-        // invisible until the operator wonders why the right stick isn't
-        // turning.
-        Span::styled(format!("gamepad: connected [{}]", hud.gamepad_stick_mode), Style::default().fg(Color::Green))
+        // Stick mode and arm-fine mode are both latched, not held (see
+        // `StickXMode`'s and `ARM_STEP_FINE_MM`'s docs), so both are
+        // shown unconditionally next to "connected" -- otherwise either
+        // one staying active with nothing pressed would be invisible
+        // until it produces a confusingly wrong-feeling movement.
+        let arm = if hud.gamepad_arm_fine { ", arm:fine" } else { "" };
+        Span::styled(format!("gamepad: connected [{}{arm}]", hud.gamepad_stick_mode), Style::default().fg(Color::Green))
     } else {
         Span::styled("gamepad: none", Style::default().fg(Color::DarkGray))
     }
