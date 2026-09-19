@@ -31,7 +31,19 @@ struct Cli {
     bridge_script: PathBuf,
     stub_bridge: bool,
     serial_port: String,
+    /// The `xgo_bridge.py` subprocess's own hardware watchdog -- unrelated
+    /// to `estop_watchdog_ms` below (see its doc comment).
     watchdog_ms: f64,
+    /// Overrides `task_class`'s `watchdog_blackout_ms()` for the Channel B
+    /// command watchdog that latches E-Stop on the robot side (SR-4.1).
+    /// `None` keeps the existing task-class-derived default (200/300/400/
+    /// 500ms for B/C/D/E) exactly as before this flag existed -- this is a
+    /// distinct system from `watchdog_ms` above (the bridge subprocess's
+    /// own watchdog against the serial link), which this does not affect.
+    /// Intended for links known to be jitterier than the task class
+    /// assumes (e.g. an isolated demo AP) -- loosening it trades off how
+    /// fast the robot safety-stops on a real command dropout.
+    estop_watchdog_ms: Option<f64>,
     enable_camera: bool,
     camera_bin: String,
     record_dir: Option<PathBuf>,
@@ -74,6 +86,7 @@ impl Cli {
         // Matches xgo_bridge.py's default -- see that file's module
         // docstring for why 150ms fired spuriously on real hardware.
         let mut watchdog_ms = 400.0f64;
+        let mut estop_watchdog_ms: Option<f64> = None;
         let mut enable_camera = false;
         let mut camera_bin = "libcamera-vid".to_string();
         let mut record_dir = None;
@@ -106,6 +119,7 @@ impl Cli {
                 "--stub-bridge" => stub_bridge = true,
                 "--serial-port" => serial_port = it.next().context("--serial-port needs a value")?,
                 "--watchdog-ms" => watchdog_ms = it.next().context("--watchdog-ms needs a value")?.parse()?,
+                "--estop-watchdog-ms" => estop_watchdog_ms = Some(it.next().context("--estop-watchdog-ms needs a value")?.parse()?),
                 "--camera" => enable_camera = true,
                 "--camera-bin" => camera_bin = it.next().context("--camera-bin needs a value")?,
                 "--record-dir" => record_dir = Some(PathBuf::from(it.next().context("--record-dir needs a value")?)),
@@ -127,6 +141,7 @@ impl Cli {
                         "Usage: robot-edge [--listen ADDR] [--cert PATH] [--key PATH] [--ca PATH]\n  \
                          [--robot-id ID] [--task-class B|C|D|E] [--tick-hz N]\n  \
                          [--bridge-script PATH] [--stub-bridge] [--serial-port PATH] [--watchdog-ms N]\n  \
+                         [--estop-watchdog-ms N]\n  \
                          [--camera] [--camera-bin PATH]\n  \
                          [--record-dir PATH] [--record video,command,telemetry,haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
@@ -154,6 +169,7 @@ impl Cli {
             stub_bridge,
             serial_port,
             watchdog_ms,
+            estop_watchdog_ms,
             enable_camera,
             camera_bin,
             record_dir,
@@ -221,6 +237,7 @@ async fn main() -> Result<()> {
         key_path: cli.key,
         ca_path: cli.ca,
         task_class: cli.task_class,
+        watchdog_threshold_ms: cli.estop_watchdog_ms.unwrap_or_else(|| cli.task_class.watchdog_blackout_ms()),
         robot_id: cli.robot_id,
         tick_hz: cli.tick_hz,
         bridge: BridgeConfig {

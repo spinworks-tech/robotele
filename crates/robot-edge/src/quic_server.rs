@@ -40,6 +40,10 @@ pub struct ServerArgs {
     pub key_path: String,
     pub ca_path: String,
     pub task_class: TaskClass,
+    /// Overrides `task_class`'s own `watchdog_blackout_ms()` for the
+    /// Channel B command watchdog -- see `--watchdog-ms`. Kept separate
+    /// from `bridge`'s own watchdog config, which this does not affect.
+    pub watchdog_threshold_ms: f64,
     pub robot_id: String,
     pub tick_hz: u32,
     pub bridge: BridgeConfig,
@@ -132,7 +136,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             robot_id: args.robot_id.clone(),
             profile: profile.clone(),
             cameras: cameras.clone(),
-            safety: SafetyTask::new(args.task_class, Instant::now()),
+            safety: SafetyTask::with_watchdog_threshold_ms(args.task_class, args.watchdog_threshold_ms, Instant::now()),
             bridge,
             video_rx,
             camera_controls_tx,

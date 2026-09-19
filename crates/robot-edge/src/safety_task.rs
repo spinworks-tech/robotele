@@ -24,9 +24,16 @@ pub struct SafetyTask {
 
 impl SafetyTask {
     pub fn new(task_class: TaskClass, now: Instant) -> Self {
+        Self::with_watchdog_threshold_ms(task_class, task_class.watchdog_blackout_ms(), now)
+    }
+
+    /// Same as `new`, but overriding the watchdog's blackout threshold
+    /// instead of using the one implied by `task_class` -- see
+    /// `--watchdog-ms` in `robot-edge`'s CLI.
+    pub fn with_watchdog_threshold_ms(task_class: TaskClass, watchdog_threshold_ms: f64, now: Instant) -> Self {
         Self {
             state_machine: SafetyStateMachine::new(task_class, now),
-            watchdog: Watchdog::new(task_class, now),
+            watchdog: Watchdog::with_threshold_ms(watchdog_threshold_ms, now),
             explicit_estop: false,
             deadman_held: false,
             command_fresh: false,
