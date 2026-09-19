@@ -8,6 +8,7 @@ mod safety_task;
 mod session_handler;
 mod video;
 mod xgo_profile;
+mod zenoh_bridge;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
