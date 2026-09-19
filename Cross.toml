@@ -1,0 +1,12 @@
+[target.aarch64-unknown-linux-gnu]
+# flatc must be v1.11.0 to match the `flatbuffers = "0.7"` crate pinned in
+# crates/roboprotocol-proto/Cargo.toml (see .github/workflows/rust.yml) --
+# apt's flatbuffers-compiler is too new and generates incompatible bindings.
+pre-build = [
+    "apt-get update && apt-get install --assume-yes cmake git build-essential",
+    "git clone --depth 1 --branch v1.11.0 https://github.com/google/flatbuffers.git /tmp/flatbuffers-src",
+    "sed -i -E 's/-Werror=/-W/g; s/-Werror\\b//g' /tmp/flatbuffers-src/CMakeLists.txt",
+    "cmake -S /tmp/flatbuffers-src -B /tmp/flatbuffers-build -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_TESTS=OFF",
+    "cmake --build /tmp/flatbuffers-build --target flatc -j$(nproc)",
+    "install -m 755 /tmp/flatbuffers-build/flatc /usr/local/bin/flatc",
+]
