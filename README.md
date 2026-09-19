@@ -68,6 +68,39 @@ Each body region within a profile (an arm, a leg group, a wheeled base) also dec
 
 v0 ships exactly one concrete robot profile: the **[XGO-Lite V2](https://wiki.elecfreaks.com/en/pico/cm4-xgo-robot-kit/product-introduction/xgo-lite-v2-product-instruction/)** quadruped (with the optional arm/gripper accessory) — a Raspberry Pi CM4-based kit with 12 leg servos plus a 3-DoF Cartesian-commanded arm/gripper — 15 DoF across 5 regions (4 leg regions as `QuadrupedLegs`/`VelocityAttitude`, 1 arm region as `CartesianEndEffector`), streaming a single front-facing H.264 camera. See the [XGO-Lite V2 Guide](docs/06-xgo-lite-guide.md) to run it — or skip building on the Pi entirely with the prebuilt `robot-edge` binary from the [latest release](https://github.com/spinworks-tech/robotele/releases/latest). Authoring new profiles for other hardware (a URDF + build-config pipeline, rather than a hand-written Rust constant) is on the roadmap — see [Design Review & Roadmap](docs/09-design-review-and-roadmap.md).
 
+### Running the BabyROS-integrated build
+
+This branch adds a Channel C sidecar (`crates/robot-edge/src/zenoh_bridge.rs`) that publishes
+telemetry to, and accepts an autonomy goal from, a BabyROS node over [Zenoh](https://zenoh.io/) —
+hence the `robot-edge-v0.1.1-babyros-*` asset on the
+[v0.1.1 release](https://github.com/spinworks-tech/robotele/releases/tag/v0.1.1), built from this
+branch and kept separate from the plain `robot-edge-v0.1.1-*` asset built from `main`.
+
+**Launch order doesn't matter, and BabyROS is optional.** `robot-edge` opens its own Zenoh session
+in peer mode at startup regardless of whether a BabyROS node is reachable yet — if none is found,
+the sidecar just logs a warning and runs inert (no telemetry publish, no autonomy goal ever
+asserted) rather than blocking or failing to start. Whichever side starts second is picked up by
+Zenoh's own peer discovery (multicast scouting by default, so both must be on the same LAN/subnet
+unless you've configured explicit Zenoh endpoints) — there's no handshake to sequence by hand.
+
+To run it:
+
+1. Start `robot-edge` on the Pi exactly as in the [XGO-Lite V2 Guide](docs/06-xgo-lite-guide.md)
+   (same flags — `--robot-id` just needs to match what your BabyROS node uses below):
+   ```bash
+   xgo_bridge/scripts/run-detached.sh pi@<ip> --robot-id xgo_real --camera
+   ```
+2. Start your BabyROS node (on the Pi, or anywhere reachable over the same Zenoh scouting domain),
+   pointed at the same `robot_id`. It will:
+   - subscribe to `robotele/<robot_id>/telemetry` for the Channel B telemetry `robot-edge` publishes, and
+   - publish to `robotele/<robot_id>/autonomy_goal` to assert a semi-autonomy goal.
+3. An asserted autonomy goal is only ever honored while messages keep arriving within 500ms
+   (`AUTONOMY_GOAL_TTL`) — a stalled or crashed BabyROS node silently stops asserting rather than
+   latching a stale goal — and **teleoperation from `operator-console` always preempts it**
+   regardless of what BabyROS is doing (see the arbitration ladder in
+   [`roboprotocol-core`](crates/roboprotocol-core)). BabyROS is additive, never load-bearing for
+   safety.
+
 ### Operator console, live
 
 The `operator-console` TUI against a real XGO-Lite V2 — telemetry, commands, and per-channel wire rates all update live in the terminal:
