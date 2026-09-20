@@ -10,7 +10,7 @@ roboprotocol-core = { path = "../roboprotocol-core" }
 roboprotocol-proto = { path = "../roboprotocol-proto" }
 roboprotocol-recording = { path = "../roboprotocol-recording" }
 quiche = "0.22"
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "time", "io-util", "sync", "signal"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "process", "time", "io-util", "sync", "signal"] }
 # Channel C sidecar (spinworks-tech/robotele#5): telemetry-out / autonomy-goal-in
 # over Zenoh, bolted onto the control loop rather than inserted into it -- see
 # zenoh_bridge.rs. Same major version as the eclipse-zenoh Python bindings

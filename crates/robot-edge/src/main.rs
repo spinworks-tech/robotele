@@ -210,7 +210,10 @@ impl Cli {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Zenoh (zenoh_bridge.rs) panics at startup on tokio's current_thread
+// scheduler; one worker thread keeps the same effective concurrency model
+// (main future runs on this thread, only spawned tasks use the worker).
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse()?;
