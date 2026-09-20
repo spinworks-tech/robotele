@@ -1,12 +1,13 @@
 [target.aarch64-unknown-linux-gnu]
-# flatc must be v1.11.0 to match the `flatbuffers = "0.7"` crate pinned in
-# crates/roboprotocol-proto/Cargo.toml (see .github/workflows/rust.yml) --
-# apt's flatbuffers-compiler is too new and generates incompatible bindings.
-pre-build = [
-    "apt-get update && apt-get install --assume-yes cmake git build-essential",
-    "git clone --depth 1 --branch v1.11.0 https://github.com/google/flatbuffers.git /tmp/flatbuffers-src",
-    "sed -i -E 's/-Werror=/-W/g; s/-Werror\\b//g' /tmp/flatbuffers-src/CMakeLists.txt",
-    "cmake -S /tmp/flatbuffers-src -B /tmp/flatbuffers-build -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_TESTS=OFF",
-    "cmake --build /tmp/flatbuffers-build --target flatc -j$(nproc)",
-    "install -m 755 /tmp/flatbuffers-build/flatc /usr/local/bin/flatc",
-]
+# The stock cross-rs image (ghcr.io/cross-rs/aarch64-unknown-linux-gnu) is
+# based on Ubuntu 24.04 and links against glibc symbols up to 2.39. The XGO-Lite
+# V2's stock Raspberry Pi OS image only ships glibc <= 2.31, so a binary built
+# against that image fails to run on the robot at all ("version GLIBC_2.39 not
+# found"). docker/cross-aarch64-glibc2.31.Dockerfile rebuilds the aarch64
+# cross-toolchain against Ubuntu 20.04 (glibc 2.31) instead -- build it with:
+#   docker build -f docker/cross-aarch64-glibc2.31.Dockerfile -t robotele/cross-aarch64-glibc2.31:latest .
+# It also bundles flatc v1.11.0, matching the `flatbuffers = "0.7"` crate
+# pinned in crates/roboprotocol-proto/Cargo.toml (see .github/workflows/rust.yml)
+# -- the stock image's apt flatbuffers-compiler is too new and generates
+# incompatible bindings.
+image = "robotele/cross-aarch64-glibc2.31:latest"
