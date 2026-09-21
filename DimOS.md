@@ -25,6 +25,15 @@ Not done yet: **video** (see "Known gaps").
 
 `<id>` is `robot-edge`'s `--robot-id` (default in the adapter: `xgo_real`).
 
+### IMU
+
+Telemetry carries roll/pitch/yaw only: no gyro and no accelerometer. The `imu` stream therefore
+has a valid `orientation` (built from the Euler angles) and marks `angular_velocity` and
+`linear_acceleration` as not provided with covariance `[0] = -1`, the ROS convention, so
+consumers don't mistake the zeros for measurements. Yaw is whatever the robot reports (0-360),
+but a quaternion cannot hold that, so anything reading `orientation` back gets it wrapped to
+±180° (327.67° becomes -32.33°). The Rerun "Attitude (deg)" panel shows the wrapped values.
+
 ### Joint names
 
 The robot sends no joint names; these are ours, from the wire order in
@@ -99,8 +108,8 @@ time.sleep(5)
 ## Viewing
 
 DimOS uses [Rerun](https://rerun.io/). With `--rerun-open web` the dashboard is at
-`http://localhost:7779/` and the Rerun web viewer at port `9878`. The blueprint adds two
-time-series panels (`Battery %`, `Joint angles (deg)`) under `telemetry/`.
+`http://localhost:7779/` and the Rerun web viewer at port `9878`. The blueprint adds three
+time-series panels (`Battery %`, `Attitude (deg)`, `Joint angles (deg)`) under `telemetry/`.
 
 Two problems seen with the released `dimos` 0.0.10.post2:
 
@@ -146,6 +155,7 @@ Limitations:
   console; nothing is published on Zenoh, and the camera cannot be opened by a second process.
   Plan: publish NAL units on `robotele/<id>/video` (only while a subscriber exists, always
   delivering SPS/PPS/IDR), decode in the bridge (PyAV) into an `Image`.
-- **No Imu stream.** Roll/pitch/yaw are in the telemetry but not yet republished.
+- **No real IMU data.** No angular velocity or acceleration reaches DimOS, because the robot
+  edge does not send any; adding it means extending the telemetry format.
 - **XGO-Lite is not a DimOS-supported robot.** No upstream module or hardware support exists;
   this adapter is out-of-tree, registered through the `dimos.blueprints` entry-point group.

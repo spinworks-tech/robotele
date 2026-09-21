@@ -27,6 +27,16 @@ def joint_state_to_rerun(msg):
     ]
 
 
+def imu_to_rerun(msg):
+    import rerun as rr
+
+    e = msg.orientation.euler  # radians; yaw is wrapped to +-180 here
+    return [
+        (f"{TELEMETRY}/attitude/{axis}", rr.Scalars(math.degrees(v)))
+        for axis, v in (("roll", e.roll), ("pitch", e.pitch), ("yaw", e.yaw))
+    ]
+
+
 def telemetry_blueprint():
     import rerun.blueprint as rrb
 
@@ -37,8 +47,9 @@ def telemetry_blueprint():
                 name="Battery %",
                 axis_y=rrb.ScalarAxis(range=(0.0, 100.0)),
             ),
+            rrb.TimeSeriesView(origin=f"{TELEMETRY}/attitude", name="Attitude (deg)"),
             rrb.TimeSeriesView(origin=f"{TELEMETRY}/joints", name="Joint angles (deg)"),
-            row_shares=[1, 2],
+            row_shares=[1, 1, 2],
         )
     )
 
@@ -47,6 +58,7 @@ RERUN_CONFIG = {
     "visual_override": {
         "world/battery_percent": battery_to_rerun,
         "world/joint_state": joint_state_to_rerun,
+        "world/imu": imu_to_rerun,
     },
     "blueprint": telemetry_blueprint,
 }

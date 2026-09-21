@@ -15,7 +15,10 @@ import zenoh
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
+from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Twist import Twist
+from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.msgs.sensor_msgs.Imu import Imu
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.msgs.std_msgs.Float32 import Float32
 
@@ -29,6 +32,7 @@ class RoboteleBridgeConfig(ModuleConfig):
     robot_id: str = "xgo_real"
     zenoh_connect: str | None = None  # e.g. "tcp/192.168.2.19:7447"; None = default scouting
     frame_id: str = "base_link"
+    imu_frame_id: str = "imu_link"
     # Twist magnitude that maps to full robot-native deflection (the operator
     # console's own max: vx 15, vy 12, turn 60). UNCALIBRATED placeholders: the
     # XGO's real m/s per xgolib unit has not been measured.
@@ -41,6 +45,7 @@ class RoboteleBridge(Module):
     cmd_vel: In[Twist]
     joint_state: Out[JointState]
     battery_percent: Out[Float32]
+    imu: Out[Imu]
 
     _session = None
     _last_goal = 0.0
@@ -76,6 +81,19 @@ class RoboteleBridge(Module):
             )
         )
         self.battery_percent.publish(Float32(float(t.battery)))
+        # Orientation only: telemetry carries roll/pitch/yaw, no gyro or
+        # accelerometer. Covariance[0] = -1 is the ROS convention for "this
+        # field is not provided", so consumers don't read the zeros as data.
+        self.imu.publish(
+            Imu(
+                orientation=Quaternion.from_euler(
+                    Vector3(math.radians(t.roll), math.radians(t.pitch), math.radians(t.yaw))
+                ),
+                angular_velocity_covariance=[-1.0] + [0.0] * 8,
+                linear_acceleration_covariance=[-1.0] + [0.0] * 8,
+                frame_id=self.config.imu_frame_id,
+            )
+        )
 
     def _on_cmd_vel(self, twist: Twist) -> None:
         # Publish the latest velocity at most every _GOAL_REFRESH_S. A stopped
