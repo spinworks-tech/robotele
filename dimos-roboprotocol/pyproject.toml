@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dimos-roboprotocol"
+version = "0.0.1"
+description = "DimOS adapter for RoboProtocol robot-edge (Zenoh sidecar: telemetry out, autonomy goals in)"
+requires-python = ">=3.10"
+dependencies = ["eclipse-zenoh"]
+
+[project.optional-dependencies]
+dimos = ["dimos"]
+test = ["pytest"]
+
+[project.entry-points."dimos.blueprints"]
+xgo-lite = "dimos_roboprotocol.blueprints:xgo_lite"
+
+[tool.setuptools.packages.find]
+where = ["src"]
