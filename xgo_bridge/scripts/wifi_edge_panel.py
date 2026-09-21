@@ -22,6 +22,13 @@ ROBOT_EDGE_EXTRA_ARGS = ["--camera"]
 ROBOT_EDGE_ARGS = ["--robot-id", ROBOT_EDGE_ID] + ROBOT_EDGE_EXTRA_ARGS
 ROBOT_EDGE_MATCH = "target/release/robot-edge"
 ROBOT_EDGE_PORT = 4433
+# Optional BabyROS-integrated build (Zenoh sidecar, see BABYROS.md). If this
+# file exists, button C in the ROBOT-EDGE view switches between it and
+# ROBOT_EDGE_BIN. Its filename still contains ROBOT_EDGE_MATCH, so
+# robot_edge_pid() finds either build while it's running.
+ROBOT_EDGE_BIN_BABYROS = f"{ROBOT_EDGE_DIR}/target/release/robot-edge.babyros"
+ZENOH_DEFAULT_PORT = 7447  # robot-edge's --zenoh-port default
+ZENOH_PORT = 7447
 
 FONT = ImageFont.truetype("/home/pi/model/msyh.ttc", 16)
 FONT_SM = ImageFont.truetype("/home/pi/model/msyh.ttc", 13)
@@ -119,14 +126,33 @@ def robot_edge_pid():
     return pids[0] if pids else None
 
 
-def robot_edge_start():
+def babyros_available():
+    return os.access(ROBOT_EDGE_BIN_BABYROS, os.X_OK)
+
+
+def robot_edge_variant(pid):
+    """"babyros" or "plain" for a running robot-edge, judged from its command line."""
+    out = run(["ps", "-o", "args=", "-p", str(pid)])
+    return "babyros" if "robot-edge.babyros" in out else "plain"
+
+
+def zenoh_listening(port=ZENOH_PORT):
+    return f":{port} " in run(["ss", "-ltn"])
+
+
+def robot_edge_start(variant="plain"):
     if robot_edge_pid():
         return
+    binary, args = ROBOT_EDGE_BIN, list(ROBOT_EDGE_ARGS)
+    if variant == "babyros" and babyros_available():
+        binary = ROBOT_EDGE_BIN_BABYROS
+        if ZENOH_PORT != ZENOH_DEFAULT_PORT:
+            args += ["--zenoh-port", str(ZENOH_PORT)]
     ts = time.strftime("%Y%m%d-%H%M%S")
     log_path = f"{ROBOT_EDGE_DIR}/robot-edge-{ts}-launch.log"
     with open(log_path, "wb") as log:
         subprocess.Popen(
-            [ROBOT_EDGE_BIN] + ROBOT_EDGE_ARGS,
+            [binary] + args,
             cwd=ROBOT_EDGE_DIR,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -193,21 +219,26 @@ def draw_wifi_view(draw, networks, saved, selection):
     draw.text((8, FOOTER_Y), "C/D move  A connect(*)  B->edge", fill=COLOR_DIM, font=FONT_SM)
 
 
-def draw_edge_view(draw, pid):
+def draw_edge_view(draw, pid, variant):
     running = pid is not None
+    if running:
+        variant = robot_edge_variant(pid)
     draw.rectangle((0, 40, 320, 72), fill=COLOR_SEL)
     status = "RUNNING" if running else "STOPPED"
     color = COLOR_OK if running else COLOR_BAD
     draw.text((16, 47), f"robot-edge: {status}", fill=color, font=FONT)
 
-    y = 84
-    for line in (
-        f"id: {ROBOT_EDGE_ID}",
-        f"port: {ROBOT_EDGE_PORT} (quic/udp)",
-        f"args: {' '.join(ROBOT_EDGE_EXTRA_ARGS)}",
+    y = 80
+    zenoh_up = running and zenoh_listening()
+    for line, color in (
+        (f"id: {ROBOT_EDGE_ID}", COLOR_TXT),
+        (f"port: {ROBOT_EDGE_PORT} (quic/udp)", COLOR_TXT),
+        (f"build: {variant}", COLOR_TXT),
+        (f"zenoh: :{ZENOH_PORT} " + ("UP" if zenoh_up else "off"), COLOR_OK if zenoh_up else COLOR_DIM),
+        (f"args: {' '.join(ROBOT_EDGE_EXTRA_ARGS)}", COLOR_TXT),
     ):
-        draw.text((16, y), line, fill=COLOR_TXT, font=FONT_SM)
-        y += 20
+        draw.text((16, y), line, fill=color, font=FONT_SM)
+        y += 17
 
     if running:
         draw.text((16, y), f"pid: {pid}   up: {robot_edge_uptime(pid)}", fill=COLOR_DIM, font=FONT_SM)
@@ -215,7 +246,8 @@ def draw_edge_view(draw, pid):
         draw.text((16, y), "not running", fill=COLOR_DIM, font=FONT_SM)
 
     action = "A: stop" if running else "A: start"
-    draw.text((16, FOOTER_Y), f"{action}   B: wifi list", fill=COLOR_DIM, font=FONT_SM)
+    switch = "  C: build" if (not running and babyros_available()) else ""
+    draw.text((16, FOOTER_Y), f"{action}  B: wifi{switch}", fill=COLOR_DIM, font=FONT_SM)
 
 
 def main():
@@ -225,6 +257,7 @@ def main():
     button = Button()
 
     view = "wifi"
+    variant = "plain"
     selection = 0
     networks = scan_networks()
     saved = saved_networks()
@@ -253,6 +286,9 @@ def main():
             if view == "wifi" and networks:
                 selection = (selection - 1) % min(len(networks), WIFI_ROWS)
                 dirty = True
+            elif view == "edge" and not robot_edge_pid() and babyros_available():
+                variant = "babyros" if variant == "plain" else "plain"
+                dirty = True
         elif button.pressed("d"):
             if view == "wifi" and networks:
                 selection = (selection + 1) % min(len(networks), WIFI_ROWS)
@@ -265,7 +301,7 @@ def main():
                 if robot_edge_pid():
                     robot_edge_stop()
                 else:
-                    robot_edge_start()
+                    robot_edge_start(variant)
             dirty = True
 
         if dirty:
@@ -275,7 +311,7 @@ def main():
             if view == "wifi":
                 draw_wifi_view(draw, networks, saved, selection)
             else:
-                draw_edge_view(draw, robot_edge_pid())
+                draw_edge_view(draw, robot_edge_pid(), variant)
             display.ShowImage(splash)
             dirty = False
         else:

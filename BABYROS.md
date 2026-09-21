@@ -155,9 +155,25 @@ xgo_bridge/scripts/run-detached.sh pi@<robot-ip> --robot-id xgo_real --camera
 cd /home/pi/RoboProtocol && ./target/release/robot-edge --robot-id xgo_real --camera
 ```
 
-The robot's LCD WiFi panel (`xgo-wifi-panel.service`) can also start and stop
-`robot-edge` from its ROBOT-EDGE view; it runs the same `target/release/robot-edge`
-with `--robot-id xgo_real --camera`.
+**LCD panel** (`xgo-wifi-panel.service` → `wifi_edge_panel.py`): the ROBOT-EDGE
+view starts/stops `robot-edge` with A and shows a `build:` line (plain / babyros)
+and a `zenoh: :7447 UP/off` line. To use it without swapping files, install the
+BabyROS binary next to the plain one instead of over it:
+
+```bash
+cp ~/robot-edge-v0.1.2-babyros-aarch64-unknown-linux-gnu/robot-edge \
+   /home/pi/RoboProtocol/target/release/robot-edge.babyros
+chmod +x /home/pi/RoboProtocol/target/release/robot-edge.babyros
+```
+
+When that file exists and `robot-edge` is stopped, button **C** switches the next
+start between `plain` and `babyros`; the panel defaults to `plain` after every
+panel restart, so it never runs the Zenoh build unless you pick it. If you move
+Zenoh off 7447, set `ZENOH_PORT` at the top of the script (it then passes
+`--zenoh-port`). After editing the script in the repo, copy it to the Pi
+(`/home/pi/xgo_wifi_edge_panel.py`) and `sudo systemctl restart xgo-wifi-panel`.
+`run-detached.sh` still only runs `target/release/robot-edge`, so use the
+copy-over method above with that script.
 
 **Check that Zenoh is up:**
 
