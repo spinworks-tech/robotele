@@ -200,6 +200,24 @@ stops being honored immediately (nothing latches).
 cd /home/pi/RoboProtocol && cp target/release/robot-edge.plain target/release/robot-edge
 ```
 
+**Running the side-by-side BabyROS binary by hand.** Always start from the
+folder that contains `certs/`, because the default `--cert/--key/--ca` paths are
+relative (`certs/robot/robot.crt`, `certs/robot/robot.key`, `certs/dev-ca/ca.crt`):
+
+```bash
+cd /home/pi/RoboProtocol
+./target/release/robot-edge.babyros --robot-id xgo_real --camera
+# add --stub-bridge to run without the serial port (no motors move)
+```
+
+The panel and `run-detached.sh` already start from `/home/pi/RoboProtocol`.
+
+**Troubleshooting: `Error: loading robot cert chain` / `TlsFail`.** You started
+it from a directory with no `certs/` folder (typically `/home/pi`). quiche reports
+a missing certificate file with the same generic `TlsFail` as an invalid one, so it
+looks like a bad cert. `cd /home/pi/RoboProtocol` first, or pass absolute paths:
+`--cert /home/pi/RoboProtocol/certs/robot/robot.crt --key .../robot.key --ca .../dev-ca/ca.crt`.
+
 ### Consumer side (BabyROS / Zenoh node)
 
 Your BabyROS or plain-Zenoh client is its own process on whatever machine runs
