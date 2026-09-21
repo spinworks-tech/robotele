@@ -7,6 +7,7 @@ robot-edge's arbitration ladder ranks below FullTeleoperation.
 from __future__ import annotations
 
 import math
+import os
 import time
 
 import zenoh
@@ -16,6 +17,7 @@ from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.sensor_msgs.JointState import JointState
+from dimos.msgs.std_msgs.Float32 import Float32
 
 from .codec import MAX_TURN, MAX_VX, MAX_VY, decode_telemetry, encode_autonomy_goal
 
@@ -38,6 +40,7 @@ class RoboteleBridge(Module):
     config: RoboteleBridgeConfig
     cmd_vel: In[Twist]
     joint_state: Out[JointState]
+    battery_percent: Out[Float32]
 
     _session = None
     _last_goal = 0.0
@@ -45,8 +48,9 @@ class RoboteleBridge(Module):
     @rpc
     def start(self) -> None:
         conf = zenoh.Config()
-        if self.config.zenoh_connect:
-            conf.insert_json5("connect/endpoints", f'["{self.config.zenoh_connect}"]')
+        connect = self.config.zenoh_connect or os.environ.get("ROBOTELE_ZENOH_CONNECT")
+        if connect:
+            conf.insert_json5("connect/endpoints", f'["{connect}"]')
         self._session = zenoh.open(conf)
         prefix = f"robotele/{self.config.robot_id}"
         self._telemetry_sub = self._session.declare_subscriber(
@@ -71,6 +75,7 @@ class RoboteleBridge(Module):
                 position=[math.radians(d) for d in t.joints],
             )
         )
+        self.battery_percent.publish(Float32(float(t.battery)))
 
     def _on_cmd_vel(self, twist: Twist) -> None:
         # Publish the latest velocity at most every _GOAL_REFRESH_S. A stopped
