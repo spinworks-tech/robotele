@@ -224,7 +224,14 @@ impl Cli {
 // (main future runs on this thread, only spawned tasks use the worker).
 #[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Explicit INFO default when RUST_LOG is unset. Zenoh pulls in
+    // tracing-subscriber's `env-filter` feature for the whole build, and with it
+    // enabled a bare `fmt::init()` silently defaults to ERROR-only -- which hid
+    // every INFO line (HELLO negotiated, Zenoh address, ...) and broke
+    // scripts/smoke_test.sh. RUST_LOG still overrides.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .init();
     let cli = Cli::parse()?;
 
     let mut bridge_extra_args = Vec::new();

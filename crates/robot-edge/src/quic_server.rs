@@ -75,7 +75,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
     // Started once, outside the reconnect loop, same reasoning as `recorder`
     // above: the Zenoh session and its background tasks persist across
     // reconnects. Both handles are cheap to clone into each `Session`.
-    let (telemetry_sink, autonomy_goal) = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port).await;
+    let (telemetry_sink, command_sink, autonomy_goal) = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port).await;
 
     // v0 keeps the single-active-connection design (no CID-routing table for
     // concurrent clients -- see module docs) but must not let one connection
@@ -149,6 +149,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             camera_controls_tx,
             camera_control_dedup: CameraControlDedup::new(),
             telemetry_sink: telemetry_sink.clone(),
+            command_sink: command_sink.clone(),
             autonomy_goal: autonomy_goal.clone(),
             phase: Phase::AwaitingHello,
             channel_b_seq: 0,
@@ -197,6 +198,9 @@ struct Session {
     /// Channel C sidecar (spinworks-tech/robotele#5): fire-and-forget
     /// telemetry-out, never on the safety-critical path. See zenoh_bridge.rs.
     telemetry_sink: crate::zenoh_bridge::TelemetrySink,
+    /// Channel C sidecar: the operator's command + arbitrated source, published
+    /// on change (see zenoh_bridge::CommandSink).
+    command_sink: crate::zenoh_bridge::CommandSink,
     /// Channel C sidecar: freshness-gated semi-autonomy goal-in, read once
     /// per safety tick. See zenoh_bridge.rs.
     autonomy_goal: crate::zenoh_bridge::AutonomyGoal,
@@ -593,6 +597,8 @@ impl Session {
 
     fn dispatch_teleop_command(&mut self, cmd: &TeleopCommand) -> roboprotocol_core::safety::ControlSource {
         let source = self.safety.tick(Instant::now(), self.autonomy_goal.asserted());
+        // Channel C sidecar: fire-and-forget, never blocks this path.
+        self.command_sink.publish(source, cmd);
         use roboprotocol_core::safety::ControlSource;
         match source {
             ControlSource::FullTeleoperation => {

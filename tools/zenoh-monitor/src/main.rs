@@ -1,6 +1,7 @@
 //! Listens to robot-edge's Channel C Zenoh topics (the BabyROS sidecar, see
-//! BABYROS.md) and shows the data flowing: decodes `robotele/<id>/telemetry`,
-//! and counts anything else published under `robotele/<id>/` (e.g. the
+//! BABYROS.md) and shows the data flowing: decodes `robotele/<id>/telemetry` and
+//! `robotele/<id>/command` (the operator's command plus the arbitrated control
+//! source), and counts anything else published under `robotele/<id>/` (e.g. the
 //! `autonomy_goal` topic) so you can see it without a flood of lines.
 
 use std::collections::BTreeMap;
@@ -68,6 +69,44 @@ fn decode_telemetry(b: &[u8]) -> Option<String> {
     ))
 }
 
+const SOURCE_NAMES: [&str; 5] = ["EStop", "SafeParking", "ActiveImpedanceHold", "FullTeleop", "SemiAutonomous"];
+
+/// `robotele/<id>/command` payload (30 bytes, big-endian; see
+/// `zenoh_bridge::encode_command` in robot-edge): control_source u8, then
+/// vx/vy/turn/roll/pitch/yaw as f32, arm_x/arm_z as i16, claw u8.
+struct Command {
+    source: u8,
+    text: String,
+    idle: bool,
+}
+
+fn decode_command(b: &[u8]) -> Option<Command> {
+    if b.len() != 30 {
+        return None;
+    }
+    let f = |i: usize| f32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let (vx, vy, turn) = (f(1), f(5), f(9));
+    let arm_x = i16::from_be_bytes([b[25], b[26]]);
+    let arm_z = i16::from_be_bytes([b[27], b[28]]);
+    let source = b[0];
+    let name = SOURCE_NAMES.get(source as usize).copied().unwrap_or("?");
+    Some(Command {
+        source,
+        idle: vx == 0.0 && vy == 0.0 && turn == 0.0,
+        text: format!(
+            "[{name}]  vx={vx:+.2} vy={vy:+.2} turn={turn:+.2}  rpy=({:.1},{:.1},{:.1})  arm=({arm_x},{arm_z}) claw={}",
+            f(13),
+            f(17),
+            f(21),
+            b[29]
+        ),
+    })
+}
+
+/// Commands can change at operator-input rate; print at most this often unless
+/// the control source or the moving/idle state flips (those always print).
+const COMMAND_PRINT_EVERY: Duration = Duration::from_millis(200);
+
 #[derive(Default)]
 struct TopicStats {
     total: u64,
@@ -94,6 +133,7 @@ async fn main() -> Result<()> {
     let mut summary = tokio::time::interval(SUMMARY_EVERY);
     summary.tick().await; // first tick fires immediately; skip it
     let mut last_summary = Instant::now();
+    let mut last_cmd: Option<(u8, bool, Instant)> = None;
 
     loop {
         tokio::select! {
@@ -135,6 +175,18 @@ async fn main() -> Result<()> {
                         Some(text) => println!("[t+{t:>7.1}s] {topic}  {} B  {text}", payload.len()),
                         None => println!("[t+{t:>7.1}s] {topic}  {} B  (unrecognized telemetry layout)", payload.len()),
                     }
+                } else if topic.ends_with("/command") {
+                    match decode_command(&payload) {
+                        Some(cmd) => {
+                            let flipped = last_cmd.map_or(true, |(src, idle, _)| src != cmd.source || idle != cmd.idle);
+                            let due = last_cmd.map_or(true, |(_, _, at)| at.elapsed() >= COMMAND_PRINT_EVERY);
+                            if args.all || flipped || due {
+                                println!("[t+{t:>7.1}s] {topic}  cmd {}", cmd.text);
+                                last_cmd = Some((cmd.source, cmd.idle, Instant::now()));
+                            }
+                        }
+                        None => println!("[t+{t:>7.1}s] {topic}  {} B  (unrecognized command layout)", payload.len()),
+                    }
                 } else if args.all || first {
                     let head: String = payload.iter().take(16).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
                     let note = if first && !args.all { "  (new topic; further samples are only counted, use --all to print each)" } else { "" };
@@ -172,6 +224,24 @@ mod tests {
         assert!(s.contains("roll=1.5 pitch=-2.0 yaw=90.0"));
         assert!(s.contains("joints[15]="));
         assert!(s.contains("12.3"));
+    }
+
+    #[test]
+    fn decodes_a_command_sample() {
+        let mut b = vec![3u8];
+        for v in [0.5f32, 0.0, -0.25, 0.0, 1.5, 0.0] {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        b.extend_from_slice(&40i16.to_be_bytes());
+        b.extend_from_slice(&(-10i16).to_be_bytes());
+        b.push(128);
+        assert_eq!(b.len(), 30);
+        let c = decode_command(&b).unwrap();
+        assert_eq!(c.source, 3);
+        assert!(!c.idle);
+        assert!(c.text.contains("[FullTeleop]") && c.text.contains("vx=+0.50") && c.text.contains("turn=-0.25"));
+        assert!(c.text.contains("arm=(40,-10) claw=128"));
+        assert!(decode_command(&[0u8; 29]).is_none());
     }
 
     #[test]
