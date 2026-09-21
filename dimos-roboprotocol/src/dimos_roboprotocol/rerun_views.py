@@ -42,6 +42,7 @@ def telemetry_blueprint():
 
     return rrb.Blueprint(
         rrb.Vertical(
+            rrb.Spatial2DView(origin="world/color_image", name="Camera"),
             rrb.TimeSeriesView(
                 origin=f"{TELEMETRY}/battery_percent",
                 name="Battery %",
@@ -49,12 +50,14 @@ def telemetry_blueprint():
             ),
             rrb.TimeSeriesView(origin=f"{TELEMETRY}/attitude", name="Attitude (deg)"),
             rrb.TimeSeriesView(origin=f"{TELEMETRY}/joints", name="Joint angles (deg)"),
-            row_shares=[1, 1, 2],
+            row_shares=[4, 1, 1, 2],
         )
     )
 
 
 RERUN_CONFIG = {
+    # Decoded video is raw RGB per frame; keep the viewer link comfortable.
+    "max_hz": {"world/color_image": 10.0},
     "visual_override": {
         "world/battery_percent": battery_to_rerun,
         "world/joint_state": joint_state_to_rerun,

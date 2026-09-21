@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 
 import zenoh
@@ -18,6 +19,7 @@ from dimos.core.stream import In, Out
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.Imu import Imu
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.msgs.std_msgs.Float32 import Float32
@@ -33,6 +35,10 @@ class RoboteleBridgeConfig(ModuleConfig):
     zenoh_connect: str | None = None  # e.g. "tcp/192.168.2.19:7447"; None = default scouting
     frame_id: str = "base_link"
     imu_frame_id: str = "imu_link"
+    # Subscribe to robotele/<id>/video and publish decoded frames. robot-edge
+    # only publishes video while someone subscribes, so this is what turns the
+    # camera tap (and its CM4 CPU cost) on.
+    video: bool = True
     # Twist magnitude that maps to full robot-native deflection (the operator
     # console's own max: vx 15, vy 12, turn 60). UNCALIBRATED placeholders: the
     # XGO's real m/s per xgolib unit has not been measured.
@@ -46,6 +52,7 @@ class RoboteleBridge(Module):
     joint_state: Out[JointState]
     battery_percent: Out[Float32]
     imu: Out[Imu]
+    color_image: Out[Image]
 
     _session = None
     _last_goal = 0.0
@@ -62,6 +69,12 @@ class RoboteleBridge(Module):
             f"{prefix}/telemetry", self._on_telemetry
         )
         self._goal_pub = self._session.declare_publisher(f"{prefix}/autonomy_goal")
+        if self.config.video:
+            from .video import H264Decoder
+
+            self._decoder = H264Decoder()
+            self._decode_lock = threading.Lock()
+            self._video_sub = self._session.declare_subscriber(f"{prefix}/video", self._on_video)
         self.register_disposable(self.cmd_vel.observable().subscribe(self._on_cmd_vel))
 
     @rpc
@@ -94,6 +107,12 @@ class RoboteleBridge(Module):
                 frame_id=self.config.imu_frame_id,
             )
         )
+
+    def _on_video(self, sample) -> None:
+        with self._decode_lock:
+            frames = self._decoder.decode(bytes(sample.payload))
+        for rgb in frames:
+            self.color_image.publish(Image.from_numpy(rgb, format=ImageFormat.RGB, ts=time.time()))
 
     def _on_cmd_vel(self, twist: Twist) -> None:
         # Publish the latest velocity at most every _GOAL_REFRESH_S. A stopped

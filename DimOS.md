@@ -20,9 +20,8 @@ SemiAutonomous`). RoboProtocol is deliberately *not* a DimOS transport backend: 
 | robot → DimOS | `robotele/<id>/telemetry` | `joint_state` (`JointState`) | 15 joints, degrees converted to radians |
 | robot → DimOS | `robotele/<id>/telemetry` | `battery_percent` (`Float32`) | 0-100 |
 | robot → DimOS | `robotele/<id>/telemetry` | `imu` (`Imu`) | orientation only, see below |
+| robot → DimOS | `robotele/<id>/video` | `color_image` (`Image`, RGB) | H.264, only while subscribed, see "Video" |
 | DimOS → robot | `robotele/<id>/autonomy_goal` | `cmd_vel` (`Twist`, input) | see "Driving the robot" |
-
-Not done yet: **video** (see "Known gaps").
 
 `<id>` is `robot-edge`'s `--robot-id` (default in the adapter: `xgo_real`).
 
@@ -127,6 +126,29 @@ Why a custom Rerun config at all: DimOS's Rerun bridge only draws messages that 
 skipped. `dimos-roboprotocol/src/dimos_roboprotocol/rerun_views.py` sideloads converters via
 `visual_override` and supplies the panel layout.
 
+## Video
+
+`robot-edge` captures H.264 with `libcamera-vid` and sends it to the operator console as QUIC
+datagrams (Channel A). It also taps the same NAL units onto Zenoh, `robotele/<id>/video`, **but
+only while at least one Zenoh subscriber matches**: with nobody subscribed the tap is a no-op
+(no copy, no queue), so an idle robot pays nothing. The bridge module subscribes (config
+`video: true`, the default) and decodes with PyAV into `color_image`.
+
+- **Payload:** one NAL unit per Zenoh sample, Annex-B start code prepended, in stream order.
+  Concatenated they are a valid H.264 stream.
+- **Delivery mirrors Channel A:** SPS/PPS/IDR are queued and never dropped by congestion
+  control (queue bounded at 32 so a wedged peer cannot grow memory); all other NALs are
+  latest-wins and dropped under congestion. The publisher runs in its own task, so a slow
+  Zenoh peer cannot stall the QUIC video path or a control tick.
+- **Joining mid-stream:** the latest SPS/PPS are replayed when a subscriber appears; the picture
+  starts at the next IDR (about a second with `--intra 30` at 30 fps).
+- **Session-bound:** capture is per QUIC session, so video needs the operator console (or any
+  QUIC client) connected with `--camera`, like telemetry.
+- **Cost:** decoding needs PyAV (`pip install av`, or `pip install -e ".[video]"`). The viewer
+  is throttled to 10 Hz (`max_hz` in `rerun_views.py`) because frames are logged as raw RGB.
+  Watching adds roughly the camera bitrate (about 4 Mbps by default) of Zenoh traffic and some
+  CM4 CPU; whether that disturbs the control loop on the real robot has not been measured yet.
+
 ## Driving the robot (autonomy goal)
 
 A DimOS planner or agent publishing `cmd_vel` (`Twist`) makes the bridge put a sample on
@@ -146,16 +168,15 @@ Limitations:
   per xgolib unit has not been measured. Calibrate before trusting odometry or a nav planner.
 - **Session-bound.** The tick loop is per QUIC session, so autonomy only acts while a session is
   up. It is not a headless autonomy mode.
-- **Untested on hardware.** The Rust side type-checks (`cargo check --tests`) but its unit tests
-  have not been run on this Windows machine (`cargo test` fails at the link step against
-  quiche's BoringSSL), and nothing has driven the real robot from DimOS yet.
+- **Untested on hardware.** The Rust unit tests pass, but nothing has driven the real robot from
+  DimOS yet. (`cargo test` does not link on native Windows because of quiche's BoringSSL; run it
+  in Linux/WSL with `flatc` v1.12.0 on `PATH`, e.g. `CARGO_TARGET_DIR=~/robotele-target cargo test -p robot-edge`.)
 
 ## Known gaps
 
-- **Video.** `robot-edge` sends H.264 only as QUIC datagrams on Channel A to the operator
-  console; nothing is published on Zenoh, and the camera cannot be opened by a second process.
-  Plan: publish NAL units on `robotele/<id>/video` (only while a subscriber exists, always
-  delivering SPS/PPS/IDR), decode in the bridge (PyAV) into an `Image`.
+- **Video is implemented but not yet tried on the robot.** See "Video" above. It needs a
+  `robot-edge` build that contains the Zenoh video tap (this branch), and a QUIC session with
+  `--camera` up, since capture is per session.
 - **No real IMU data.** No angular velocity or acceleration reaches DimOS, because the robot
   edge does not send any; adding it means extending the telemetry format.
 - **XGO-Lite is not a DimOS-supported robot.** No upstream module or hardware support exists;
