@@ -72,9 +72,10 @@ v0 ships exactly one concrete robot profile: the **[XGO-Lite V2](https://wiki.el
 
 This branch adds a Channel C sidecar (`crates/robot-edge/src/zenoh_bridge.rs`) that publishes
 telemetry to, and accepts an autonomy goal from, a BabyROS node over [Zenoh](https://zenoh.io/) —
-hence the `robot-edge-v0.1.1-babyros-*` asset on the
-[v0.1.1 release](https://github.com/spinworks-tech/robotele/releases/tag/v0.1.1), built from this
-branch and kept separate from the plain `robot-edge-v0.1.1-*` asset built from `main`.
+hence the separate [v0.1.2 release](https://github.com/spinworks-tech/robotele/releases/tag/v0.1.2)
+(`robot-edge-v0.1.2-babyros-*`), built from this branch and kept apart from the plain
+`robot-edge-v0.1.1-*` asset on the [v0.1.1 release](https://github.com/spinworks-tech/robotele/releases/tag/v0.1.1)
+built from `main`, to avoid confusion between the two binaries.
 
 **Launch order doesn't matter, and BabyROS is optional.** `robot-edge` opens its own Zenoh session
 in peer mode at startup regardless of whether a BabyROS node is reachable yet — if none is found,
