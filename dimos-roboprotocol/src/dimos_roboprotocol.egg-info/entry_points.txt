@@ -1,2 +1,0 @@
-[dimos.blueprints]
-xgo-lite = dimos_roboprotocol.blueprints:xgo_lite
