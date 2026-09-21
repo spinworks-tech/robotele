@@ -74,10 +74,12 @@ Run it exactly as in the [XGO-Lite V2 guide](docs/06-xgo-lite-guide.md) (certs,
 serial port, etc.). A start-up line like this means the sidecar is up:
 
 ```
-zenoh::net::runtime::orchestrator: Zenoh can be reached at: tcp/192.168.2.19:40109
+zenoh::net::runtime::orchestrator: Zenoh can be reached at: tcp/192.168.2.19:7447
 ```
 
-**The Zenoh port is random on every start.** See [Known limitations](#known-limitations).
+The Zenoh listen port defaults to **7447** and no longer changes on every start (fixed since
+this was written — see `--zenoh-port` below); override it with `--zenoh-port N` if 7447 is taken,
+blocked, or you'd rather pin a different one for a firewall rule / a BabyROS `connect` endpoint.
 
 ### 2. Something to talk to it
 
@@ -131,7 +133,7 @@ RUST_LOG=info ./robot-edge --stub-bridge --robot-id xgo_real --listen 0.0.0.0:44
   --cert certs/robot/robot.crt --key certs/robot/robot.key --ca certs/dev-ca/ca.crt
 ```
 
-Note the Zenoh port from the log (`tcp/<ip>:<port>`). **Certs:** the robot and
+Zenoh listens on the fixed `--zenoh-port` (default 7447; the log still confirms the address). **Certs:** the robot and
 operator must chain to the same dev CA. The Pi's `RoboProtocol/certs` had a
 different CA from the repo's `certs/`, so use one set on both sides.
 
@@ -143,7 +145,7 @@ connect to the endpoint directly:
 ```python
 import time, zenoh
 c = zenoh.Config()
-c.insert_json5("connect/endpoints", '["tcp/192.168.2.19:40109"]')   # from the log
+c.insert_json5("connect/endpoints", '["tcp/192.168.2.19:7447"]')   # default --zenoh-port
 s = zenoh.open(c)
 
 # The robot's autonomy_goal subscriber is visible:
@@ -207,9 +209,8 @@ deadman. Also untested: the sidecar with the real (non-stub) bridge and motors.
 
 ## Known limitations
 
-- **Random Zenoh port.** Clients must read it from the log or you must pin one
-  (robot-edge doesn't yet set `listen/endpoints`).
-- **Multicast scouting** may not reach across subnets/APs; use `connect/endpoints`.
+- **Multicast scouting** may not reach across subnets/APs; use `connect/endpoints`
+  (pointed at the fixed `--zenoh-port`, default 7447, rather than a port read from the log).
 - **Raw payloads vs BabyROS's codec.** BabyROS tags every payload with a 4-byte
   attachment (`JSON`, `NDAR`, …) and its decoder raises on an untagged one.
   robot-edge publishes raw bytes with no attachment, so BabyROS needs
