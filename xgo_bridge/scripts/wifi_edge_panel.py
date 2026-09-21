@@ -186,17 +186,20 @@ def robot_edge_uptime(pid):
 
 
 COMPANY_NAME = "SpinWorks ltd"
+BABYROS_BADGE = "BabyROS"
+EDGE_FOOTER_TAG = "RoboTele"
 
 
-def draw_header(draw, ssid, ip_addr, state, show_company=False):
+def draw_header(draw, ssid, ip_addr, state, show_company=False, badge=None):
     ok = state == "COMPLETED"
     draw.rectangle((0, 0, 320, 34), fill=(10, 14, 32))
     label = f"{ssid or '(disconnected)'}"
     draw.text((8, 3), label, fill=COLOR_TXT if ok else COLOR_DIM, font=FONT)
     draw.text((8, 19), ip_addr or "no ip", fill=COLOR_OK if ok else COLOR_BAD, font=FONT_SM)
-    if show_company:
-        w = draw.textlength(COMPANY_NAME, font=FONT_SM)
-        draw.text((320 - 8 - w, 11), COMPANY_NAME, fill=COLOR_YELLOW, font=FONT_SM)
+    right = COMPANY_NAME if show_company else badge
+    if right:
+        w = draw.textlength(right, font=FONT_SM)
+        draw.text((320 - 8 - w, 11), right, fill=COLOR_YELLOW, font=FONT_SM)
 
 
 WIFI_ROWS = 5
@@ -219,7 +222,7 @@ def draw_wifi_view(draw, networks, saved, selection):
     draw.text((8, FOOTER_Y), "C/D move  A connect(*)  B->edge", fill=COLOR_DIM, font=FONT_SM)
 
 
-def draw_edge_view(draw, pid, variant):
+def draw_edge_view(draw, pid, variant, zenoh_up):
     running = pid is not None
     if running:
         variant = robot_edge_variant(pid)
@@ -229,7 +232,6 @@ def draw_edge_view(draw, pid, variant):
     draw.text((16, 47), f"robot-edge: {status}", fill=color, font=FONT)
 
     y = 80
-    zenoh_up = running and zenoh_listening()
     for line, color in (
         (f"id: {ROBOT_EDGE_ID}", COLOR_TXT),
         (f"port: {ROBOT_EDGE_PORT} (quic/udp)", COLOR_TXT),
@@ -248,6 +250,8 @@ def draw_edge_view(draw, pid, variant):
     action = "A: stop" if running else "A: start"
     switch = "  C: build" if (not running and babyros_available()) else ""
     draw.text((16, FOOTER_Y), f"{action}  B: wifi{switch}", fill=COLOR_DIM, font=FONT_SM)
+    tag_w = draw.textlength(EDGE_FOOTER_TAG, font=FONT_SM)
+    draw.text((320 - 8 - tag_w, FOOTER_Y), EDGE_FOOTER_TAG, fill=COLOR_DIM, font=FONT_SM)
 
 
 def main():
@@ -307,11 +311,17 @@ def main():
         if dirty:
             splash = Image.new("RGB", (320, 240), COLOR_BG)
             draw = ImageDraw.Draw(splash)
-            draw_header(draw, ssid, ip_addr, state, show_company=(view == "wifi"))
+            pid = robot_edge_pid() if view == "edge" else None
+            zenoh_up = pid is not None and zenoh_listening()
+            draw_header(
+                draw, ssid, ip_addr, state,
+                show_company=(view == "wifi"),
+                badge=BABYROS_BADGE if zenoh_up else None,
+            )
             if view == "wifi":
                 draw_wifi_view(draw, networks, saved, selection)
             else:
-                draw_edge_view(draw, robot_edge_pid(), variant)
+                draw_edge_view(draw, pid, variant, zenoh_up)
             display.ShowImage(splash)
             dirty = False
         else:
