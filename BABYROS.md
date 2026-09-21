@@ -308,7 +308,13 @@ operator console (`C:\Users\Public\RoboProtocol-Demo\bin\zenoh-monitor.exe`).
 .\bin\zenoh-monitor.exe --connect tcp/192.168.2.19:7447 --robot-id xgo_real --all
 .\bin\zenoh-monitor.exe --only commands    # just the operator's commands (and autonomy goals)
 .\bin\zenoh-monitor.exe --only status      # just telemetry + the 5 s summary
+.\bin\zenoh-monitor.exe --only commands --changes   # print a command only when it changes
 ```
+
+`--changes` (alias `--diff`) skips a command that is identical to the last one
+printed. `robot-edge` re-sends an unchanged command every 250 ms, so without it a
+held key repeats on screen; with it you get one line per real change (key pressed,
+released, source changed). Skipped commands are still counted in the summary.
 
 `--only commands` hides telemetry and the summary line (the summary is still
 printed if there are no peers, so "not connected" can't be mistaken for "no
