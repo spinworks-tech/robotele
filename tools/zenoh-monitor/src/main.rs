@@ -41,11 +41,13 @@ struct Args {
     robot_id: String,
     key: Option<String>,
     all: bool,
+    /// Only print a command when it differs from the last one printed.
+    changes: bool,
     show: Show,
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = Args { endpoints: Vec::new(), robot_id: "xgo_real".to_string(), key: None, all: false, show: Show::All };
+    let mut args = Args { endpoints: Vec::new(), robot_id: "xgo_real".to_string(), key: None, all: false, changes: false, show: Show::All };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -53,6 +55,7 @@ fn parse_args() -> Result<Args> {
             "--robot-id" => args.robot_id = it.next().ok_or_else(|| anyhow!("--robot-id needs a value"))?,
             "--key" => args.key = Some(it.next().ok_or_else(|| anyhow!("--key needs a value"))?),
             "--all" => args.all = true,
+            "--changes" | "--diff" => args.changes = true,
             "--only" => {
                 args.show = match it.next().ok_or_else(|| anyhow!("--only needs a value (commands|status)"))?.as_str() {
                     "commands" | "command" | "cmd" => Show::Commands,
@@ -62,12 +65,14 @@ fn parse_args() -> Result<Args> {
             }
             "-h" | "--help" => {
                 println!(
-                    "Usage: zenoh-monitor [--connect tcp/HOST:PORT]... [--robot-id ID] [--key KEYEXPR] [--only commands|status] [--all]\n\n  \
+                    "Usage: zenoh-monitor [--connect tcp/HOST:PORT]... [--robot-id ID] [--key KEYEXPR] [--only commands|status] [--changes] [--all]\n\n  \
                      --connect   Zenoh endpoint of robot-edge (repeatable). Default: {DEFAULT_ENDPOINT}\n  \
                      --robot-id  robot-edge's --robot-id. Default: xgo_real\n  \
                      --key       Key expression to listen on. Default: robotele/<robot-id>/**\n  \
                      --only      commands: just the operator's commands (and autonomy goals)\n              \
                      status: just the robot's telemetry + the 5 s summary. Default: both\n  \
+                     --changes   Print a command only when it differs from the last one printed\n              \
+                     (robot-edge re-sends an unchanged command every 250 ms)\n  \
                      --all       Print every sample (default: telemetry lines + a rate summary\n              \
                      for other topics such as autonomy_goal, which can arrive at ~10 Hz)\n\n\
                      Ctrl+C to quit."
@@ -141,6 +146,11 @@ fn decode_command(b: &[u8]) -> Option<Command> {
 /// the control source or the moving/idle state flips (those always print).
 const COMMAND_PRINT_EVERY: Duration = Duration::from_millis(200);
 
+/// `--changes`: is this payload identical to the last one we printed?
+fn is_repeat(changes: bool, last_printed: Option<&[u8]>, payload: &[u8]) -> bool {
+    changes && last_printed == Some(payload)
+}
+
 #[derive(Default)]
 struct TopicStats {
     total: u64,
@@ -168,6 +178,7 @@ async fn main() -> Result<()> {
     summary.tick().await; // first tick fires immediately; skip it
     let mut last_summary = Instant::now();
     let mut last_cmd: Option<(u8, bool, Instant)> = None;
+    let mut last_printed_cmd: Option<Vec<u8>> = None;
 
     loop {
         tokio::select! {
@@ -220,9 +231,14 @@ async fn main() -> Result<()> {
                         Some(cmd) => {
                             let flipped = last_cmd.map_or(true, |(src, idle, _)| src != cmd.source || idle != cmd.idle);
                             let due = last_cmd.map_or(true, |(_, _, at)| at.elapsed() >= COMMAND_PRINT_EVERY);
-                            if args.all || flipped || due {
+                            // Compared with the last *printed* payload, not the last received one: a change
+                            // that the rate limit held back is still pending, and prints when it comes due
+                            // (via robot-edge's 250 ms repeat) instead of being lost.
+                            let repeat = is_repeat(args.changes, last_printed_cmd.as_deref(), &payload);
+                            if !repeat && (args.all || flipped || due) {
                                 println!("[t+{t:>7.1}s] {topic}  cmd {}", cmd.text);
                                 last_cmd = Some((cmd.source, cmd.idle, Instant::now()));
+                                last_printed_cmd = Some(payload.to_vec());
                             }
                         }
                         None => println!("[t+{t:>7.1}s] {topic}  {} B  (unrecognized command layout)", payload.len()),
@@ -291,6 +307,14 @@ mod tests {
         assert!(!Show::Commands.telemetry() && Show::Commands.commands());
         assert!(!Show::Commands.summary(1), "commands-only hides the summary while connected");
         assert!(Show::Commands.summary(0), "but still warns when there are no peers");
+    }
+
+    #[test]
+    fn changes_flag_only_suppresses_identical_commands() {
+        assert!(is_repeat(true, Some(&[1, 2]), &[1, 2]));
+        assert!(!is_repeat(true, Some(&[1, 2]), &[1, 3]), "a different command always passes");
+        assert!(!is_repeat(true, None, &[1, 2]), "the first command always passes");
+        assert!(!is_repeat(false, Some(&[1, 2]), &[1, 2]), "without --changes nothing is suppressed");
     }
 
     #[test]
