@@ -27,8 +27,15 @@ pub struct Watchdog {
 
 impl Watchdog {
     pub fn new(task_class: TaskClass, now: Instant) -> Self {
+        Self::with_threshold_ms(task_class.watchdog_blackout_ms(), now)
+    }
+
+    /// Same as `new`, but with an explicit blackout threshold instead of
+    /// the one implied by `TaskClass` -- e.g. for operating on a link
+    /// known to have worse jitter than the task class's tier assumes.
+    pub fn with_threshold_ms(threshold_ms: f64, now: Instant) -> Self {
         Self {
-            threshold_ms: task_class.watchdog_blackout_ms(),
+            threshold_ms,
             last_heartbeat: now,
             triggered: false,
             trigger_events: Vec::new(),

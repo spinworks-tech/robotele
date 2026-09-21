@@ -1,0 +1,14 @@
+[Unit]
+Description=XGO Lite WiFi/robot-edge LCD panel
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/usr/bin/python3 /home/pi/xgo_wifi_edge_panel.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

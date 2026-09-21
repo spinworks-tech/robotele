@@ -160,6 +160,7 @@ impl TeleopCommand {
 /// so this works for either the base kit or one with the arm attached
 /// (see xgo_profile.rs's dof_count), derived from the remaining byte
 /// count rather than hardcoded.
+#[derive(Clone)]
 pub struct TelemetryData {
     pub battery: u8,
     pub roll: f32,

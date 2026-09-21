@@ -8,6 +8,7 @@ mod safety_task;
 mod session_handler;
 mod video;
 mod xgo_profile;
+mod zenoh_bridge;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,12 +27,26 @@ struct Cli {
     key: String,
     ca: String,
     robot_id: String,
+    /// TCP port the Channel C Zenoh sidecar listens on -- see `--zenoh-port`.
+    zenoh_port: u16,
     task_class: TaskClass,
     tick_hz: u32,
     bridge_script: PathBuf,
     stub_bridge: bool,
     serial_port: String,
+    /// The `xgo_bridge.py` subprocess's own hardware watchdog -- unrelated
+    /// to `estop_watchdog_ms` below (see its doc comment).
     watchdog_ms: f64,
+    /// Overrides `task_class`'s `watchdog_blackout_ms()` for the Channel B
+    /// command watchdog that latches E-Stop on the robot side (SR-4.1).
+    /// `None` keeps the existing task-class-derived default (200/300/400/
+    /// 500ms for B/C/D/E) exactly as before this flag existed -- this is a
+    /// distinct system from `watchdog_ms` above (the bridge subprocess's
+    /// own watchdog against the serial link), which this does not affect.
+    /// Intended for links known to be jitterier than the task class
+    /// assumes (e.g. an isolated demo AP) -- loosening it trades off how
+    /// fast the robot safety-stops on a real command dropout.
+    estop_watchdog_ms: Option<f64>,
     enable_camera: bool,
     camera_bin: String,
     record_dir: Option<PathBuf>,
@@ -66,6 +81,11 @@ impl Cli {
         let mut key = "certs/robot/robot.key".to_string();
         let mut ca = "certs/dev-ca/ca.crt".to_string();
         let mut robot_id = "xgo_lite_v2".to_string();
+        // Zenoh's own conventional default TCP port. Fixed rather than the
+        // library default's ephemeral (`:0`) peer-mode listen port, so a
+        // firewall rule or a BabyROS node's `connect` endpoint has something
+        // stable to target -- see zenoh_bridge::config_with_port.
+        let mut zenoh_port = 7447u16;
         let mut task_class = TaskClass::D;
         let mut tick_hz = 50u32;
         let mut bridge_script = PathBuf::from("xgo_bridge/xgo_bridge.py");
@@ -74,6 +94,7 @@ impl Cli {
         // Matches xgo_bridge.py's default -- see that file's module
         // docstring for why 150ms fired spuriously on real hardware.
         let mut watchdog_ms = 400.0f64;
+        let mut estop_watchdog_ms: Option<f64> = None;
         let mut enable_camera = false;
         let mut camera_bin = "libcamera-vid".to_string();
         let mut record_dir = None;
@@ -92,6 +113,7 @@ impl Cli {
                 "--key" => key = it.next().context("--key needs a value")?,
                 "--ca" => ca = it.next().context("--ca needs a value")?,
                 "--robot-id" => robot_id = it.next().context("--robot-id needs a value")?,
+                "--zenoh-port" => zenoh_port = it.next().context("--zenoh-port needs a value")?.parse()?,
                 "--task-class" => {
                     task_class = match it.next().context("--task-class needs a value")?.as_str() {
                         "B" => TaskClass::B,
@@ -106,6 +128,7 @@ impl Cli {
                 "--stub-bridge" => stub_bridge = true,
                 "--serial-port" => serial_port = it.next().context("--serial-port needs a value")?,
                 "--watchdog-ms" => watchdog_ms = it.next().context("--watchdog-ms needs a value")?.parse()?,
+                "--estop-watchdog-ms" => estop_watchdog_ms = Some(it.next().context("--estop-watchdog-ms needs a value")?.parse()?),
                 "--camera" => enable_camera = true,
                 "--camera-bin" => camera_bin = it.next().context("--camera-bin needs a value")?,
                 "--record-dir" => record_dir = Some(PathBuf::from(it.next().context("--record-dir needs a value")?)),
@@ -125,8 +148,9 @@ impl Cli {
                 "-h" | "--help" => {
                     println!(
                         "Usage: robot-edge [--listen ADDR] [--cert PATH] [--key PATH] [--ca PATH]\n  \
-                         [--robot-id ID] [--task-class B|C|D|E] [--tick-hz N]\n  \
+                         [--robot-id ID] [--zenoh-port N] [--task-class B|C|D|E] [--tick-hz N]\n  \
                          [--bridge-script PATH] [--stub-bridge] [--serial-port PATH] [--watchdog-ms N]\n  \
+                         [--estop-watchdog-ms N]\n  \
                          [--camera] [--camera-bin PATH]\n  \
                          [--record-dir PATH] [--record video,command,telemetry,haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
@@ -148,12 +172,14 @@ impl Cli {
             key,
             ca,
             robot_id,
+            zenoh_port,
             task_class,
             tick_hz,
             bridge_script,
             stub_bridge,
             serial_port,
             watchdog_ms,
+            estop_watchdog_ms,
             enable_camera,
             camera_bin,
             record_dir,
@@ -193,7 +219,10 @@ impl Cli {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Zenoh (zenoh_bridge.rs) panics at startup on tokio's current_thread
+// scheduler; one worker thread keeps the same effective concurrency model
+// (main future runs on this thread, only spawned tasks use the worker).
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse()?;
@@ -221,7 +250,9 @@ async fn main() -> Result<()> {
         key_path: cli.key,
         ca_path: cli.ca,
         task_class: cli.task_class,
+        watchdog_threshold_ms: cli.estop_watchdog_ms.unwrap_or_else(|| cli.task_class.watchdog_blackout_ms()),
         robot_id: cli.robot_id,
+        zenoh_port: cli.zenoh_port,
         tick_hz: cli.tick_hz,
         bridge: BridgeConfig {
             python_bin: "python3".to_string(),

@@ -40,7 +40,13 @@ pub struct ServerArgs {
     pub key_path: String,
     pub ca_path: String,
     pub task_class: TaskClass,
+    /// Overrides `task_class`'s own `watchdog_blackout_ms()` for the
+    /// Channel B command watchdog -- see `--watchdog-ms`. Kept separate
+    /// from `bridge`'s own watchdog config, which this does not affect.
+    pub watchdog_threshold_ms: f64,
     pub robot_id: String,
+    /// TCP port the Channel C Zenoh sidecar listens on -- see `--zenoh-port`.
+    pub zenoh_port: u16,
     pub tick_hz: u32,
     pub bridge: BridgeConfig,
     pub camera_config: Option<capture::CaptureConfig>,
@@ -65,6 +71,11 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
     // down and rebuilt with every new connection. `Recorder` is cheap to
     // clone (an `Arc` underneath) into each `Session`.
     let recorder = roboprotocol_recording::Recorder::start(args.recording.clone())?;
+
+    // Started once, outside the reconnect loop, same reasoning as `recorder`
+    // above: the Zenoh session and its background tasks persist across
+    // reconnects. Both handles are cheap to clone into each `Session`.
+    let (telemetry_sink, autonomy_goal) = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port).await;
 
     // v0 keeps the single-active-connection design (no CID-routing table for
     // concurrent clients -- see module docs) but must not let one connection
@@ -132,11 +143,13 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             robot_id: args.robot_id.clone(),
             profile: profile.clone(),
             cameras: cameras.clone(),
-            safety: SafetyTask::new(args.task_class, Instant::now()),
+            safety: SafetyTask::with_watchdog_threshold_ms(args.task_class, args.watchdog_threshold_ms, Instant::now()),
             bridge,
             video_rx,
             camera_controls_tx,
             camera_control_dedup: CameraControlDedup::new(),
+            telemetry_sink: telemetry_sink.clone(),
+            autonomy_goal: autonomy_goal.clone(),
             phase: Phase::AwaitingHello,
             channel_b_seq: 0,
             estop_seq: 0,
@@ -181,6 +194,12 @@ struct Session {
     /// At-most-once application of `CameraControl` RPCs, same reasoning as
     /// `trigger_dedup` below.
     camera_control_dedup: CameraControlDedup,
+    /// Channel C sidecar (spinworks-tech/robotele#5): fire-and-forget
+    /// telemetry-out, never on the safety-critical path. See zenoh_bridge.rs.
+    telemetry_sink: crate::zenoh_bridge::TelemetrySink,
+    /// Channel C sidecar: freshness-gated semi-autonomy goal-in, read once
+    /// per safety tick. See zenoh_bridge.rs.
+    autonomy_goal: crate::zenoh_bridge::AutonomyGoal,
     phase: Phase,
     channel_b_seq: u64,
     estop_seq: u64,
@@ -457,7 +476,7 @@ impl Session {
             return;
         }
         use roboprotocol_core::safety::ControlSource;
-        if self.safety.tick(Instant::now()) != ControlSource::FullTeleoperation {
+        if self.safety.tick(Instant::now(), self.autonomy_goal.asserted()) != ControlSource::FullTeleoperation {
             tracing::debug!(action_id = trigger.action_id, "ActionTrigger dropped: not in Full Teleoperation");
             return;
         }
@@ -573,7 +592,7 @@ impl Session {
     }
 
     fn dispatch_teleop_command(&mut self, cmd: &TeleopCommand) -> roboprotocol_core::safety::ControlSource {
-        let source = self.safety.tick(Instant::now());
+        let source = self.safety.tick(Instant::now(), self.autonomy_goal.asserted());
         use roboprotocol_core::safety::ControlSource;
         match source {
             ControlSource::FullTeleoperation => {
@@ -664,7 +683,7 @@ impl Session {
     async fn on_tick(&mut self) -> Result<()> {
         let now = Instant::now();
         self.tick_count += 1;
-        let source = self.safety.tick(now);
+        let source = self.safety.tick(now, self.autonomy_goal.asserted());
         let latched = self.safety.is_estopped();
 
         if !self.estop_stream_primed && self.conn.is_established() {
@@ -757,13 +776,16 @@ impl Session {
     fn on_bridge_event(&mut self, event: SupervisorEvent) {
         match event {
             SupervisorEvent::FromBridge(crate::bridge::BridgeEvent::Telemetry { motors, battery, roll, pitch, yaw, .. }) => {
-                self.latest_telemetry = Some(channel_b::TelemetryData {
+                let data = channel_b::TelemetryData {
                     battery,
                     roll: roll as f32,
                     pitch: pitch as f32,
                     yaw: yaw as f32,
                     motors: motors.into_iter().map(|m| m as f32).collect(),
-                });
+                };
+                // Channel C sidecar: fire-and-forget, never blocks this path.
+                self.telemetry_sink.publish(data.clone());
+                self.latest_telemetry = Some(data);
             }
             SupervisorEvent::FromBridge(ev) => tracing::debug!(?ev, "bridge event"),
             SupervisorEvent::ProcessDied { attempt, will_retry } => {

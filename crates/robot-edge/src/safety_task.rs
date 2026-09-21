@@ -5,10 +5,12 @@
 //! and `resume_dwell_exceeded` are always `false` -- there's no operator
 //! control wired up yet to request Emergency Safe Parking, and no
 //! configurable dwell timer for auto-escalating out of Active Impedance
-//! Hold. `autonomy_goal_asserted` is always `false` -- v0 has no
-//! semi-autonomy source. The arbitration ladder itself (in
-//! `roboprotocol-core`) is fully implemented; only these v0-specific
-//! input sources are stubbed.
+//! Hold. The arbitration ladder itself (in `roboprotocol-core`) is fully
+//! implemented; only these v0-specific input sources are stubbed.
+//!
+//! `autonomy_goal_asserted` is no longer stubbed: it's passed into
+//! `tick` from `zenoh_bridge::AutonomyGoal`, a freshness-gated flag fed by
+//! the Channel C autonomy-goal subscriber (spinworks-tech/robotele#5).
 
 use std::time::Instant;
 
@@ -24,9 +26,16 @@ pub struct SafetyTask {
 
 impl SafetyTask {
     pub fn new(task_class: TaskClass, now: Instant) -> Self {
+        Self::with_watchdog_threshold_ms(task_class, task_class.watchdog_blackout_ms(), now)
+    }
+
+    /// Same as `new`, but overriding the watchdog's blackout threshold
+    /// instead of using the one implied by `task_class` -- see
+    /// `--watchdog-ms` in `robot-edge`'s CLI.
+    pub fn with_watchdog_threshold_ms(task_class: TaskClass, watchdog_threshold_ms: f64, now: Instant) -> Self {
         Self {
             state_machine: SafetyStateMachine::new(task_class, now),
-            watchdog: Watchdog::new(task_class, now),
+            watchdog: Watchdog::with_threshold_ms(watchdog_threshold_ms, now),
             explicit_estop: false,
             deadman_held: false,
             command_fresh: false,
@@ -62,7 +71,11 @@ impl SafetyTask {
 
     /// Poll periodically (the safety tick). Also polls the watchdog for a
     /// blackout trip. Returns the arbitrated control source for this tick.
-    pub fn tick(&mut self, now: Instant) -> ControlSource {
+    ///
+    /// `autonomy_goal_asserted` comes from `zenoh_bridge::AutonomyGoal`,
+    /// already freshness-gated -- passed in rather than read here so this
+    /// module stays free of any Zenoh/tokio dependency.
+    pub fn tick(&mut self, now: Instant, autonomy_goal_asserted: bool) -> ControlSource {
         self.watchdog.check(now);
 
         let inputs = ArbitrationInputs {
@@ -74,7 +87,7 @@ impl SafetyTask {
                 && self.command_fresh
                 && !self.state_machine.is_suspended()
                 && self.state_machine.tier() <= 3,
-            autonomy_goal_asserted: false,
+            autonomy_goal_asserted,
         };
         arbitrate(inputs)
     }
@@ -92,8 +105,8 @@ mod tests {
         task.deadman_held = true;
         task.command_fresh = true;
 
-        assert_eq!(task.tick(t0), ControlSource::FullTeleoperation);
-        assert_eq!(task.tick(t0 + Duration::from_millis(401)), ControlSource::EStop);
+        assert_eq!(task.tick(t0, false), ControlSource::FullTeleoperation);
+        assert_eq!(task.tick(t0 + Duration::from_millis(401), false), ControlSource::EStop);
     }
 
     #[test]
@@ -105,13 +118,13 @@ mod tests {
         task.on_channel_b_activity(Some(10.0), t0);
 
         task.trigger_explicit_estop();
-        assert_eq!(task.tick(t0 + Duration::from_millis(1)), ControlSource::EStop);
+        assert_eq!(task.tick(t0 + Duration::from_millis(1), false), ControlSource::EStop);
         task.on_channel_b_activity(Some(10.0), t0 + Duration::from_millis(2));
-        assert_eq!(task.tick(t0 + Duration::from_millis(2)), ControlSource::EStop, "must not clear itself on fresh activity");
+        assert_eq!(task.tick(t0 + Duration::from_millis(2), false), ControlSource::EStop, "must not clear itself on fresh activity");
 
         task.clear_explicit_estop(t0 + Duration::from_millis(3));
         task.on_channel_b_activity(Some(10.0), t0 + Duration::from_millis(3));
-        assert_eq!(task.tick(t0 + Duration::from_millis(3)), ControlSource::FullTeleoperation);
+        assert_eq!(task.tick(t0 + Duration::from_millis(3), false), ControlSource::FullTeleoperation);
     }
 
     #[test]
@@ -121,6 +134,24 @@ mod tests {
         task.deadman_held = true;
         task.command_fresh = true;
         task.on_channel_b_activity(Some(600.0), t0); // Class D SUSPENDED at 500ms+
-        assert_eq!(task.tick(t0), ControlSource::ActiveImpedanceHold);
+        assert_eq!(task.tick(t0, false), ControlSource::ActiveImpedanceHold);
+    }
+
+    #[test]
+    fn autonomy_goal_wins_only_when_teleop_not_ready() {
+        let t0 = Instant::now();
+        let mut task = SafetyTask::new(TaskClass::D, t0);
+        // No deadman/fresh command: teleop_ready is false.
+        assert_eq!(task.tick(t0, true), ControlSource::SemiAutonomous);
+        assert_eq!(task.tick(t0, false), ControlSource::ActiveImpedanceHold, "fail-safe default with no autonomy goal either");
+    }
+
+    #[test]
+    fn teleop_preempts_autonomy_goal_regardless_of_assertion() {
+        let t0 = Instant::now();
+        let mut task = SafetyTask::new(TaskClass::D, t0);
+        task.deadman_held = true;
+        task.command_fresh = true;
+        assert_eq!(task.tick(t0, true), ControlSource::FullTeleoperation);
     }
 }
