@@ -19,6 +19,7 @@ SemiAutonomous`). RoboProtocol is deliberately *not* a DimOS transport backend: 
 | --- | --- | --- | --- |
 | robot → DimOS | `robotele/<id>/telemetry` | `joint_state` (`JointState`) | 15 joints, degrees converted to radians |
 | robot → DimOS | `robotele/<id>/telemetry` | `battery_percent` (`Float32`) | 0-100 |
+| robot → DimOS | `robotele/<id>/telemetry` | `imu` (`Imu`) | orientation only, see below |
 | DimOS → robot | `robotele/<id>/autonomy_goal` | `cmd_vel` (`Twist`, input) | see "Driving the robot" |
 
 Not done yet: **video** (see "Known gaps").
@@ -32,7 +33,7 @@ has a valid `orientation` (built from the Euler angles) and marks `angular_veloc
 `linear_acceleration` as not provided with covariance `[0] = -1`, the ROS convention, so
 consumers don't mistake the zeros for measurements. Yaw is whatever the robot reports (0-360),
 but a quaternion cannot hold that, so anything reading `orientation` back gets it wrapped to
-�180� (327.67� becomes -32.33�). The Rerun "Attitude (deg)" panel shows the wrapped values.
+±180° (327.67° becomes -32.33°). The Rerun "Attitude (deg)" panel shows the wrapped values.
 
 ### Joint names
 
