@@ -9,6 +9,7 @@ members = [
     "oculus/gateway",
     "tools/dev-certs",
     "tools/replay-decode",
+    "tools/zenoh-monitor",
 ]
 
 [workspace.package]

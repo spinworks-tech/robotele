@@ -268,6 +268,26 @@ time.sleep(12)
 print(len(got), "samples")            # ~1 per second
 ```
 
+### Live monitor (`zenoh-monitor`)
+
+A small Rust tool that subscribes to `robotele/<robot-id>/**`, decodes the
+telemetry, and shows the data flowing: one line per telemetry sample, plus a
+line every 5 s with connected peers and per-topic rates. Other topics (e.g.
+`autonomy_goal`, ~10 Hz) are counted rather than printed unless you pass `--all`.
+Source: `tools/zenoh-monitor`. The Windows build is in the demo folder next to the
+operator console (`C:\Users\Public\RoboProtocol-Demo\bin\zenoh-monitor.exe`).
+
+```powershell
+.\bin\zenoh-monitor.exe                    # robot at 192.168.2.19:7447, id xgo_real
+.\bin\zenoh-monitor.exe --connect tcp/192.168.2.19:7447 --robot-id xgo_real --all
+```
+
+Telemetry only flows while an `operator-console` session is open. `peers=0`
+means it can't reach the robot's Zenoh port: check the IP, that `robot-edge`
+is the BabyROS build, and that the panel shows `zenoh: ... UP`. Build it with
+`cargo build --release -p zenoh-monitor` (PowerShell on Windows). Multicast
+discovery on the same LAN also works, but `--connect` is more reliable.
+
 ### Full loop with `operator-console`
 
 Telemetry is only produced inside a QUIC session, so start the console too:

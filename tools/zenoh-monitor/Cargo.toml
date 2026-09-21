@@ -1,0 +1,12 @@
+[package]
+name = "zenoh-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Listens to robot-edge's Channel C Zenoh topics (BabyROS sidecar) and shows the data flowing."
+
+[dependencies]
+zenoh = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+anyhow = "1"
