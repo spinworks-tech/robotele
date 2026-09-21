@@ -14,6 +14,7 @@ plain `robot-edge-v0.1.1-*` build on `main`.
 | Direction | Zenoh key | What |
 | --- | --- | --- |
 | robot → world | `robotele/<robot-id>/telemetry` | Robot telemetry, ~1 Hz (the bridge is polled every 50 ticks) |
+| robot → world | `robotele/<robot-id>/command` | The operator's command and the control source it was arbitrated to. **Not in the v0.1.2 binary**: needs a build from a later commit (see below) |
 | world → robot | `robotele/<robot-id>/autonomy_goal` | "A semi-autonomy source wants control" |
 
 `<robot-id>` is robot-edge's `--robot-id` (e.g. `xgo_real`).
@@ -54,6 +55,27 @@ def unpack(b):
     motors = [v / 100 for v in struct.unpack(f">{(len(b) - 7) // 2}h", b[7:])]
     return battery, roll, pitch, yaw, motors
 ```
+
+### Command payload
+
+`robotele/<id>/command` is the operator's *requested* command plus the source the
+arbitration ladder picked for it, published from the same place commands are
+dispatched to the robot. It is still published while E-Stopped (you see what the
+operator asked for even when it isn't applied). Big-endian, 30 bytes:
+
+| Bytes | Field |
+| --- | --- |
+| 0 | control source `u8`: 0 EStop, 1 EmergencySafeParking, 2 ActiveImpedanceHold, 3 FullTeleoperation, 4 SemiAutonomous |
+| 1–4, 5–8, 9–12 | vx, vy, turn, `f32` |
+| 13–16, 17–20, 21–24 | attitude roll, pitch, yaw, `f32` |
+| 25–26, 27–28 | arm x, arm z, `i16` |
+| 29 | claw, `u8` |
+
+To keep 50 Hz operator input from becoming 50 Hz of Zenoh traffic on the Pi, a
+sample is sent only when the command or its source changes, plus a repeat every
+250 ms while unchanged. Like telemetry it is fire-and-forget and can never stall
+a control tick. Watching this topic while publishing to `autonomy_goal` shows the
+source flip to `SemiAutonomous` (only when not E-Stopped and nobody is driving).
 
 ## Setup
 
@@ -271,9 +293,13 @@ print(len(got), "samples")            # ~1 per second
 ### Live monitor (`zenoh-monitor`)
 
 A small Rust tool that subscribes to `robotele/<robot-id>/**`, decodes the
-telemetry, and shows the data flowing: one line per telemetry sample, plus a
-line every 5 s with connected peers and per-topic rates. Other topics (e.g.
-`autonomy_goal`, ~10 Hz) are counted rather than printed unless you pass `--all`.
+telemetry and the operator commands, and shows the data flowing: one line per
+telemetry sample, command lines like `cmd [FullTeleop] vx=+0.40 turn=+0.00 ...`
+(at most ~5/s, but always immediately when the control source or moving/idle
+state changes), plus a line every 5 s with connected peers and per-topic rates.
+Other topics (e.g. `autonomy_goal`, ~10 Hz) are counted rather than printed unless
+you pass `--all`. Command lines need a `robot-edge` build that includes the
+`command` topic; against v0.1.2 you'll just see telemetry.
 Source: `tools/zenoh-monitor`. The Windows build is in the demo folder next to the
 operator console (`C:\Users\Public\RoboProtocol-Demo\bin\zenoh-monitor.exe`).
 

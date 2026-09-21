@@ -23,7 +23,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::channel_b::TelemetryData;
+use roboprotocol_core::recording::control_source_byte;
+use roboprotocol_core::safety::ControlSource;
+
+use crate::channel_b::{TeleopCommand, TelemetryData};
 
 /// An autonomy goal is only honored while a message arrived within this
 /// window -- absence of fresh messages decays to "not asserted" rather than
@@ -34,6 +37,10 @@ const AUTONOMY_GOAL_TTL: Duration = Duration::from_millis(500);
 
 fn telemetry_topic(robot_id: &str) -> String {
     format!("robotele/{robot_id}/telemetry")
+}
+
+fn command_topic(robot_id: &str) -> String {
+    format!("robotele/{robot_id}/command")
 }
 
 fn autonomy_goal_topic(robot_id: &str) -> String {
@@ -91,6 +98,64 @@ impl TelemetrySink {
     }
 }
 
+/// How often an unchanged operator command is re-published, so a monitor that
+/// joins late (or missed a sample) still sees the current state.
+const COMMAND_REPEAT: Duration = Duration::from_millis(250);
+
+/// Wire layout of a `robotele/<id>/command` sample, big-endian, 30 bytes:
+/// `control_source u8` (same numbering as the recordings: 0 EStop, 1
+/// EmergencySafeParking, 2 ActiveImpedanceHold, 3 FullTeleoperation, 4
+/// SemiAutonomous), then `vx, vy, turn, roll, pitch, yaw` as `f32`, `arm_x,
+/// arm_z` as `i16`, `claw` as `u8`. It is the operator's *requested* command
+/// and the source that was arbitrated for it -- not necessarily what reached
+/// the motors (e.g. it is still published while E-Stopped).
+pub fn encode_command(source: ControlSource, cmd: &TeleopCommand) -> Vec<u8> {
+    let mut out = Vec::with_capacity(30);
+    out.push(control_source_byte(source));
+    for v in [cmd.vx, cmd.vy, cmd.turn, cmd.attitude_r, cmd.attitude_p, cmd.attitude_y] {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out.extend_from_slice(&cmd.arm_x.to_be_bytes());
+    out.extend_from_slice(&cmd.arm_z.to_be_bytes());
+    out.push(cmd.claw);
+    out
+}
+
+/// Send handle for the operator-command publisher. Like `TelemetrySink`, it
+/// never blocks: `try_send` into a depth-1 channel drained by its own task.
+/// Publishes only when the command or its arbitrated source changed, plus a
+/// repeat every [`COMMAND_REPEAT`], so 50 Hz operator input doesn't become
+/// 50 Hz of Zenoh traffic on the CM4. A sample dropped because the channel was
+/// full is retried on the next tick (it isn't recorded as sent).
+#[derive(Clone)]
+pub struct CommandSink {
+    tx: mpsc::Sender<Vec<u8>>,
+    last: Option<(Vec<u8>, Instant)>,
+}
+
+impl CommandSink {
+    pub fn publish(&mut self, source: ControlSource, cmd: &TeleopCommand) {
+        self.publish_at(Instant::now(), source, cmd);
+    }
+
+    fn publish_at(&mut self, now: Instant, source: ControlSource, cmd: &TeleopCommand) {
+        let payload = encode_command(source, cmd);
+        if let Some((last, at)) = &self.last {
+            if *last == payload && now.saturating_duration_since(*at) < COMMAND_REPEAT {
+                return;
+            }
+        }
+        if self.tx.try_send(payload.clone()).is_ok() {
+            self.last = Some((payload, now));
+        }
+    }
+}
+
+fn inert_command_sink() -> CommandSink {
+    let (tx, _rx) = mpsc::channel(1);
+    CommandSink { tx, last: None }
+}
+
 /// A no-op sink for when the sidecar didn't start (Zenoh session failed to
 /// open) or is disabled -- callers publish unconditionally rather than
 /// threading an `Option` through the control loop.
@@ -121,18 +186,19 @@ fn config_with_port(port: u16) -> zenoh::Config {
 /// on any Zenoh failure, logs a warning and returns an inert sink / a goal
 /// that's never asserted, so the caller never needs a fallback branch of its
 /// own.
-pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, AutonomyGoal) {
+pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, CommandSink, AutonomyGoal) {
     let goal = AutonomyGoal::new();
 
     let session = match zenoh::open(config_with_port(port)).await {
         Ok(session) => session,
         Err(e) => {
             tracing::warn!(error = ?e, "zenoh session open failed, Channel C sidecar disabled this run");
-            return (inert_sink(), goal);
+            return (inert_sink(), inert_command_sink(), goal);
         }
     };
 
     let (tx, mut rx) = mpsc::channel::<TelemetryData>(1);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<Vec<u8>>(1);
 
     match session.declare_publisher(telemetry_topic(robot_id)).await {
         Ok(publisher) => {
@@ -151,6 +217,21 @@ pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, AutonomyGoal) {
         }
         Err(e) => {
             tracing::warn!(error = ?e, "zenoh telemetry publisher declare failed, telemetry sidecar disabled this run");
+        }
+    }
+
+    match session.declare_publisher(command_topic(robot_id)).await {
+        Ok(publisher) => {
+            tokio::spawn(async move {
+                while let Some(payload) = cmd_rx.recv().await {
+                    if let Err(e) = publisher.put(payload).await {
+                        tracing::warn!(error = ?e, "zenoh command publish failed");
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "zenoh command publisher declare failed, command stream disabled this run");
         }
     }
 
@@ -174,5 +255,55 @@ pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, AutonomyGoal) {
     // from under the publisher task.
     std::mem::forget(session);
 
-    (TelemetrySink(tx), goal)
+    (TelemetrySink(tx), CommandSink { tx: cmd_tx, last: None }, goal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cmd(vx: f32) -> TeleopCommand {
+        TeleopCommand { vx, vy: 0.0, turn: 0.0, attitude_r: 0.0, attitude_p: 0.0, attitude_y: 0.0, arm_x: 10, arm_z: -20, claw: 128 }
+    }
+
+    #[test]
+    fn command_layout_is_30_bytes_with_source_first() {
+        let b = encode_command(ControlSource::FullTeleoperation, &cmd(0.5));
+        assert_eq!(b.len(), 30);
+        assert_eq!(b[0], 3);
+        assert_eq!(f32::from_be_bytes(b[1..5].try_into().unwrap()), 0.5);
+        assert_eq!(i16::from_be_bytes(b[25..27].try_into().unwrap()), 10);
+        assert_eq!(i16::from_be_bytes(b[27..29].try_into().unwrap()), -20);
+        assert_eq!(b[29], 128);
+    }
+
+    #[test]
+    fn unchanged_commands_are_throttled_but_changes_and_repeats_go_out() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut sink = CommandSink { tx, last: None };
+        let t0 = Instant::now();
+        sink.publish_at(t0, ControlSource::FullTeleoperation, &cmd(0.5));
+        sink.publish_at(t0 + Duration::from_millis(20), ControlSource::FullTeleoperation, &cmd(0.5)); // same, too soon
+        assert_eq!(rx.try_recv().unwrap()[0], 3);
+        assert!(rx.try_recv().is_err(), "identical command within the repeat window must not be re-sent");
+
+        sink.publish_at(t0 + Duration::from_millis(40), ControlSource::FullTeleoperation, &cmd(0.6)); // changed
+        assert!(rx.try_recv().is_ok());
+        sink.publish_at(t0 + Duration::from_millis(60), ControlSource::EStop, &cmd(0.6)); // source changed
+        assert_eq!(rx.try_recv().unwrap()[0], 0);
+        sink.publish_at(t0 + Duration::from_millis(400), ControlSource::EStop, &cmd(0.6)); // repeat interval elapsed
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_full_channel_drops_the_sample_and_retries_next_tick() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut sink = CommandSink { tx, last: None };
+        let t0 = Instant::now();
+        sink.publish_at(t0, ControlSource::FullTeleoperation, &cmd(0.1)); // fills the channel
+        sink.publish_at(t0 + Duration::from_millis(10), ControlSource::FullTeleoperation, &cmd(0.2)); // dropped (full)
+        assert_eq!(f32::from_be_bytes(rx.try_recv().unwrap()[1..5].try_into().unwrap()), 0.1);
+        sink.publish_at(t0 + Duration::from_millis(20), ControlSource::FullTeleoperation, &cmd(0.2)); // retried
+        assert_eq!(f32::from_be_bytes(rx.try_recv().unwrap()[1..5].try_into().unwrap()), 0.2);
+    }
 }
