@@ -676,7 +676,10 @@ impl Session {
                 let seq = self.next_seq();
                 let _ = self.bridge.cmd_tx.send(BridgeCommand::Stop { seq });
             }
-            ControlSource::SemiAutonomous => {} // v0: no autonomy goals exist yet
+            // Driven from `on_tick` (which runs even when no operator command
+            // arrives), not here: an operator datagram must not be the thing
+            // that keeps an autonomy goal alive.
+            ControlSource::SemiAutonomous => {}
         }
         source
     }
@@ -737,6 +740,18 @@ impl Session {
             self.bridge_estop_active = false;
             let clear_seq = self.next_seq();
             let _ = self.bridge.cmd_tx.send(BridgeCommand::EstopClear { seq: clear_seq });
+        }
+
+        // Semi-autonomy (Channel C `autonomy_goal`): only reached when the
+        // arbitration ladder ranked it above ActiveImpedanceHold, i.e. no
+        // E-Stop/suspension and no ready teleop. Velocity is already clamped to
+        // the operator's own limits and decays to zero with the goal's TTL.
+        if source == roboprotocol_core::safety::ControlSource::SemiAutonomous {
+            let v = self.autonomy_goal.velocity();
+            let move_seq = self.next_seq();
+            let _ = self.bridge.cmd_tx.send(BridgeCommand::Move { x: v.vx as f64, y: v.vy as f64, seq: move_seq });
+            let turn_seq = self.next_seq();
+            let _ = self.bridge.cmd_tx.send(BridgeCommand::Turn { step: v.turn as f64, seq: turn_seq });
         }
 
         if self.tick_count % TELEMETRY_QUERY_EVERY_N_TICKS == 0 {

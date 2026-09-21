@@ -2,7 +2,7 @@ import struct
 
 import pytest
 
-from dimos_roboprotocol.codec import decode_command, decode_telemetry
+from dimos_roboprotocol.codec import decode_command, decode_telemetry, encode_autonomy_goal
 
 
 def test_telemetry_roundtrip():
@@ -24,3 +24,9 @@ def test_command_decode():
     assert (c.vx, c.turn, c.arm_x, c.arm_z, c.claw) == (0.5, -0.25, -80, 155, 200)
     with pytest.raises(ValueError):
         decode_command(b[:-1])
+
+
+def test_autonomy_goal_encodes_and_clamps():
+    assert struct.unpack(">3f", encode_autonomy_goal(5.0, -3.0, 20.0)) == (5.0, -3.0, 20.0)
+    assert struct.unpack(">3f", encode_autonomy_goal(99, -99, 99)) == (15.0, -12.0, 60.0)
+    assert len(encode_autonomy_goal()) == 12

@@ -18,7 +18,7 @@
 //! something teleoperation should ever depend on to start.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -47,20 +47,62 @@ fn autonomy_goal_topic(robot_id: &str) -> String {
     format!("robotele/{robot_id}/autonomy_goal")
 }
 
-/// Shared, lock-free flag fed by the autonomy-goal subscriber and read every
-/// safety tick via `SafetyTask::tick`. Freshness-gated: see `AUTONOMY_GOAL_TTL`.
+/// Per-axis limits applied to an autonomy velocity, in the same robot-native
+/// units the operator console sends (xgolib `move_x`/`move_y`/`turn`; see
+/// `operator-console`'s `MOVE_SCALE` / `TURN_SCALE` and the WASD magnitudes).
+/// An autonomy source can therefore never command faster than the operator can.
+pub const AUTONOMY_MAX_VX: f32 = 15.0;
+pub const AUTONOMY_MAX_VY: f32 = 12.0;
+pub const AUTONOMY_MAX_TURN: f32 = 60.0;
+
+/// Velocity carried by an autonomy-goal sample, robot-native units.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AutonomyVelocity {
+    pub vx: f32,
+    pub vy: f32,
+    pub turn: f32,
+}
+
+/// Decodes an `autonomy_goal` payload: `vx, vy, turn` as big-endian `f32`
+/// (12 bytes), clamped to the `AUTONOMY_MAX_*` limits. Any other length (e.g.
+/// the legacy 1-byte "flag only" sample) or a non-finite value decodes to zero
+/// velocity: the goal is still asserted, the robot just holds still.
+pub fn decode_autonomy_velocity(payload: &[u8]) -> AutonomyVelocity {
+    let Ok(b): Result<[u8; 12], _> = payload.try_into() else {
+        return AutonomyVelocity::default();
+    };
+    let f = |i: usize| f32::from_be_bytes(b[i..i + 4].try_into().unwrap());
+    let (vx, vy, turn) = (f(0), f(4), f(8));
+    if !(vx.is_finite() && vy.is_finite() && turn.is_finite()) {
+        return AutonomyVelocity::default();
+    }
+    AutonomyVelocity {
+        vx: vx.clamp(-AUTONOMY_MAX_VX, AUTONOMY_MAX_VX),
+        vy: vy.clamp(-AUTONOMY_MAX_VY, AUTONOMY_MAX_VY),
+        turn: turn.clamp(-AUTONOMY_MAX_TURN, AUTONOMY_MAX_TURN),
+    }
+}
+
+/// Shared flag + latest velocity fed by the autonomy-goal subscriber and read
+/// every safety tick via `SafetyTask::tick`. Freshness-gated: see `AUTONOMY_GOAL_TTL`.
 #[derive(Clone)]
 pub struct AutonomyGoal {
     last_seen_ms: Arc<AtomicU64>,
+    velocity: Arc<Mutex<AutonomyVelocity>>,
     epoch: Instant,
 }
 
 impl AutonomyGoal {
     fn new() -> Self {
-        Self { last_seen_ms: Arc::new(AtomicU64::new(0)), epoch: Instant::now() }
+        Self {
+            last_seen_ms: Arc::new(AtomicU64::new(0)),
+            velocity: Arc::new(Mutex::new(AutonomyVelocity::default())),
+            epoch: Instant::now(),
+        }
     }
 
-    fn mark_seen(&self, now: Instant) {
+    fn mark_seen(&self, now: Instant, payload: &[u8]) {
+        *self.velocity.lock().unwrap() = decode_autonomy_velocity(payload);
         let ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
         self.last_seen_ms.store(ms, Ordering::Relaxed);
     }
@@ -76,6 +118,16 @@ impl AutonomyGoal {
         }
         let now_ms = Instant::now().saturating_duration_since(self.epoch).as_millis() as u64;
         now_ms.saturating_sub(last_ms) < AUTONOMY_GOAL_TTL.as_millis() as u64
+    }
+
+    /// The last received velocity while the goal is fresh, else zero, so a
+    /// stale velocity can never keep driving the robot.
+    pub fn velocity(&self) -> AutonomyVelocity {
+        if self.asserted() {
+            *self.velocity.lock().unwrap()
+        } else {
+            AutonomyVelocity::default()
+        }
     }
 }
 
@@ -238,7 +290,7 @@ pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, CommandSink, Au
     {
         let goal = goal.clone();
         let topic = autonomy_goal_topic(robot_id);
-        match session.declare_subscriber(topic).callback(move |_sample| goal.mark_seen(Instant::now())).await {
+        match session.declare_subscriber(topic).callback(move |sample| goal.mark_seen(Instant::now(), &sample.payload().to_bytes())).await {
             Ok(subscriber) => {
                 // Held for the process lifetime: dropping it would undeclare
                 // the subscription. `robot-edge` never tears this down early.
@@ -261,6 +313,36 @@ pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, CommandSink, Au
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn velocity_payload(vx: f32, vy: f32, turn: f32) -> Vec<u8> {
+        [vx, vy, turn].iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn autonomy_velocity_decodes_and_clamps_to_operator_limits() {
+        let v = decode_autonomy_velocity(&velocity_payload(5.0, -3.0, 20.0));
+        assert_eq!(v, AutonomyVelocity { vx: 5.0, vy: -3.0, turn: 20.0 });
+        let v = decode_autonomy_velocity(&velocity_payload(999.0, -999.0, 999.0));
+        assert_eq!(v, AutonomyVelocity { vx: AUTONOMY_MAX_VX, vy: -AUTONOMY_MAX_VY, turn: AUTONOMY_MAX_TURN });
+    }
+
+    #[test]
+    fn autonomy_velocity_fails_safe_to_zero() {
+        assert_eq!(decode_autonomy_velocity(&[1]), AutonomyVelocity::default(), "legacy flag-only sample");
+        assert_eq!(decode_autonomy_velocity(&[]), AutonomyVelocity::default());
+        assert_eq!(decode_autonomy_velocity(&velocity_payload(f32::NAN, 1.0, 1.0)), AutonomyVelocity::default());
+        assert_eq!(decode_autonomy_velocity(&velocity_payload(1.0, f32::INFINITY, 1.0)), AutonomyVelocity::default());
+    }
+
+    #[test]
+    fn goal_velocity_is_zero_until_a_sample_arrives() {
+        let goal = AutonomyGoal::new();
+        assert!(!goal.asserted());
+        assert_eq!(goal.velocity(), AutonomyVelocity::default());
+        goal.mark_seen(Instant::now(), &velocity_payload(4.0, 0.0, 0.0));
+        assert!(goal.asserted());
+        assert_eq!(goal.velocity().vx, 4.0);
+    }
 
     fn cmd(vx: f32) -> TeleopCommand {
         TeleopCommand { vx, vy: 0.0, turn: 0.0, attitude_r: 0.0, attitude_p: 0.0, attitude_y: 0.0, arm_x: 10, arm_z: -20, claw: 128 }

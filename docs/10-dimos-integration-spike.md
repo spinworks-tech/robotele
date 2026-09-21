@@ -58,7 +58,12 @@ A Python package (e.g. `dimos-roboprotocol/`) exposing, via the
    onto DimOS message types (likely `sensor_msgs.JointState`/`Imu`); DimOS uses
    LCM-encoded typed messages on `dimos/<name>/<msg_name>` keys, so a
    translation layer is needed either way.
-2. `autonomy_goal` carries no payload today (any sample = asserted). Real DimOS
-   navigation needs a velocity/goal payload; that is a protocol extension.
+2. `autonomy_goal` now carries an optional `vx, vy, turn` velocity in robot-native
+   units, clamped by `robot-edge` to the operator console's limits and dispatched
+   only while arbitration selects `SemiAutonomous` (see `BABYROS.md`). The adapter
+   maps a DimOS `Twist` (m/s, rad/s) onto it via `max_linear_mps` /
+   `max_angular_rps`, which are **uncalibrated placeholders**: the XGO's real
+   m/s per xgolib unit has not been measured. Calibrate before trusting odometry
+   or nav planners.
 3. Decide whether to propose the adapter upstream after the DimOS-side
    discussion (dimensionalOS/dimos#3751) responds.

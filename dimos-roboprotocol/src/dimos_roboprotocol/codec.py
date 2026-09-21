@@ -63,6 +63,22 @@ def decode_command(b: bytes) -> Command:
     return Command(src, vx, vy, turn, r, p, y, ax, az, claw)
 
 
-def encode_autonomy_goal() -> bytes:
-    """robot-edge ignores the payload: any fresh sample asserts the goal for 500 ms."""
-    return b"\x01"
+# Robot-native per-axis limits; robot-edge clamps to the same values
+# (zenoh_bridge.rs AUTONOMY_MAX_*), matching what the operator console can send.
+MAX_VX = 15.0
+MAX_VY = 12.0
+MAX_TURN = 60.0
+
+
+def _clamp(v: float, limit: float) -> float:
+    return max(-limit, min(limit, v))
+
+
+def encode_autonomy_goal(vx: float = 0.0, vy: float = 0.0, turn: float = 0.0) -> bytes:
+    """`vx, vy, turn` as big-endian f32 in robot-native (xgolib) units.
+
+    Any fresh sample asserts the goal for 500 ms; the velocity is honored only
+    while it is fresh, so a stalled sender stops the robot. Values are clamped
+    here too, but robot-edge is the authority.
+    """
+    return struct.pack(">3f", _clamp(vx, MAX_VX), _clamp(vy, MAX_VY), _clamp(turn, MAX_TURN))

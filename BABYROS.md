@@ -24,9 +24,16 @@ RoboProtocol's QUIC transport; Zenoh is bolted on the side, never in series with
 
 - Telemetry is published fire-and-forget through a depth-1 channel. A slow or
   absent Zenoh peer just drops samples; it can never stall a control tick.
-- The autonomy goal is a single freshness-gated flag: **any** sample on the
-  topic (payload ignored) counts as "asserted" for **500 ms** (`AUTONOMY_GOAL_TTL`).
+- The autonomy goal is a freshness-gated flag: **any** sample on the
+  topic counts as "asserted" for **500 ms** (`AUTONOMY_GOAL_TTL`).
   A stalled/crashed autonomy node stops asserting on its own; nothing latches.
+- The payload may carry a velocity: 12 bytes, big-endian `f32` `vx, vy, turn` in
+  robot-native (xgolib) units, the same units the operator console sends. It is
+  clamped to the console's own limits (`|vx|<=15`, `|vy|<=12`, `|turn|<=60`), and
+  any other length (e.g. a 1-byte flag), NaN or infinity means zero velocity. While
+  arbitration picks `SemiAutonomous`, `robot-edge` sends that velocity to the bridge
+  every tick, and it decays to zero with the 500 ms TTL. This only runs while a QUIC
+  session is up (the tick loop is per-session).
 - The flag feeds `arbitrate()`'s `autonomy_goal_asserted`. The ladder is
   `EStop > EmergencySafeParking > ActiveImpedanceHold > FullTeleoperation > SemiAutonomous`,
   so an autonomy goal only wins when the robot is not E-Stopped/suspended **and**
