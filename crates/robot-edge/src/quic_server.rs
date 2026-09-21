@@ -75,7 +75,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
     // Started once, outside the reconnect loop, same reasoning as `recorder`
     // above: the Zenoh session and its background tasks persist across
     // reconnects. Both handles are cheap to clone into each `Session`.
-    let (telemetry_sink, command_sink, autonomy_goal) = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port).await;
+    let (telemetry_sink, command_sink, autonomy_goal, video_sink) = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port).await;
 
     // v0 keeps the single-active-connection design (no CID-routing table for
     // concurrent clients -- see module docs) but must not let one connection
@@ -133,7 +133,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
         let bridge = BridgeSupervisor::spawn(args.bridge.clone());
         let capture_handle = args.camera_config.clone().map(capture::spawn_capture);
         let camera_controls_tx = capture_handle.as_ref().map(|h| h.controls_tx.clone());
-        let video_rx = capture_handle.map(|h| channel_a::spawn_encoder(h.rx, recorder.clone()));
+        let video_rx = capture_handle.map(|h| channel_a::spawn_encoder(h.rx, recorder.clone(), video_sink.clone()));
 
         let mut session = Session {
             conn,

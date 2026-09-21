@@ -17,11 +17,11 @@
 //! fatal): this is an optional observability/semi-autonomy add-on, not
 //! something teleoperation should ever depend on to start.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use roboprotocol_core::recording::control_source_byte;
 use roboprotocol_core::safety::ControlSource;
@@ -41,6 +41,10 @@ fn telemetry_topic(robot_id: &str) -> String {
 
 fn command_topic(robot_id: &str) -> String {
     format!("robotele/{robot_id}/command")
+}
+
+fn video_topic(robot_id: &str) -> String {
+    format!("robotele/{robot_id}/video")
 }
 
 fn autonomy_goal_topic(robot_id: &str) -> String {
@@ -103,7 +107,9 @@ impl AutonomyGoal {
 
     fn mark_seen(&self, now: Instant, payload: &[u8]) {
         *self.velocity.lock().unwrap() = decode_autonomy_velocity(payload);
-        let ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
+        // +1 so a sample in the epoch's own first millisecond is not stored
+        // as 0, which `asserted` reads as "never seen".
+        let ms = now.saturating_duration_since(self.epoch).as_millis() as u64 + 1;
         self.last_seen_ms.store(ms, Ordering::Relaxed);
     }
 
@@ -116,7 +122,7 @@ impl AutonomyGoal {
         if last_ms == 0 {
             return false; // never seen a message this run
         }
-        let now_ms = Instant::now().saturating_duration_since(self.epoch).as_millis() as u64;
+        let now_ms = Instant::now().saturating_duration_since(self.epoch).as_millis() as u64 + 1;
         now_ms.saturating_sub(last_ms) < AUTONOMY_GOAL_TTL.as_millis() as u64
     }
 
@@ -129,6 +135,56 @@ impl AutonomyGoal {
             AutonomyVelocity::default()
         }
     }
+}
+
+/// Bound on queued critical (SPS/PPS/IDR) NALs. They are rare (about one GOP's
+/// worth per second) so this only fills if the Zenoh peer has wedged; a NAL
+/// dropped here just means the subscriber waits for the next IDR.
+const VIDEO_CRITICAL_QUEUE: usize = 32;
+
+/// Send handle for the Zenoh video tap: every NAL the encoder produces, as an
+/// Annex-B payload (start code prepended), published on `robotele/<id>/video`
+/// **only while at least one subscriber matches**. Same contract as
+/// `TelemetrySink`: it never blocks and never errors into the caller, so a
+/// slow, absent or wedged Zenoh peer cannot affect the QUIC video path or a
+/// control tick.
+///
+/// Mirrors `channel_a`'s own split: SPS/PPS/IDR are queued and always
+/// delivered in order (a decoder cannot recover without them); everything
+/// else is latest-wins and dropped under congestion.
+#[derive(Clone)]
+pub struct VideoSink {
+    critical: mpsc::Sender<Vec<u8>>,
+    delta: Arc<watch::Sender<Option<Vec<u8>>>>,
+    subscribed: Arc<AtomicBool>,
+}
+
+impl VideoSink {
+    /// `payload` is one NAL with its Annex-B start code; `critical` is
+    /// `roboprotocol_core::video::nal_is_critical` for that NAL.
+    pub fn publish(&self, payload: &[u8], critical: bool) {
+        if !self.subscribed.load(Ordering::Relaxed) {
+            return; // nobody is watching: no copy, no queueing
+        }
+        if critical {
+            if self.critical.try_send(payload.to_vec()).is_err() {
+                tracing::trace!("zenoh video critical queue full, dropping NAL");
+            }
+        } else {
+            self.delta.send_replace(Some(payload.to_vec()));
+        }
+    }
+}
+
+/// NAL type of an Annex-B payload that starts with a 4-byte start code.
+fn annexb_nal_type(payload: &[u8]) -> Option<u8> {
+    payload.get(4).map(|b| b & 0x1f)
+}
+
+fn inert_video_sink() -> VideoSink {
+    let (critical, _rx) = mpsc::channel(1);
+    let (delta, _drx) = watch::channel(None);
+    VideoSink { critical, delta: Arc::new(delta), subscribed: Arc::new(AtomicBool::new(false)) }
 }
 
 /// Send handle for the telemetry publisher task. `publish` never blocks and
@@ -233,19 +289,102 @@ fn config_with_port(port: u16) -> zenoh::Config {
     config
 }
 
+/// Declares the video publishers and the task draining them. On any Zenoh
+/// failure returns an inert sink (video simply isn't offered over Zenoh).
+async fn spawn_video(session: &zenoh::Session, robot_id: &str) -> VideoSink {
+    use zenoh::qos::CongestionControl;
+
+    let topic = video_topic(robot_id);
+    // Critical NALs must not be dropped by congestion control; delta NALs
+    // may be (the decoder recovers at the next IDR).
+    let (critical_pub, delta_pub) = match (
+        session.declare_publisher(topic.clone()).congestion_control(CongestionControl::Block).await,
+        session.declare_publisher(topic).congestion_control(CongestionControl::Drop).await,
+    ) {
+        (Ok(c), Ok(d)) => (c, d),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!(error = ?e, "zenoh video publisher declare failed, video tap disabled this run");
+            return inert_video_sink();
+        }
+    };
+
+    let subscribed = Arc::new(AtomicBool::new(false));
+    let (resub_tx, mut resub_rx) = mpsc::channel::<()>(1);
+    {
+        let subscribed = subscribed.clone();
+        match delta_pub
+            .matching_listener()
+            .callback(move |status| {
+                subscribed.store(status.matching(), Ordering::Relaxed);
+                if status.matching() {
+                    // A subscriber joined (possibly mid-GOP): replay SPS/PPS.
+                    let _ = resub_tx.try_send(());
+                }
+            })
+            .await
+        {
+            // Held for the process lifetime, like the other subscriptions.
+            Ok(listener) => std::mem::forget(listener),
+            Err(e) => {
+                tracing::warn!(error = ?e, "zenoh video matching listener failed, video tap disabled this run");
+                return inert_video_sink();
+            }
+        }
+    }
+
+    let (critical_tx, mut critical_rx) = mpsc::channel::<Vec<u8>>(VIDEO_CRITICAL_QUEUE);
+    let (delta_tx, mut delta_rx) = watch::channel::<Option<Vec<u8>>>(None);
+    tokio::spawn(async move {
+        let (mut sps, mut pps): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
+        loop {
+            tokio::select! {
+                biased;
+                Some(payload) = critical_rx.recv() => {
+                    match annexb_nal_type(&payload) {
+                        Some(7) => sps = Some(payload.clone()),
+                        Some(8) => pps = Some(payload.clone()),
+                        _ => {}
+                    }
+                    if let Err(e) = critical_pub.put(payload).await {
+                        tracing::warn!(error = ?e, "zenoh video publish failed");
+                    }
+                }
+                Some(()) = resub_rx.recv() => {
+                    for p in [&sps, &pps].into_iter().flatten() {
+                        let _ = critical_pub.put(p.clone()).await;
+                    }
+                }
+                changed = delta_rx.changed() => {
+                    if changed.is_err() {
+                        return; // every sink dropped
+                    }
+                    let payload = delta_rx.borrow_and_update().clone();
+                    if let Some(p) = payload {
+                        if let Err(e) = delta_pub.put(p).await {
+                            tracing::warn!(error = ?e, "zenoh video publish failed");
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    VideoSink { critical: critical_tx, delta: Arc::new(delta_tx), subscribed }
+}
+
 /// Opens a Zenoh session and starts the telemetry-publisher and
 /// autonomy-goal-subscriber background tasks. Always returns usable handles:
 /// on any Zenoh failure, logs a warning and returns an inert sink / a goal
 /// that's never asserted, so the caller never needs a fallback branch of its
 /// own.
-pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, CommandSink, AutonomyGoal) {
+pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, CommandSink, AutonomyGoal, VideoSink) {
     let goal = AutonomyGoal::new();
 
     let session = match zenoh::open(config_with_port(port)).await {
         Ok(session) => session,
         Err(e) => {
             tracing::warn!(error = ?e, "zenoh session open failed, Channel C sidecar disabled this run");
-            return (inert_sink(), inert_command_sink(), goal);
+            return (inert_sink(), inert_command_sink(), goal, inert_video_sink());
         }
     };
 
@@ -302,12 +441,14 @@ pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, CommandSink, Au
         }
     }
 
+    let video = spawn_video(&session, robot_id).await;
+
     // Keep the session alive for the process lifetime, same reasoning as the
     // subscriber above -- dropping it would close the whole Zenoh session out
     // from under the publisher task.
     std::mem::forget(session);
 
-    (TelemetrySink(tx), CommandSink { tx: cmd_tx, last: None }, goal)
+    (TelemetrySink(tx), CommandSink { tx: cmd_tx, last: None }, goal, video)
 }
 
 #[cfg(test)]
@@ -388,4 +529,43 @@ mod tests {
         sink.publish_at(t0 + Duration::from_millis(20), ControlSource::FullTeleoperation, &cmd(0.2)); // retried
         assert_eq!(f32::from_be_bytes(rx.try_recv().unwrap()[1..5].try_into().unwrap()), 0.2);
     }
+    #[test]
+    fn video_sink_is_silent_until_a_subscriber_matches() {
+        let (critical, mut crx) = mpsc::channel(4);
+        let (delta, drx) = watch::channel(None);
+        let subscribed = Arc::new(AtomicBool::new(false));
+        let sink = VideoSink { critical, delta: Arc::new(delta), subscribed: subscribed.clone() };
+
+        sink.publish(&[0, 0, 0, 1, 0x67], true);
+        sink.publish(&[0, 0, 0, 1, 0x41], false);
+        assert!(crx.try_recv().is_err(), "no subscriber: critical NAL must not be queued");
+        assert!(drx.borrow().is_none(), "no subscriber: delta NAL must not be stored");
+
+        subscribed.store(true, Ordering::Relaxed);
+        sink.publish(&[0, 0, 0, 1, 0x67], true);
+        sink.publish(&[0, 0, 0, 1, 0x41, 1], false);
+        sink.publish(&[0, 0, 0, 1, 0x41, 2], false);
+        assert_eq!(crx.try_recv().unwrap(), vec![0, 0, 0, 1, 0x67]);
+        assert_eq!(drx.borrow().clone().unwrap(), vec![0, 0, 0, 1, 0x41, 2], "delta is latest-wins");
+    }
+
+    #[test]
+    fn video_sink_drops_critical_nals_when_the_queue_is_full_instead_of_blocking() {
+        let (critical, mut crx) = mpsc::channel(1);
+        let (delta, _drx) = watch::channel(None);
+        let sink = VideoSink { critical, delta: Arc::new(delta), subscribed: Arc::new(AtomicBool::new(true)) };
+        sink.publish(&[0, 0, 0, 1, 0x65, 1], true);
+        sink.publish(&[0, 0, 0, 1, 0x65, 2], true); // full: dropped, must not panic or block
+        assert_eq!(crx.try_recv().unwrap()[5], 1);
+        assert!(crx.try_recv().is_err());
+    }
+
+    #[test]
+    fn annexb_nal_type_reads_the_header_after_the_start_code() {
+        assert_eq!(annexb_nal_type(&[0, 0, 0, 1, 0x67]), Some(7));
+        assert_eq!(annexb_nal_type(&[0, 0, 0, 1, 0x68]), Some(8));
+        assert_eq!(annexb_nal_type(&[0, 0, 0, 1, 0x65]), Some(5));
+        assert_eq!(annexb_nal_type(&[0, 0, 0, 1]), None);
+    }
+
 }

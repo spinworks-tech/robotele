@@ -52,6 +52,8 @@ use roboprotocol_core::timestamp::now_micros;
 use roboprotocol_core::video::{nal_is_critical, AnnexBSplitter};
 use roboprotocol_recording::{Category, Record, Recorder};
 
+use crate::zenoh_bridge::VideoSink;
+
 /// `AnnexBSplitter::push` hands back NAL bytes without their start code
 /// (deliberate -- the wire chunking doesn't waste bytes resending it, see
 /// `roboprotocol_core::video`'s docs). operator-console's own recording
@@ -89,7 +91,7 @@ impl VideoRx {
     }
 }
 
-pub fn spawn_encoder(mut raw_rx: mpsc::UnboundedReceiver<Vec<u8>>, recorder: Recorder) -> VideoRx {
+pub fn spawn_encoder(mut raw_rx: mpsc::UnboundedReceiver<Vec<u8>>, recorder: Recorder, zenoh_video: VideoSink) -> VideoRx {
     let (critical_tx, critical_rx) = mpsc::unbounded_channel();
     let (delta_tx, delta_rx) = watch::channel(None);
     tokio::spawn(async move {
@@ -100,11 +102,15 @@ pub fn spawn_encoder(mut raw_rx: mpsc::UnboundedReceiver<Vec<u8>>, recorder: Rec
                 let mut payload = Vec::with_capacity(START_CODE.len() + nal.len());
                 payload.extend_from_slice(&START_CODE);
                 payload.extend_from_slice(&nal);
+                let critical = nal_is_critical(&nal);
+                // Zenoh tap (spinworks-tech/robotele#6): a no-op unless a
+                // Zenoh subscriber is watching; never blocks this task.
+                zenoh_video.publish(&payload, critical);
                 recorder.enqueue(Category::VideoA, Record { capture_us: now_micros(), control_source: CONTROL_SOURCE_SENTINEL, payload });
 
                 let nal_id = next_nal_id;
                 next_nal_id = next_nal_id.wrapping_add(1);
-                let delivered = if nal_is_critical(&nal) {
+                let delivered = if critical {
                     critical_tx.send((nal_id, nal)).is_ok()
                 } else {
                     delta_tx.send(Some((nal_id, nal))).is_ok()
