@@ -120,6 +120,80 @@ strings target/aarch64-unknown-linux-gnu/release/robot-edge | grep '^GLIBC_' | s
 `Cross.toml` points at that image (Ubuntu 20.04 base → glibc 2.31, plus flatc
 v1.11.0). The stock `cross` image links glibc 2.39 and will not start on the robot.
 
+## Starting and stopping
+
+**There is no separate Zenoh service.** The sidecar runs inside the `robot-edge`
+process: it opens its Zenoh session when `robot-edge` starts and closes it when
+`robot-edge` exits. Starting/stopping the robot side means starting/stopping
+`robot-edge`. There is also no flag to turn Zenoh off (only `--zenoh-port` to
+move it); to run without it, use the plain `robot-edge-v0.1.1-*` build.
+
+### Robot side
+
+The launch tooling on the Pi runs the binary at
+`/home/pi/RoboProtocol/target/release/robot-edge` (falling back to `target/debug/`).
+To run the BabyROS build with that tooling, put it in that spot (keeping the
+plain build so you can switch back; the SD card is tight, so check `df -h /` first):
+
+```bash
+ssh pi@<robot-ip>
+cd /home/pi/RoboProtocol
+cp target/release/robot-edge target/release/robot-edge.plain          # one-time backup
+cp ~/robot-edge-v0.1.2-babyros-aarch64-unknown-linux-gnu/robot-edge target/release/robot-edge
+chmod +x target/release/robot-edge
+```
+
+**Start** (any one of these; only one `robot-edge` can hold the QUIC port and
+the serial port at a time):
+
+```bash
+# From your PC: detached from SSH, timestamped log, stops any running robot-edge first
+xgo_bridge/scripts/run-detached.sh pi@<robot-ip> --robot-id xgo_real --camera
+# Optional: --zenoh-port 7447 (default), --record-dir ... --record command,telemetry
+
+# Or on the Pi by hand (dies when the SSH session closes; use for quick tests)
+cd /home/pi/RoboProtocol && ./target/release/robot-edge --robot-id xgo_real --camera
+```
+
+The robot's LCD WiFi panel (`xgo-wifi-panel.service`) can also start and stop
+`robot-edge` from its ROBOT-EDGE view; it runs the same `target/release/robot-edge`
+with `--robot-id xgo_real --camera`.
+
+**Check that Zenoh is up:**
+
+```bash
+grep "Zenoh can be reached" /home/pi/RoboProtocol/robot-edge-*.log | tail -1
+ss -ltn | grep 7447          # listening on the Zenoh port
+```
+
+**Stop:**
+
+```bash
+pgrep -x robot-edge          # exact name; avoid `pkill -f`, see xgo_bridge/RUNME.md
+kill <pid>                   # SIGINT/SIGTERM is fine; `kill -9 <pid>` if it hangs
+```
+
+(`run-detached.sh` and the panel do this for you when they start/stop it.)
+Stopping `robot-edge` ends the QUIC session, so any connected `operator-console`
+loses its connection, and closes Zenoh: telemetry stops and the autonomy goal
+stops being honored immediately (nothing latches).
+
+**Switch back to the plain build:**
+
+```bash
+cd /home/pi/RoboProtocol && cp target/release/robot-edge.plain target/release/robot-edge
+```
+
+### Consumer side (BabyROS / Zenoh node)
+
+Your BabyROS or plain-Zenoh client is its own process on whatever machine runs
+it; start it with `python your_node.py` and stop it with Ctrl+C. **Order doesn't
+matter**: either side can start first and Zenoh connects them once both are up
+(use `connect/endpoints` to the robot's `tcp/<robot-ip>:7447` if multicast
+discovery doesn't find it). If the consumer stops, `robot-edge` keeps running
+unaffected: telemetry just has no listener and any autonomy goal expires within
+500 ms.
+
 ## Testing
 
 ### Safe smoke test (no motors)
