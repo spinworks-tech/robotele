@@ -15,7 +15,7 @@ plain `robot-edge-v0.1.1-*` build on `main`.
 | --- | --- | --- |
 | robot → world | `robotele/<robot-id>/telemetry` | Robot telemetry, ~1 Hz (the bridge is polled every 50 ticks) |
 | robot → world | `robotele/<robot-id>/command` | The operator's command and the control source it was arbitrated to. **Not in the v0.1.2 binary**: needs a build from a later commit (see below) |
-| world → robot | `robotele/<robot-id>/autonomy_goal` | "A semi-autonomy source wants control" |
+| world → robot | `robotele/<robot-id>/autonomy_goal` | "A semi-autonomy source wants control", optionally with a velocity (see below) |
 
 `<robot-id>` is robot-edge's `--robot-id` (e.g. `xgo_real`).
 
