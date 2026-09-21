@@ -306,7 +306,13 @@ operator console (`C:\Users\Public\RoboProtocol-Demo\bin\zenoh-monitor.exe`).
 ```powershell
 .\bin\zenoh-monitor.exe                    # robot at 192.168.2.19:7447, id xgo_real
 .\bin\zenoh-monitor.exe --connect tcp/192.168.2.19:7447 --robot-id xgo_real --all
+.\bin\zenoh-monitor.exe --only commands    # just the operator's commands (and autonomy goals)
+.\bin\zenoh-monitor.exe --only status      # just telemetry + the 5 s summary
 ```
+
+`--only commands` hides telemetry and the summary line (the summary is still
+printed if there are no peers, so "not connected" can't be mistaken for "no
+commands"); `--only status` hides the command lines but the summary still counts them.
 
 Telemetry only flows while an `operator-console` session is open. `peers=0`
 means it can't reach the robot's Zenoh port: check the IP, that `robot-edge`

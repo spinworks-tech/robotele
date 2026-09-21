@@ -12,15 +12,40 @@ use anyhow::{anyhow, Result};
 const DEFAULT_ENDPOINT: &str = "tcp/192.168.2.19:7447";
 const SUMMARY_EVERY: Duration = Duration::from_secs(5);
 
+/// What to print. `Status` is the robot's telemetry and the periodic summary;
+/// `Commands` is the operator's commands (and any other non-telemetry topic such
+/// as `autonomy_goal`, which is also something sent *to* the robot).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Show {
+    All,
+    Status,
+    Commands,
+}
+
+impl Show {
+    fn telemetry(self) -> bool {
+        self != Show::Commands
+    }
+    fn commands(self) -> bool {
+        self != Show::Status
+    }
+    /// The 5 s summary line; in commands-only mode it's still printed when there
+    /// are no peers, since silence would look like "no commands" instead of "not connected".
+    fn summary(self, peers: usize) -> bool {
+        self != Show::Commands || peers == 0
+    }
+}
+
 struct Args {
     endpoints: Vec<String>,
     robot_id: String,
     key: Option<String>,
     all: bool,
+    show: Show,
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = Args { endpoints: Vec::new(), robot_id: "xgo_real".to_string(), key: None, all: false };
+    let mut args = Args { endpoints: Vec::new(), robot_id: "xgo_real".to_string(), key: None, all: false, show: Show::All };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -28,12 +53,21 @@ fn parse_args() -> Result<Args> {
             "--robot-id" => args.robot_id = it.next().ok_or_else(|| anyhow!("--robot-id needs a value"))?,
             "--key" => args.key = Some(it.next().ok_or_else(|| anyhow!("--key needs a value"))?),
             "--all" => args.all = true,
+            "--only" => {
+                args.show = match it.next().ok_or_else(|| anyhow!("--only needs a value (commands|status)"))?.as_str() {
+                    "commands" | "command" | "cmd" => Show::Commands,
+                    "status" | "telemetry" => Show::Status,
+                    other => return Err(anyhow!("--only expects `commands` or `status`, got `{other}`")),
+                }
+            }
             "-h" | "--help" => {
                 println!(
-                    "Usage: zenoh-monitor [--connect tcp/HOST:PORT]... [--robot-id ID] [--key KEYEXPR] [--all]\n\n  \
+                    "Usage: zenoh-monitor [--connect tcp/HOST:PORT]... [--robot-id ID] [--key KEYEXPR] [--only commands|status] [--all]\n\n  \
                      --connect   Zenoh endpoint of robot-edge (repeatable). Default: {DEFAULT_ENDPOINT}\n  \
                      --robot-id  robot-edge's --robot-id. Default: xgo_real\n  \
                      --key       Key expression to listen on. Default: robotele/<robot-id>/**\n  \
+                     --only      commands: just the operator's commands (and autonomy goals)\n              \
+                     status: just the robot's telemetry + the 5 s summary. Default: both\n  \
                      --all       Print every sample (default: telemetry lines + a rate summary\n              \
                      for other topics such as autonomy_goal, which can arrive at ~10 Hz)\n\n\
                      Ctrl+C to quit."
@@ -154,7 +188,9 @@ async fn main() -> Result<()> {
                     parts.push("no samples yet".to_string());
                 }
                 let note = if peers == 0 { "  -- NO PEERS: check the robot IP/port and that robot-edge is the BabyROS build" } else { "" };
-                println!("[t+{:>7.1}s] peers={peers}  {}{note}", started.elapsed().as_secs_f32(), parts.join(" | "));
+                if args.show.summary(peers) {
+                    println!("[t+{:>7.1}s] peers={peers}  {}{note}", started.elapsed().as_secs_f32(), parts.join(" | "));
+                }
             }
             sample = subscriber.recv_async() => {
                 let sample = match sample {
@@ -171,10 +207,14 @@ async fn main() -> Result<()> {
 
                 let t = started.elapsed().as_secs_f32();
                 if topic.ends_with("/telemetry") {
-                    match decode_telemetry(&payload) {
-                        Some(text) => println!("[t+{t:>7.1}s] {topic}  {} B  {text}", payload.len()),
-                        None => println!("[t+{t:>7.1}s] {topic}  {} B  (unrecognized telemetry layout)", payload.len()),
+                    if args.show.telemetry() {
+                        match decode_telemetry(&payload) {
+                            Some(text) => println!("[t+{t:>7.1}s] {topic}  {} B  {text}", payload.len()),
+                            None => println!("[t+{t:>7.1}s] {topic}  {} B  (unrecognized telemetry layout)", payload.len()),
+                        }
                     }
+                } else if !args.show.commands() {
+                    // status-only: commands and other topics are still counted above, just not printed
                 } else if topic.ends_with("/command") {
                     match decode_command(&payload) {
                         Some(cmd) => {
@@ -242,6 +282,15 @@ mod tests {
         assert!(c.text.contains("[FullTeleop]") && c.text.contains("vx=+0.50") && c.text.contains("turn=-0.25"));
         assert!(c.text.contains("arm=(40,-10) claw=128"));
         assert!(decode_command(&[0u8; 29]).is_none());
+    }
+
+    #[test]
+    fn show_filter_splits_status_from_commands() {
+        assert!(Show::All.telemetry() && Show::All.commands() && Show::All.summary(1));
+        assert!(Show::Status.telemetry() && !Show::Status.commands() && Show::Status.summary(1));
+        assert!(!Show::Commands.telemetry() && Show::Commands.commands());
+        assert!(!Show::Commands.summary(1), "commands-only hides the summary while connected");
+        assert!(Show::Commands.summary(0), "but still warns when there are no peers");
     }
 
     #[test]
