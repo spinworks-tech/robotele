@@ -45,6 +45,8 @@ pub struct ServerArgs {
     /// from `bridge`'s own watchdog config, which this does not affect.
     pub watchdog_threshold_ms: f64,
     pub robot_id: String,
+    /// TCP port the Channel C Zenoh sidecar listens on -- see `--zenoh-port`.
+    pub zenoh_port: u16,
     pub tick_hz: u32,
     pub bridge: BridgeConfig,
     pub camera_config: Option<capture::CaptureConfig>,
@@ -73,7 +75,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
     // Started once, outside the reconnect loop, same reasoning as `recorder`
     // above: the Zenoh session and its background tasks persist across
     // reconnects. Both handles are cheap to clone into each `Session`.
-    let (telemetry_sink, autonomy_goal) = crate::zenoh_bridge::spawn(&args.robot_id).await;
+    let (telemetry_sink, autonomy_goal) = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port).await;
 
     // v0 keeps the single-active-connection design (no CID-routing table for
     // concurrent clients -- see module docs) but must not let one connection

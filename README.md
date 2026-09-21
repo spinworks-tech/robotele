@@ -84,12 +84,16 @@ asserted) rather than blocking or failing to start. Whichever side starts second
 Zenoh's own peer discovery (multicast scouting by default, so both must be on the same LAN/subnet
 unless you've configured explicit Zenoh endpoints) — there's no handshake to sequence by hand.
 
+`robot-edge` listens for Zenoh on TCP port **7447** by default — override with `--zenoh-port` if
+that's taken, blocked by a firewall, or you'd rather point a BabyROS node's `connect` endpoint at a
+fixed, known port instead of relying on multicast scouting.
+
 To run it:
 
 1. Start `robot-edge` on the Pi exactly as in the [XGO-Lite V2 Guide](docs/06-xgo-lite-guide.md)
    (same flags — `--robot-id` just needs to match what your BabyROS node uses below):
    ```bash
-   xgo_bridge/scripts/run-detached.sh pi@<ip> --robot-id xgo_real --camera
+   xgo_bridge/scripts/run-detached.sh pi@<ip> --robot-id xgo_real --camera --zenoh-port 7447
    ```
 2. Start your BabyROS node (on the Pi, or anywhere reachable over the same Zenoh scouting domain),
    pointed at the same `robot_id`. It will:

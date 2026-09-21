@@ -101,15 +101,30 @@ fn inert_sink() -> TelemetrySink {
     TelemetrySink(tx)
 }
 
+/// Builds a Zenoh config listening on `port` (TCP, all interfaces, both
+/// address families) instead of the default's ephemeral (`:0`) peer-mode
+/// listen port -- a fixed port a firewall rule or a BabyROS node's `connect`
+/// endpoint can target, rather than one that changes every run. Multicast
+/// scouting (still on by default) means most same-LAN setups never need
+/// this; it matters once that's blocked or a specific unicast peer is
+/// wanted instead.
+fn config_with_port(port: u16) -> zenoh::Config {
+    let mut config = zenoh::Config::default();
+    if let Err(e) = config.insert_json5("listen/endpoints", &format!(r#"["tcp/[::]:{port}"]"#)) {
+        tracing::warn!(error = ?e, port, "failed to set zenoh listen port, falling back to the default (ephemeral) port");
+    }
+    config
+}
+
 /// Opens a Zenoh session and starts the telemetry-publisher and
 /// autonomy-goal-subscriber background tasks. Always returns usable handles:
 /// on any Zenoh failure, logs a warning and returns an inert sink / a goal
 /// that's never asserted, so the caller never needs a fallback branch of its
 /// own.
-pub async fn spawn(robot_id: &str) -> (TelemetrySink, AutonomyGoal) {
+pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, AutonomyGoal) {
     let goal = AutonomyGoal::new();
 
-    let session = match zenoh::open(zenoh::Config::default()).await {
+    let session = match zenoh::open(config_with_port(port)).await {
         Ok(session) => session,
         Err(e) => {
             tracing::warn!(error = ?e, "zenoh session open failed, Channel C sidecar disabled this run");
