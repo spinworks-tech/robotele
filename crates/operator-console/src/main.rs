@@ -262,7 +262,7 @@ impl io::Write for FileWriter {
 /// test greps for phase-transition lines.
 fn init_tracing(headless: bool) -> Result<()> {
     if headless {
-        tracing_subscriber::fmt::init();
+        tracing_subscriber::fmt().with_env_filter(default_filter()).init();
         return Ok(());
     }
     let file = OpenOptions::new()
@@ -271,8 +271,16 @@ fn init_tracing(headless: bool) -> Result<()> {
         .open("operator-console.log")
         .context("opening operator-console.log")?;
     let file = Arc::new(Mutex::new(file));
-    tracing_subscriber::fmt().with_writer(move || FileWriter(file.clone())).init();
+    tracing_subscriber::fmt().with_env_filter(default_filter()).with_writer(move || FileWriter(file.clone())).init();
     Ok(())
+}
+
+/// INFO unless `RUST_LOG` says otherwise. Another crate in the workspace (Zenoh,
+/// via robot-edge) enables tracing-subscriber's `env-filter` feature for the
+/// whole build, and with it a bare `fmt::init()` silently defaults to
+/// ERROR-only -- which hid the phase/HELLO lines `scripts/smoke_test.sh` greps for.
+fn default_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
 }
 
 #[tokio::main(flavor = "current_thread")]

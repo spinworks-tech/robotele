@@ -111,7 +111,11 @@ async fn build_tls_config(sans: Vec<String>) -> Result<axum_server::tls_rustls::
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Explicit INFO default: see operator-console's `default_filter` for why a bare
+    // `fmt::init()` would silently become ERROR-only in a workspace build.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .init();
     let cli = Cli::parse()?;
 
     let state = GatewayState::new();
