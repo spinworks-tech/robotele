@@ -19,7 +19,7 @@ from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.msgs.std_msgs.Float32 import Float32
 
-from .codec import MAX_TURN, MAX_VX, MAX_VY, decode_telemetry, encode_autonomy_goal
+from .codec import MAX_TURN, MAX_VX, MAX_VY, decode_telemetry, encode_autonomy_goal, joint_names
 
 # robot-edge honors an autonomy goal for 500 ms (AUTONOMY_GOAL_TTL); refresh well inside it.
 _GOAL_REFRESH_S = 0.2
@@ -71,7 +71,7 @@ class RoboteleBridge(Module):
             JointState(
                 ts=time.time(),
                 frame_id=self.config.frame_id,
-                name=[f"joint_{i}" for i in range(len(t.joints))],
+                name=joint_names(len(t.joints)),
                 position=[math.radians(d) for d in t.joints],
             )
         )

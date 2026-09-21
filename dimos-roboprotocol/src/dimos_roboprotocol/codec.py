@@ -16,6 +16,27 @@ CONTROL_SOURCES = {
     4: "SemiAutonomous",
 }
 
+# Joint order on the wire (crates/robot-edge/src/xgo_profile.rs): four legs
+# (front-left, front-right, rear-right, rear-left), each lower/middle/upper,
+# then the optional arm accessory. The robot sends no names, these are ours.
+# The arm's per-joint meaning is undocumented by the vendor SDK.
+_LEGS = ("front_left", "front_right", "rear_right", "rear_left")
+XGO_JOINT_NAMES = [f"{leg}_{pos}" for leg in _LEGS for pos in ("lower", "middle", "upper")] + [
+    "arm_1",
+    "arm_2",
+    "arm_3",
+]
+
+
+def joint_names(count: int) -> list[str]:
+    """Names for `count` telemetry joints; generic names if the layout is unknown."""
+    if count == len(XGO_JOINT_NAMES):
+        return list(XGO_JOINT_NAMES)
+    if count == 12:  # base kit without the arm
+        return XGO_JOINT_NAMES[:12]
+    return [f"joint_{i}" for i in range(count)]
+
+
 _TELEMETRY_HEADER = 7  # battery u8 + roll/pitch/yaw i16
 _COMMAND_LEN = 30
 

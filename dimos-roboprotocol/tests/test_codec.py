@@ -2,7 +2,7 @@ import struct
 
 import pytest
 
-from dimos_roboprotocol.codec import decode_command, decode_telemetry, encode_autonomy_goal
+from dimos_roboprotocol.codec import decode_command, decode_telemetry, encode_autonomy_goal, joint_names
 
 
 def test_telemetry_roundtrip():
@@ -30,3 +30,11 @@ def test_autonomy_goal_encodes_and_clamps():
     assert struct.unpack(">3f", encode_autonomy_goal(5.0, -3.0, 20.0)) == (5.0, -3.0, 20.0)
     assert struct.unpack(">3f", encode_autonomy_goal(99, -99, 99)) == (15.0, -12.0, 60.0)
     assert len(encode_autonomy_goal()) == 12
+
+
+def test_joint_names():
+    n = joint_names(15)
+    assert len(n) == 15 and len(set(n)) == 15
+    assert n[0] == "front_left_lower" and n[8] == "rear_right_upper" and n[12] == "arm_1"
+    assert joint_names(12) == n[:12]
+    assert joint_names(4) == ["joint_0", "joint_1", "joint_2", "joint_3"]
