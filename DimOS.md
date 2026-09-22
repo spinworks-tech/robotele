@@ -73,6 +73,24 @@ The `web` and `visualization` extras are needed for the viewer. The web dashboar
 `git-lfs` on `PATH`; without sudo, drop the static binary from the
 [git-lfs releases](https://github.com/git-lfs/git-lfs/releases) into `~/.local/bin`.
 
+`Image.to_rerun()` (used to show `color_image` in Rerun, see "Video" below) needs
+`libturbojpeg`, a system library `pip install av` does not provide. Without it every
+`color_image` sample throws inside DimOS's Rerun bridge (logged as "Error in subscribe_all
+callback", with no traceback reaching the log because it happens in a worker process) — decode
+and the Zenoh publish still work, only the Rerun display fails. Without sudo, extract the
+shared library instead of installing it:
+
+```bash
+mkdir -p ~/.local/lib-extract && cd ~/.local/lib-extract
+apt-get download libturbojpeg   # fetches the .deb, no root needed
+dpkg-deb -x libturbojpeg_*.deb extracted
+mkdir -p ~/.local/lib && cp extracted/usr/lib/*/libturbojpeg.so.0 ~/.local/lib/
+export LD_LIBRARY_PATH=~/.local/lib:$LD_LIBRARY_PATH   # needed every run, before `dimos`
+```
+
+`turbojpeg.py`'s library search checks `LD_LIBRARY_PATH` for the exact filename
+`libturbojpeg.so.0`, so this works without touching the system library path.
+
 Run the tests for the pure-Python codec (no DimOS needed):
 
 ```bash
@@ -144,10 +162,17 @@ only while at least one Zenoh subscriber matches**: with nobody subscribed the t
   starts at the next IDR (about a second with `--intra 30` at 30 fps).
 - **Session-bound:** capture is per QUIC session, so video needs the operator console (or any
   QUIC client) connected with `--camera`, like telemetry.
-- **Cost:** decoding needs PyAV (`pip install av`, or `pip install -e ".[video]"`). The viewer
-  is throttled to 10 Hz (`max_hz` in `rerun_views.py`) because frames are logged as raw RGB.
-  Watching adds roughly the camera bitrate (about 4 Mbps by default) of Zenoh traffic and some
-  CM4 CPU; whether that disturbs the control loop on the real robot has not been measured yet.
+- **Cost:** decoding needs PyAV (`pip install av`, or `pip install -e ".[video]"`), and showing
+  frames in Rerun needs `libturbojpeg` (see "Setup"). The viewer is throttled to 10 Hz (`max_hz`
+  in `rerun_views.py`) because frames are logged as raw RGB. Watching adds roughly the camera
+  bitrate (about 4 Mbps by default) of Zenoh traffic and some CM4 CPU; whether that disturbs the
+  control loop on the real robot has not been measured yet.
+- **Verified against the real robot** (robot-edge v0.1.3, 2026-09-22): a stale `libcamera-vid`
+  process left over from an earlier `robot-edge` run held the camera and made a fresh session's
+  capture fail every time until it was killed (capture gives up permanently per session on
+  repeated failure, see `capture.rs`; reconnecting the operator console after the kill got a
+  clean capture). Once that and the `libturbojpeg` gap were cleared, `color_image` streamed at
+  around 16 fps end to end from the real camera with no further errors.
 
 ## Driving the robot (autonomy goal)
 
@@ -174,9 +199,8 @@ Limitations:
 
 ## Known gaps
 
-- **Video is implemented but not yet tried on the robot.** See "Video" above. It needs a
-  `robot-edge` build that contains the Zenoh video tap (this branch), and a QUIC session with
-  `--camera` up, since capture is per session.
+- **Video works, verified against the real robot** (see "Video" above). The autonomy-goal
+  velocity path is still untested on hardware.
 - **No real IMU data.** No angular velocity or acceleration reaches DimOS, because the robot
   edge does not send any; adding it means extending the telemetry format.
 - **XGO-Lite is not a DimOS-supported robot.** No upstream module or hardware support exists;
