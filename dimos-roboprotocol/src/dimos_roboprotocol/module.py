@@ -48,7 +48,11 @@ class RoboteleBridgeConfig(ModuleConfig):
 
 class RoboteleBridge(Module):
     config: RoboteleBridgeConfig
-    cmd_vel: In[Twist]
+    # Named to match the DimOS web Command Center's keyboard-teleop convention
+    # (WebsocketVisModule.tele_cmd_vel; same name used by Spot, Alfred, Unitree
+    # G1/Go2, Galaxea R1Pro blueprints) -- DimOS wires streams by matching name,
+    # not just type, so a differently-named In[Twist] would never receive it.
+    tele_cmd_vel: In[Twist]
     joint_state: Out[JointState]
     battery_percent: Out[Float32]
     imu: Out[Imu]
@@ -75,7 +79,7 @@ class RoboteleBridge(Module):
             self._decoder = H264Decoder()
             self._decode_lock = threading.Lock()
             self._video_sub = self._session.declare_subscriber(f"{prefix}/video", self._on_video)
-        self.register_disposable(self.cmd_vel.observable().subscribe(self._on_cmd_vel))
+        self.register_disposable(self.tele_cmd_vel.observable().subscribe(self._on_cmd_vel))
 
     @rpc
     def stop(self) -> None:
