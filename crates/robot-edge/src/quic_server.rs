@@ -560,6 +560,19 @@ impl Session {
             return;
         }
         let Some((tag, payload)) = datagram::untag(data) else { return };
+        if tag == datagram::DATAGRAM_TAG_HEARTBEAT {
+            // spinworks-tech/robotele#6: an operator client (e.g.
+            // operator-console --observer) yielding FullTeleoperation
+            // without ending the session. Feeds the watchdog only --
+            // deliberately does NOT set deadman_held/command_fresh, so
+            // arbitration falls through to SemiAutonomous (if a Channel C
+            // autonomy goal is asserted) or the fail-safe ActiveImpedanceHold
+            // default otherwise. Never touches E-Stop latch state either
+            // (see the constant's own doc for why that rules out reusing
+            // EstopDatagram{latched:false} for this).
+            self.safety.on_channel_b_activity(None, Instant::now());
+            return;
+        }
         if tag != datagram::DATAGRAM_TAG_CHANNEL_B {
             // robot-edge never receives Channel A (video) datagrams -- it
             // only sends them. Anything else is unexpected; drop it rather

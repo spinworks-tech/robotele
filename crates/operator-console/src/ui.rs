@@ -125,6 +125,12 @@ pub struct HudState {
     pub reconnect_attempts: u32,
 
     pub estopped: bool,
+    /// spinworks-tech/robotele#6: true while `--observer` is holding back
+    /// Command frames (no recent Move/Turn) and sending only the heartbeat
+    /// keepalive instead -- i.e. a Channel C autonomy source, if any is
+    /// asserted, currently has control. A real movement key clears this
+    /// the same tick.
+    pub observing: bool,
     pub rtt_ms: Option<f64>,
     pub battery: Option<u8>,
     pub roll: Option<f64>,
@@ -214,6 +220,7 @@ impl HudState {
             robot_id: None,
             camera_shape: None,
             disconnected_at: None,
+            observing: false,
             reconnect_attempts: 0,
             dof_count: None,
             estopped: false,
@@ -473,6 +480,8 @@ fn draw_header(f: &mut Frame, area: Rect, hud: &HudState) {
 fn draw_estop_banner(f: &mut Frame, area: Rect, hud: &HudState) {
     let (text, style) = if hud.estopped {
         ("E-STOPPED -- press 'c' to clear", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD))
+    } else if hud.observing {
+        ("OBSERVING -- yielded to autonomy, press a move key to take control", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     } else {
         ("armed -- press 'e' to E-STOP", Style::default().fg(Color::Green))
     };
