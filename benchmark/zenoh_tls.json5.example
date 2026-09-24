@@ -1,0 +1,33 @@
+// Template for zenoh_bench.py's --config flag, to run Zenoh with TLS
+// (mutual auth, to match Channel B's mTLS -- see BENCHMARK.md's
+// "encrypted protocol-to-protocol" table).
+//
+// Copy this to zenoh_tls.json5, fill in cert paths (this repo's dev certs
+// at certs/ work fine, same SANs used by BENCHMARK.md parts 1-3), and
+// verify the key names against the zenoh version actually installed --
+// zenoh's TLS config keys have moved between minor versions, so treat this
+// as a starting point, not a guarantee, and check `zenoh --help-config` or
+// the docs for whichever zenoh you pip/cargo installed.
+{
+  mode: "peer",
+  listen: {
+    endpoints: ["tls/0.0.0.0:7447"],
+  },
+  connect: {
+    endpoints: ["tls/<peer-host>:7447"],
+  },
+  transport: {
+    link: {
+      tls: {
+        root_ca_certificate: "certs/dev-ca/ca.crt",
+        listen_certificate: "certs/robot/robot.crt",
+        listen_private_key: "certs/robot/robot.key",
+        connect_certificate: "certs/operator/operator.crt",
+        connect_private_key: "certs/operator/operator.key",
+        // mutual auth -- both sides present and verify a client cert,
+        // matching Channel B's mTLS rather than server-only TLS
+        enable_mtls: true,
+      },
+    },
+  },
+}
