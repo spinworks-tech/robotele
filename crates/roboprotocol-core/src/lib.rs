@@ -9,6 +9,7 @@
 //! the transport in.
 
 pub mod action_trigger;
+pub mod bench;
 pub mod camera_control;
 pub mod datagram;
 pub mod estop;
