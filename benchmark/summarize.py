@@ -2,11 +2,14 @@
 """Print the max-sustained-rate table from one or more run dirs' results.json."""
 import json
 import sys
+ORDER = ["mqtt", "zenoh", "udp", "mqtt-tls", "zenoh-tls", "webrtc",
+         "rs-udp", "rs-mqtt", "rs-zenoh", "rs-mqtt-tls", "rs-zenoh-tls", "rs-webrtc",
+         "channel-b-raw", "channel-b"]
 rows = {}
 for d in sys.argv[1:]:
     for k, v in json.load(open(f"{d}/results.json"))["throughput"].items():
         rows[k] = v
-protos = sorted({k.split("/")[0] for k in rows}, key=["mqtt", "zenoh", "udp", "mqtt-tls", "zenoh-tls", "webrtc"].index)
+protos = sorted({k.split("/")[0] for k in rows}, key=ORDER.index)
 sizes = sorted({int(k.split("/")[1]) for k in rows})
 print("| payload | " + " | ".join(protos) + " |")
 print("|---|" + "---|" * len(protos))

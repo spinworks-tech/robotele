@@ -253,8 +253,9 @@ async fn send(link: &mut Link<'_>, payload_bytes: usize, raw: bool, rate_hz: f64
             break;
         }
         // Catch up to the schedule: at high rates several sends are due per
-        // loop turn, well below tokio's timer granularity.
-        let due = ((now - start).as_secs_f64() * rate_hz) as u64 + 1;
+        // loop turn, well below tokio's timer granularity. Capped per turn so
+        // an effectively unlimited rate still flushes and checks the clock.
+        let due = (((now - start).as_secs_f64() * rate_hz) as u64 + 1).min(offered + 256);
         while offered < due {
             match link.conn.dgram_send(&bench_datagram(first_seq + offered, payload_bytes, raw)) {
                 Ok(()) => {}

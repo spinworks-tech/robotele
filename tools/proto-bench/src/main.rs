@@ -137,6 +137,8 @@ pub fn seq_of(buf: &[u8]) -> Option<u64> {
 /// Paced send schedule shared by every `send` mode: message `i` is due at
 /// `start + i / rate`. At high rates several are due per check, far below
 /// any timer's granularity, so callers send everything due, then wait.
+const MAX_BURST: u64 = 256;
+
 pub struct Pacer {
     start: Instant,
     end: Instant,
@@ -154,9 +156,13 @@ impl Pacer {
         Instant::now() >= self.end
     }
 
-    /// How many messages should have been offered by now.
+    /// How many messages should have been offered by now, capped at
+    /// `MAX_BURST` past what's already out: at an effectively unlimited rate
+    /// ("flood") the backlog would otherwise be billions, and the caller
+    /// would never get back to flushing or checking the clock.
     pub fn due(&self) -> u64 {
-        ((self.start.elapsed().as_secs_f64() * self.rate_hz) as u64 + 1).max(self.offered)
+        let due = (self.start.elapsed().as_secs_f64() * self.rate_hz) as u64 + 1;
+        due.clamp(self.offered, self.offered + MAX_BURST)
     }
 
     pub fn next_at(&self) -> Instant {
