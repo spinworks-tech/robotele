@@ -97,6 +97,7 @@ impl Cli {
         let mut bench_payload_bytes = 20usize;
         let mut bench_rate_hz = 1000.0f64;
         let mut bench_duration_s = 30.0f64;
+        let mut bench_raw = false;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -149,6 +150,7 @@ impl Cli {
                 "--bench-count" => bench_count = it.next().context("--bench-count needs a value")?.parse()?,
                 "--bench-payload-bytes" => bench_payload_bytes = it.next().context("--bench-payload-bytes needs a value")?.parse()?,
                 "--bench-rate-hz" => bench_rate_hz = it.next().context("--bench-rate-hz needs a value")?.parse()?,
+                "--bench-raw" => bench_raw = true,
                 "--bench-duration-s" => bench_duration_s = it.next().context("--bench-duration-s needs a value")?.parse()?,
                 "-h" | "--help" => {
                     println!(
@@ -159,7 +161,7 @@ impl Cli {
                          [--record-dir PATH] [--record-extra haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
                          [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n  \
-                         [--bench pingpong|send --headless [--bench-count N] [--bench-payload-bytes N]\n  \
+                         [--bench pingpong|send --headless [--bench-raw] [--bench-count N] [--bench-payload-bytes N]\n  \
                           [--bench-rate-hz N] [--bench-duration-s N]]   (against robot-edge --bench)\n\n\
                          Keys: w/a/s/d move, left/right turn, space stop, i/j/k/l arm, u/o claw,\n  \
                          1 stand, 2 sit, e E-Stop, c clear, r start/stop recording, p save video\n  \
@@ -200,16 +202,13 @@ impl Cli {
             }
         }
 
-        let bench = match bench_mode.as_deref() {
+        let bench_kind = match bench_mode.as_deref() {
             None => None,
-            Some("pingpong") => Some(bench::BenchSpec::PingPong { count: bench_count, payload_bytes: bench_payload_bytes }),
-            Some("send") => Some(bench::BenchSpec::Send {
-                payload_bytes: bench_payload_bytes,
-                rate_hz: bench_rate_hz,
-                duration_s: bench_duration_s,
-            }),
+            Some("pingpong") => Some(bench::BenchKind::PingPong { count: bench_count }),
+            Some("send") => Some(bench::BenchKind::Send { rate_hz: bench_rate_hz, duration_s: bench_duration_s }),
             Some(other) => anyhow::bail!("unknown --bench mode {other}, expected pingpong|send"),
         };
+        let bench = bench_kind.map(|kind| bench::BenchSpec { kind, payload_bytes: bench_payload_bytes, raw: bench_raw });
         if bench.is_some() && !headless {
             anyhow::bail!("--bench needs --headless (no keyboard input or TUI during a benchmark)");
         }

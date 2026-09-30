@@ -10,6 +10,7 @@ members = [
     "tools/dev-certs",
     "tools/replay-decode",
     "tools/zenoh-monitor",
+    "tools/proto-bench",
 ]
 
 [workspace.package]

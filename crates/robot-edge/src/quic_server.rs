@@ -576,6 +576,12 @@ impl Session {
         if self.phase != Phase::Operating {
             return;
         }
+        if data.first() == Some(&datagram::DATAGRAM_TAG_BENCH_RAW) {
+            if let Some(mode) = self.bench {
+                self.on_bench_raw(mode, data);
+            }
+            return;
+        }
         let Some((tag, payload)) = datagram::untag(data) else { return };
         if tag == datagram::DATAGRAM_TAG_HEARTBEAT {
             // spinworks-tech/robotele#6: an operator client (e.g.
@@ -658,6 +664,25 @@ impl Session {
                 c.first_rx.get_or_insert_with(Instant::now);
                 c.msgs += 1;
                 c.bytes += wire_len as u64;
+            }
+        }
+    }
+
+    /// Transport-only bench path: an opaque payload, no FlatBuffers. The
+    /// datagram is echoed back exactly as received (tag included) or just
+    /// counted -- never copied or parsed -- so the only Channel B cost left
+    /// is QUIC + TLS + the one-byte tag dispatch above.
+    fn on_bench_raw(&mut self, mode: BenchMode, data: &[u8]) {
+        self.safety.on_channel_b_activity(None, Instant::now());
+        match mode {
+            BenchMode::Echo => {
+                let _ = self.conn.dgram_send(data);
+            }
+            BenchMode::Count => {
+                let c = &mut self.bench_counter;
+                c.first_rx.get_or_insert_with(Instant::now);
+                c.msgs += 1;
+                c.bytes += (data.len() - 1) as u64;
             }
         }
     }

@@ -14,27 +14,48 @@
 //!   every message the application offered, including ones skipped because
 //!   quiche's datagram send queue was full (those count as not delivered).
 //!
-//! `payload_bytes` is the Channel B `fields` length, the application
-//! payload -- comparable to the other protocols' payload size. It can't go
-//! below the real 20-byte `TeleopCommand`, and the whole tagged frame must
-//! fit in one QUIC datagram (`dgram_max_writable_len`), since Channel B
-//! never fragments.
+//! Two framings, picked by `BenchSpec::raw`:
+//!
+//! - **raw** (`--bench-raw`): an opaque payload -- the same 16-byte seq/time
+//!   header plus padding the other protocols' benchmarks carry -- on the
+//!   `DATAGRAM_TAG_BENCH_RAW` datagram, with no FlatBuffers either way. This
+//!   times Channel B's transport (QUIC datagrams, TLS 1.3 mTLS, the one-byte
+//!   tag) on the same bytes as everything else: the like-for-like number.
+//! - **full** (default): a real FlatBuffers `ChannelBFrame` Command, decoded
+//!   by `robot-edge` up to `TeleopCommand::unpack` and echoed back as a
+//!   Telemetry frame. Adds Channel B's serialization, as the protocol
+//!   actually runs.
+//!
+//! `payload_bytes` is the application payload (raw bytes, or the frame's
+//! `fields`). The whole datagram must fit `dgram_max_writable_len`, since
+//! Channel B never fragments.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use roboprotocol_core::bench::BENCH_ECHO_TICK_ID;
+use roboprotocol_core::bench::{summarize_latency, BENCH_ECHO_TICK_ID};
 use roboprotocol_core::{datagram, timestamp};
 use tokio::net::UdpSocket;
 
 use crate::channel_b::{self, ChannelBCategory, ChannelBFrameData, TeleopCommand, ALL_REGIONS};
 
 #[derive(Debug, Clone, Copy)]
-pub enum BenchSpec {
-    PingPong { count: usize, payload_bytes: usize },
-    Send { payload_bytes: usize, rate_hz: f64, duration_s: f64 },
+pub struct BenchSpec {
+    pub kind: BenchKind,
+    pub payload_bytes: usize,
+    /// Transport only, no FlatBuffers -- see the module docs.
+    pub raw: bool,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum BenchKind {
+    PingPong { count: usize },
+    Send { rate_hz: f64, duration_s: f64 },
+}
+
+/// Same `>Qd` header as `benchmark/*_bench.py` and `tools/proto-bench`.
+const RAW_HEADER_LEN: usize = 16;
 
 const MAX_UDP_PAYLOAD: usize = 1452;
 
@@ -103,6 +124,12 @@ impl Link<'_> {
         let mut seqs = Vec::new();
         let mut dbuf = vec![0u8; MAX_UDP_PAYLOAD];
         while let Ok(len) = self.conn.dgram_recv(&mut dbuf) {
+            if dbuf[..len].first() == Some(&datagram::DATAGRAM_TAG_BENCH_RAW) {
+                if let Some(seq) = dbuf.get(1..9).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes) {
+                    seqs.push(seq);
+                }
+                continue;
+            }
             let Some((tag, payload)) = datagram::untag(&dbuf[..len]) else { continue };
             if tag != datagram::DATAGRAM_TAG_CHANNEL_B {
                 continue;
@@ -115,6 +142,18 @@ impl Link<'_> {
         }
         seqs
     }
+}
+
+fn bench_datagram(seq: u64, payload_bytes: usize, raw: bool) -> Vec<u8> {
+    if !raw {
+        return command_datagram(seq, payload_bytes);
+    }
+    let mut out = vec![0u8; 1 + payload_bytes.max(RAW_HEADER_LEN)];
+    out[0] = datagram::DATAGRAM_TAG_BENCH_RAW;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    out[1..9].copy_from_slice(&seq.to_be_bytes());
+    out[9..17].copy_from_slice(&now.to_be_bytes());
+    out
 }
 
 fn command_datagram(seq: u64, payload_bytes: usize) -> Vec<u8> {
@@ -136,17 +175,16 @@ fn command_datagram(seq: u64, payload_bytes: usize) -> Vec<u8> {
 
 pub async fn run(conn: &mut quiche::Connection, socket: &UdpSocket, local: SocketAddr, spec: BenchSpec, first_seq: u64) -> Result<()> {
     let mut link = Link { conn, socket, local, buf: vec![0u8; 65535], out: vec![0u8; MAX_UDP_PAYLOAD] };
-    let payload_bytes = match spec {
-        BenchSpec::PingPong { payload_bytes, .. } | BenchSpec::Send { payload_bytes, .. } => payload_bytes,
-    };
-    let probe = command_datagram(0, payload_bytes);
+    let BenchSpec { kind, payload_bytes, raw } = spec;
+    let probe = bench_datagram(0, payload_bytes, raw);
     let max = link.conn.dgram_max_writable_len().context("peer has no datagram support")?;
     anyhow::ensure!(
         probe.len() <= max,
         "{payload_bytes} B payload makes a {} B datagram, over this connection's {max} B limit (Channel B never fragments)",
         probe.len()
     );
-    eprintln!("channel-b bench: {payload_bytes} B fields -> {} B tagged datagram (max {max} B)", probe.len());
+    let framing = if raw { "raw payload, no FlatBuffers" } else { "FlatBuffers ChannelBFrame" };
+    eprintln!("channel-b bench: {payload_bytes} B payload -> {} B datagram, {framing} (max {max} B)", probe.len());
 
     // Let the session settle (initial telemetry, stream data) before timing,
     // feeding robot-edge's command watchdog with the same keepalive
@@ -164,23 +202,23 @@ pub async fn run(conn: &mut quiche::Connection, socket: &UdpSocket, local: Socke
     }
     link.drain_echoes();
 
-    let result = match spec {
-        BenchSpec::PingPong { count, payload_bytes } => pingpong(&mut link, count, payload_bytes, first_seq).await,
-        BenchSpec::Send { payload_bytes, rate_hz, duration_s } => send(&mut link, payload_bytes, rate_hz, duration_s, first_seq).await,
+    let result = match kind {
+        BenchKind::PingPong { count } => pingpong(&mut link, count, payload_bytes, raw, first_seq).await,
+        BenchKind::Send { rate_hz, duration_s } => send(&mut link, payload_bytes, raw, rate_hz, duration_s, first_seq).await,
     };
     let _ = link.conn.close(true, 0x0, b"bench done");
     link.flush().await?;
     result
 }
 
-async fn pingpong(link: &mut Link<'_>, count: usize, payload_bytes: usize, first_seq: u64) -> Result<()> {
+async fn pingpong(link: &mut Link<'_>, count: usize, payload_bytes: usize, raw: bool, first_seq: u64) -> Result<()> {
     eprintln!("pingpong: {count} round trips, {payload_bytes}B payload (QUIC datagrams, TLS 1.3 mTLS)");
     let mut rtts = Vec::with_capacity(count);
     let mut lost = 0usize;
     for i in 0..count as u64 {
         let seq = first_seq + i;
         let sent = Instant::now();
-        let _ = link.conn.dgram_send(&command_datagram(seq, payload_bytes));
+        let _ = link.conn.dgram_send(&bench_datagram(seq, payload_bytes, raw));
         link.flush().await?;
         // Datagrams are unreliable: a lost ping is a lost sample, not a hang.
         let deadline = sent + Duration::from_secs(1);
@@ -199,11 +237,12 @@ async fn pingpong(link: &mut Link<'_>, count: usize, payload_bytes: usize, first
     if lost > 0 {
         eprintln!("{lost} ping(s) lost (unreliable datagrams)");
     }
-    println!("{}", summarize_latency(&rtts)?);
+    anyhow::ensure!(!rtts.is_empty(), "no samples collected -- is robot-edge running with --bench echo?");
+    println!("{}", summarize_latency(&rtts));
     Ok(())
 }
 
-async fn send(link: &mut Link<'_>, payload_bytes: usize, rate_hz: f64, duration_s: f64, first_seq: u64) -> Result<()> {
+async fn send(link: &mut Link<'_>, payload_bytes: usize, raw: bool, rate_hz: f64, duration_s: f64, first_seq: u64) -> Result<()> {
     eprintln!("sending {payload_bytes}B messages at {rate_hz}Hz for {duration_s}s");
     let start = Instant::now();
     let end = start + Duration::from_secs_f64(duration_s);
@@ -217,7 +256,7 @@ async fn send(link: &mut Link<'_>, payload_bytes: usize, rate_hz: f64, duration_
         // loop turn, well below tokio's timer granularity.
         let due = ((now - start).as_secs_f64() * rate_hz) as u64 + 1;
         while offered < due {
-            match link.conn.dgram_send(&command_datagram(first_seq + offered, payload_bytes)) {
+            match link.conn.dgram_send(&bench_datagram(first_seq + offered, payload_bytes, raw)) {
                 Ok(()) => {}
                 Err(quiche::Error::Done) => skipped += 1, // send queue full
                 Err(e) => anyhow::bail!("dgram_send: {e:?}"),
@@ -237,51 +276,16 @@ async fn send(link: &mut Link<'_>, payload_bytes: usize, rate_hz: f64, duration_
     Ok(())
 }
 
-/// Same method and output format as `benchmark/bench_stats.py`.
-fn summarize_latency(rtt_seconds: &[f64]) -> Result<String> {
-    anyhow::ensure!(!rtt_seconds.is_empty(), "no samples collected -- is robot-edge running with --bench echo?");
-    let mut ordered = rtt_seconds.to_vec();
-    ordered.sort_by(|a, b| a.total_cmp(b));
-    let n = ordered.len();
-    let lo = ordered[(n as f64 * 0.01) as usize];
-    let hi = ordered[((n as f64 * 0.99) as usize).min(n - 1)];
-    let mut us: Vec<f64> = ordered.iter().copied().filter(|s| (lo..=hi).contains(s)).map(|s| s * 1e6).collect();
-    if us.is_empty() {
-        us = ordered.iter().map(|s| s * 1e6).collect();
-    }
-    let m = us.len();
-    let median = if m % 2 == 1 { us[m / 2] } else { (us[m / 2 - 1] + us[m / 2]) / 2.0 };
-    let pct = |p: f64| {
-        if m == 1 {
-            return us[0];
-        }
-        let idx = p * (m - 1) as f64;
-        let lo_idx = idx as usize;
-        let hi_idx = (lo_idx + 1).min(m - 1);
-        us[lo_idx] + (us[hi_idx] - us[lo_idx]) * (idx - lo_idx as f64)
-    };
-    Ok(format!(
-        "n={n} (trimmed to {m} after 1st/99th pct cut)  median RTT={median:.1}us (one-way={:.1}us)  p95={:.1}us  p99={:.1}us  min={:.1}us  max={:.1}us",
-        median / 2.0,
-        pct(0.95),
-        pct(0.99),
-        us[0],
-        us[m - 1]
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn latency_summary_matches_bench_stats_py() {
-        // Checked against benchmark/bench_stats.py summarize_latency() on the same input.
-        let rtts: Vec<f64> = (1..=200).map(|i| i as f64 * 1e-6).collect();
-        assert_eq!(
-            summarize_latency(&rtts).unwrap(),
-            "n=200 (trimmed to 197 after 1st/99th pct cut)  median RTT=101.0us (one-way=50.5us)  p95=189.2us  p99=197.0us  min=3.0us  max=199.0us"
-        );
+    fn raw_datagram_carries_the_shared_header_and_no_frame() {
+        let d = bench_datagram(42, 64, true);
+        assert_eq!(d.len(), 65);
+        assert_eq!(d[0], datagram::DATAGRAM_TAG_BENCH_RAW);
+        assert_eq!(u64::from_be_bytes(d[1..9].try_into().unwrap()), 42);
     }
 
     #[test]

@@ -1,0 +1,17 @@
+[package]
+name = "proto-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Native (compiled) clients for the Part 4 protocol comparison: raw UDP, Zenoh, MQTT and WebRTC, with the same modes and output as benchmark/*_bench.py."
+
+[dependencies]
+roboprotocol-core = { path = "../../crates/roboprotocol-core" }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
+zenoh = "1"
+rumqttc = "0.24"
+webrtc = "0.12"
+bytes = "1"
+serde_json = "1"
