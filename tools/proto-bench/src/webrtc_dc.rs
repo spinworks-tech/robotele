@@ -196,6 +196,10 @@ pub async fn run(o: &Opts) -> Result<()> {
                         let msg = Bytes::from(message(p.offered, o.payload_bytes));
                         match tokio::time::timeout(Duration::from_secs(1), dc.send(&msg)).await {
                             Ok(Ok(_)) => {}
+                            // Failing on the very first message is a real error
+                            // (e.g. over webrtc-rs's 65,535 B message limit), not
+                            // the receiver closing.
+                            Ok(Err(e)) if p.offered == 0 => bail!("send failed: {e}"),
                             _ => break 'send,
                         }
                     }

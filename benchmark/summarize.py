@@ -16,7 +16,10 @@ print("|---|" + "---|" * len(protos))
 for sz in sizes:
     cells = []
     for p in protos:
-        b = rows.get(f"{p}/{sz}", {}).get("best")
+        if f"{p}/{sz}" not in rows:
+            cells.append("n/a")  # not run: over this protocol's message size limit
+            continue
+        b = rows[f"{p}/{sz}"].get("best")
         if not b:
             cells.append("< 1k msg/s")
             continue

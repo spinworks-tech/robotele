@@ -154,6 +154,8 @@ def send_cmd(proto, size, rate):
                 "--duration-s", str(SEND_S)]
     if proto == "rs-udp":
         size = min(size, 65507)  # the UDP datagram maximum, as for the Python floor
+    elif proto == "rs-webrtc":
+        size = min(size, 65535)  # webrtc-rs's largest DataChannel message
     return proto_args(proto, "send") + ["--payload-bytes", str(size),
                                         "--rate-hz", str(rate), "--duration-s", str(SEND_S)]
 
@@ -215,7 +217,7 @@ def trial(proto, size, rate):
 
 def _score(proto, size, rate, s_err, r):
     m = re.search(r"sent (\d+) \w+ over ([\d.]+)s", s_err)
-    sent_rate = int(m.group(1)) / float(m.group(2)) if m else 0.0
+    sent_rate = int(m.group(1)) / float(m.group(2)) if m and float(m.group(2)) > 0 else 0.0
     if proto == "udp":
         m = re.search(r"received (\d+) datagrams in ([\d.]+)s", r.stderr)
         msgs, elapsed = (int(m.group(1)), float(m.group(2))) if m else (0, WINDOW_S)
@@ -223,7 +225,8 @@ def _score(proto, size, rate, s_err, r):
     else:
         m = re.search(r"(\d+) msgs, (\d+) bytes in ([\d.]+)s", r.stdout)
         msgs, elapsed = (int(m.group(1)), float(m.group(3))) if m else (0, WINDOW_S)
-        payload = {"channel-b": max(size, CHANNEL_B_MIN_FIELDS), "rs-udp": min(size, 65507)}.get(proto, size)
+        payload = {"channel-b": max(size, CHANNEL_B_MIN_FIELDS), "rs-udp": min(size, 65507),
+                   "rs-webrtc": min(size, 65535)}.get(proto, size)
     recv_rate = msgs / elapsed if elapsed else 0.0
     offered = min(rate, sent_rate) if sent_rate else rate
     return {"target_hz": rate, "sent_hz": round(sent_rate, 1), "recv_hz": round(recv_rate, 1),
