@@ -45,6 +45,12 @@ pub const DATAGRAM_TAG_CHANNEL_A: u8 = 0x02;
 /// receiver today -- present for recorder/debug parity with other
 /// datagram types, not because anything currently reads it.
 pub const DATAGRAM_TAG_HEARTBEAT: u8 = 0x03;
+/// Benchmark-only (`roboprotocol_core::bench`): an opaque payload carried
+/// straight on a QUIC datagram, with no FlatBuffers frame inside, so the
+/// protocol comparison can time Channel B's transport on the same raw bytes
+/// the other protocols carry. `robot-edge` ignores it unless run with
+/// `--bench`.
+pub const DATAGRAM_TAG_BENCH_RAW: u8 = 0x7F;
 
 /// Prefix `payload` with a 1-byte datagram type tag.
 pub fn tag(tag_byte: u8, payload: &[u8]) -> Vec<u8> {
@@ -78,6 +84,9 @@ mod tests {
     fn heartbeat_tag_is_distinct_from_the_channel_tags_and_round_trips() {
         assert_ne!(DATAGRAM_TAG_HEARTBEAT, DATAGRAM_TAG_CHANNEL_A);
         assert_ne!(DATAGRAM_TAG_HEARTBEAT, DATAGRAM_TAG_CHANNEL_B);
+        for t in [DATAGRAM_TAG_CHANNEL_A, DATAGRAM_TAG_CHANNEL_B, DATAGRAM_TAG_HEARTBEAT, crate::estop::ESTOP_DATAGRAM_MAGIC] {
+            assert_ne!(DATAGRAM_TAG_BENCH_RAW, t);
+        }
         let tagged = tag(DATAGRAM_TAG_HEARTBEAT, &42u64.to_be_bytes());
         let (t, rest) = untag(&tagged).unwrap();
         assert_eq!(t, DATAGRAM_TAG_HEARTBEAT);

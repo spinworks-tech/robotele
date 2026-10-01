@@ -19,7 +19,8 @@ If you're new here, read in this order:
 | 7 | [Recording & Replay](07-recording-and-replay.md) | Black-box session logging and the replay/conversion tooling |
 | 8 | [Performance & Benchmarks](08-performance-and-benchmarks.md) | Real-hardware latency/throughput measurements and how to reproduce them |
 | 9 | [Design Review & Roadmap](09-design-review-and-roadmap.md) | Known gaps, strengths, and the path from prototype to standard |
-| 11 | [Protocol Comparison](11-protocol-comparison.md) | MQTT vs Zenoh vs WebRTC (DimOS) vs raw UDP on loopback, plaintext and mTLS |
+| 11 | [Protocol Comparison](11-protocol-comparison.md) | Channel B vs MQTT, Zenoh, WebRTC and raw UDP on loopback: latency and throughput, native and Python clients, plaintext and mTLS |
+| 12 | [Control Under Load (plan)](12-control-under-load-benchmark.md) | Benchmark plan: control-loop latency while video saturates a shaped link, on two Raspberry Pis |
 
 ## Repository map
 

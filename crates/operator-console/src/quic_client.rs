@@ -170,6 +170,9 @@ pub struct ClientArgs {
     /// `<--record-dir>/screenshots/` if given, else `./screenshots/` (see
     /// `main.rs`). Only consulted under `VideoBackend::Native`.
     pub screenshot_dir: PathBuf,
+    /// Benchmark-only (`--bench`): once the session reaches Operating, hand
+    /// the connection to `crate::bench` instead of the interactive loop.
+    pub bench: Option<crate::bench::BenchSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,7 +392,13 @@ pub async fn run(args: ClientArgs) -> Result<()> {
     // leaving it blank) before the operator's first camera-control nudge.
     client.sync_camera_hud_and_overlay();
 
-    client.run(socket).await
+    client.run(&socket).await?;
+    if let Some(spec) = client.args.bench {
+        anyhow::ensure!(client.phase == Phase::Operating, "session ended before reaching Operating");
+        let first_seq = client.channel_b_seq + 1;
+        crate::bench::run(&mut client.conn, &socket, client.local_addr, spec, first_seq).await?;
+    }
+    Ok(())
 }
 
 struct Client {
@@ -461,7 +470,7 @@ struct Client {
 }
 
 impl Client {
-    async fn run(&mut self, socket: UdpSocket) -> Result<()> {
+    async fn run(&mut self, socket: &UdpSocket) -> Result<()> {
         let mut buf = vec![0u8; 65535];
         let mut ticker = tokio::time::interval(self.tick_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -482,27 +491,33 @@ impl Client {
                         Err(e) => tracing::warn!(error = ?e, "conn.recv error"),
                     }
                     self.after_recv();
-                    flush_once(&mut self.conn, &socket).await?;
+                    flush_once(&mut self.conn, socket).await?;
                 }
                 _ = tokio::time::sleep(timeout) => {
                     self.conn.on_timeout();
-                    flush_once(&mut self.conn, &socket).await?;
+                    flush_once(&mut self.conn, socket).await?;
                 }
                 _ = ticker.tick() => {
                     self.on_tick();
-                    flush_once(&mut self.conn, &socket).await?;
+                    flush_once(&mut self.conn, socket).await?;
                     self.console.render(&self.hud);
                 }
                 Some(input) = recv_input(&mut self.input) => {
-                    if self.dispatch_teleop_input(input, &socket).await? {
+                    if self.dispatch_teleop_input(input, socket).await? {
                         return Ok(());
                     }
                 }
                 Some(input) = recv_gamepad(&mut self.gamepad) => {
-                    if self.dispatch_teleop_input(input, &socket).await? {
+                    if self.dispatch_teleop_input(input, socket).await? {
                         return Ok(());
                     }
                 }
+            }
+
+            if self.args.bench.is_some() && self.phase == Phase::Operating {
+                // Session fully negotiated: `quic_client::run` takes the
+                // connection from here (see `ClientArgs::bench`).
+                return Ok(());
             }
 
             let recv_stale = !self.conn.is_closed() && self.last_recv_at.elapsed() > RECV_WATCHDOG_TIMEOUT;
@@ -533,7 +548,7 @@ impl Client {
                     // reconnect loop.
                     return Ok(());
                 }
-                if !self.reconnect_until_success_or_quit(&socket).await? {
+                if !self.reconnect_until_success_or_quit(socket).await? {
                     return Ok(());
                 }
                 // Reconnected -- fall through and keep driving the same

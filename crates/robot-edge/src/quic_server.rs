@@ -30,6 +30,7 @@ use crate::safety_task::SafetyTask;
 use crate::session_handler;
 use crate::video::channel_a::VideoRx;
 use crate::video::{capture, channel_a};
+use roboprotocol_core::bench::{BenchMode, BENCH_ECHO_TICK_ID};
 use roboprotocol_core::profile::RobotProfile;
 
 const MAX_DATAGRAM_SIZE: usize = 1452;
@@ -51,6 +52,8 @@ pub struct ServerArgs {
     pub bridge: BridgeConfig,
     pub camera_config: Option<capture::CaptureConfig>,
     pub recording: roboprotocol_recording::RecorderConfig,
+    /// See `roboprotocol_core::bench`; `None` outside benchmarks.
+    pub bench: Option<BenchMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +169,8 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             action_settle_until: None,
             sitting: false,
             recorder: recorder.clone(),
+            bench: args.bench,
+            bench_counter: BenchCounter::default(),
         };
 
         match session.run(&socket, buf).await {
@@ -238,6 +243,18 @@ struct Session {
     /// Arm/Claw are unaffected; only Move/Turn are withheld.
     sitting: bool,
     recorder: roboprotocol_recording::Recorder,
+    bench: Option<BenchMode>,
+    bench_counter: BenchCounter,
+}
+
+/// `--bench count` totals, logged cumulatively once a second from `on_tick`
+/// so a benchmark driver can take the delta over any window it likes.
+#[derive(Default)]
+struct BenchCounter {
+    msgs: u64,
+    bytes: u64,
+    first_rx: Option<Instant>,
+    last_log: Option<Instant>,
 }
 
 /// Query the bridge for fresh telemetry every N ticks rather than every
@@ -559,6 +576,12 @@ impl Session {
         if self.phase != Phase::Operating {
             return;
         }
+        if data.first() == Some(&datagram::DATAGRAM_TAG_BENCH_RAW) {
+            if let Some(mode) = self.bench {
+                self.on_bench_raw(mode, data);
+            }
+            return;
+        }
         let Some((tag, payload)) = datagram::untag(data) else { return };
         if tag == datagram::DATAGRAM_TAG_HEARTBEAT {
             // spinworks-tech/robotele#6: an operator client (e.g.
@@ -585,6 +608,10 @@ impl Session {
                 self.safety.on_channel_b_activity(None, Instant::now());
                 self.safety.deadman_held = true;
                 self.safety.command_fresh = true;
+                if let Some(mode) = self.bench {
+                    self.on_bench_command(mode, frame, payload.len());
+                    return;
+                }
                 if let Some(cmd) = TeleopCommand::unpack(&frame.fields) {
                     let source = self.dispatch_teleop_command(&cmd);
                     // `capture_us` is this endpoint's own local receipt
@@ -606,6 +633,68 @@ impl Session {
             Ok(_) => {}
             Err(e) => tracing::debug!(error = %e, "failed to decode Channel B datagram"),
         }
+    }
+
+    /// Bench mode's replacement for dispatch (see `roboprotocol_core::bench`):
+    /// the command is still fully decoded -- same receive path as normal up
+    /// to `TeleopCommand::unpack` -- but never reaches the bridge, recorder
+    /// or Channel C sidecar, so a high-rate run measures the protocol rather
+    /// than the Python bridge's pipe.
+    fn on_bench_command(&mut self, mode: BenchMode, frame: ChannelBFrameData, wire_len: usize) {
+        if TeleopCommand::unpack(&frame.fields).is_none() {
+            return;
+        }
+        match mode {
+            BenchMode::Echo => {
+                let echo = ChannelBFrameData {
+                    timestamp: frame.timestamp,
+                    seq: frame.seq,
+                    tick_id: BENCH_ECHO_TICK_ID,
+                    category: ChannelBCategory::Telemetry,
+                    region_id: ALL_REGIONS,
+                    fields: frame.fields,
+                };
+                let bytes = channel_b::encode_channel_b_frame(&echo);
+                // Flushed by `run` right after `after_recv` returns, so the
+                // echo leaves in the same loop iteration the command arrived.
+                let _ = self.conn.dgram_send(&datagram::tag(datagram::DATAGRAM_TAG_CHANNEL_B, &bytes));
+            }
+            BenchMode::Count => {
+                let c = &mut self.bench_counter;
+                c.first_rx.get_or_insert_with(Instant::now);
+                c.msgs += 1;
+                c.bytes += wire_len as u64;
+            }
+        }
+    }
+
+    /// Transport-only bench path: an opaque payload, no FlatBuffers. The
+    /// datagram is echoed back exactly as received (tag included) or just
+    /// counted -- never copied or parsed -- so the only Channel B cost left
+    /// is QUIC + TLS + the one-byte tag dispatch above.
+    fn on_bench_raw(&mut self, mode: BenchMode, data: &[u8]) {
+        self.safety.on_channel_b_activity(None, Instant::now());
+        match mode {
+            BenchMode::Echo => {
+                let _ = self.conn.dgram_send(data);
+            }
+            BenchMode::Count => {
+                let c = &mut self.bench_counter;
+                c.first_rx.get_or_insert_with(Instant::now);
+                c.msgs += 1;
+                c.bytes += (data.len() - 1) as u64;
+            }
+        }
+    }
+
+    fn log_bench_counter(&mut self, now: Instant) {
+        let c = &mut self.bench_counter;
+        let Some(first) = c.first_rx else { return };
+        if c.last_log.is_some_and(|t| now.duration_since(t) < Duration::from_secs(1)) {
+            return;
+        }
+        c.last_log = Some(now);
+        tracing::info!(t_ms = now.duration_since(first).as_millis() as u64, msgs = c.msgs, bytes = c.bytes, "bench_rx");
     }
 
     fn dispatch_teleop_command(&mut self, cmd: &TeleopCommand) -> roboprotocol_core::safety::ControlSource {
@@ -705,6 +794,9 @@ impl Session {
     async fn on_tick(&mut self) -> Result<()> {
         let now = Instant::now();
         self.tick_count += 1;
+        if self.bench == Some(BenchMode::Count) {
+            self.log_bench_counter(now);
+        }
         let source = self.safety.tick(now, self.autonomy_goal.asserted());
         let latched = self.safety.is_estopped();
 

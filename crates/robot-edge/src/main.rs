@@ -56,6 +56,10 @@ struct Cli {
     record_budget_mb: u64,
     record_video_budget_mb: u64,
     record_flush_secs: u64,
+    /// Benchmark-only: echo or count Channel B commands instead of
+    /// dispatching them -- see `roboprotocol_core::bench`. Requires
+    /// `--stub-bridge`, since it bypasses actuation entirely.
+    bench: Option<roboprotocol_core::bench::BenchMode>,
 }
 
 /// Maps a `--record` list entry to a category. `robot-edge` has no
@@ -104,6 +108,7 @@ impl Cli {
         let mut record_budget_mb = 64u64;
         let mut record_video_budget_mb = 16u64;
         let mut record_flush_secs = 2u64;
+        let mut bench = None;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -145,6 +150,10 @@ impl Cli {
                 "--record-budget-mb" => record_budget_mb = it.next().context("--record-budget-mb needs a value")?.parse()?,
                 "--record-video-budget-mb" => record_video_budget_mb = it.next().context("--record-video-budget-mb needs a value")?.parse()?,
                 "--record-flush-secs" => record_flush_secs = it.next().context("--record-flush-secs needs a value")?.parse()?,
+                "--bench" => {
+                    let mode = it.next().context("--bench needs a value (echo|count)")?;
+                    bench = Some(roboprotocol_core::bench::BenchMode::parse(&mode).with_context(|| format!("unknown --bench mode {mode}, expected echo|count"))?);
+                }
                 "-h" | "--help" => {
                     println!(
                         "Usage: robot-edge [--listen ADDR] [--cert PATH] [--key PATH] [--ca PATH]\n  \
@@ -154,12 +163,19 @@ impl Cli {
                          [--camera] [--camera-bin PATH]\n  \
                          [--record-dir PATH] [--record video,command,telemetry,haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
-                         [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]"
+                         [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n  \
+                         [--bench echo|count]   (benchmark only; requires --stub-bridge)"
                     );
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unrecognized argument: {other} (see --help)"),
             }
+        }
+
+        if bench.is_some() && !stub_bridge {
+            // Bench mode skips dispatch to the bridge, so a real robot would
+            // stop obeying commands while still reporting a healthy session.
+            anyhow::bail!("--bench requires --stub-bridge (bench mode bypasses actuation)");
         }
 
         if !record.is_empty() && record_dir.is_none() {
@@ -189,6 +205,7 @@ impl Cli {
             record_budget_mb,
             record_video_budget_mb,
             record_flush_secs,
+            bench,
         })
     }
 
@@ -273,6 +290,7 @@ async fn main() -> Result<()> {
             ..CaptureConfig::default()
         }),
         recording,
+        bench: cli.bench,
     };
 
     let profile = xgo_profile::xgo_lite_v2_profile();

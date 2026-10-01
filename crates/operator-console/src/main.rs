@@ -1,4 +1,5 @@
 mod action_trigger_handler;
+mod bench;
 mod camera_control_handler;
 mod channel_b;
 mod gamepad;
@@ -46,6 +47,8 @@ struct Cli {
     record_budget_mb: u64,
     record_video_budget_mb: u64,
     record_flush_secs: u64,
+    /// Benchmark-only -- see `bench.rs`. Requires `--headless`.
+    bench: Option<bench::BenchSpec>,
 }
 
 /// `--record-extra`'s allowed categories -- `video`/`command`/`telemetry`/
@@ -89,6 +92,12 @@ impl Cli {
         let mut record_budget_mb = 2048u64;
         let mut record_video_budget_mb = 512u64;
         let mut record_flush_secs = 5u64;
+        let mut bench_mode: Option<String> = None;
+        let mut bench_count = 1000usize;
+        let mut bench_payload_bytes = 20usize;
+        let mut bench_rate_hz = 1000.0f64;
+        let mut bench_duration_s = 30.0f64;
+        let mut bench_raw = false;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -137,6 +146,12 @@ impl Cli {
                 "--record-budget-mb" => record_budget_mb = it.next().context("--record-budget-mb needs a value")?.parse()?,
                 "--record-video-budget-mb" => record_video_budget_mb = it.next().context("--record-video-budget-mb needs a value")?.parse()?,
                 "--record-flush-secs" => record_flush_secs = it.next().context("--record-flush-secs needs a value")?.parse()?,
+                "--bench" => bench_mode = Some(it.next().context("--bench needs a value (pingpong|send)")?),
+                "--bench-count" => bench_count = it.next().context("--bench-count needs a value")?.parse()?,
+                "--bench-payload-bytes" => bench_payload_bytes = it.next().context("--bench-payload-bytes needs a value")?.parse()?,
+                "--bench-rate-hz" => bench_rate_hz = it.next().context("--bench-rate-hz needs a value")?.parse()?,
+                "--bench-raw" => bench_raw = true,
+                "--bench-duration-s" => bench_duration_s = it.next().context("--bench-duration-s needs a value")?.parse()?,
                 "-h" | "--help" => {
                     println!(
                         "Usage: operator-console [--connect ADDR] [--bind ADDR] [--server-name NAME]\n  \
@@ -145,7 +160,9 @@ impl Cli {
                          [--move-stale-ms N] [--observer]\n  \
                          [--record-dir PATH] [--record-extra haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
-                         [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n\n\
+                         [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n  \
+                         [--bench pingpong|send --headless [--bench-raw] [--bench-count N] [--bench-payload-bytes N]\n  \
+                          [--bench-rate-hz N] [--bench-duration-s N]]   (against robot-edge --bench)\n\n\
                          Keys: w/a/s/d move, left/right turn, space stop, i/j/k/l arm, u/o claw,\n  \
                          1 stand, 2 sit, e E-Stop, c clear, r start/stop recording, p save video\n  \
                          frame, q quit.\n\
@@ -185,6 +202,17 @@ impl Cli {
             }
         }
 
+        let bench_kind = match bench_mode.as_deref() {
+            None => None,
+            Some("pingpong") => Some(bench::BenchKind::PingPong { count: bench_count }),
+            Some("send") => Some(bench::BenchKind::Send { rate_hz: bench_rate_hz, duration_s: bench_duration_s }),
+            Some(other) => anyhow::bail!("unknown --bench mode {other}, expected pingpong|send"),
+        };
+        let bench = bench_kind.map(|kind| bench::BenchSpec { kind, payload_bytes: bench_payload_bytes, raw: bench_raw });
+        if bench.is_some() && !headless {
+            anyhow::bail!("--bench needs --headless (no keyboard input or TUI during a benchmark)");
+        }
+
         if !record_extra.is_empty() && record_dir.is_none() {
             anyhow::bail!("--record-extra given without --record-dir");
         }
@@ -219,6 +247,7 @@ impl Cli {
             record_budget_mb,
             record_video_budget_mb,
             record_flush_secs,
+            bench,
         })
     }
 
@@ -329,6 +358,7 @@ async fn main() -> Result<()> {
         move_stale_ms: cli.move_stale_ms,
         recording,
         screenshot_dir,
+        bench: cli.bench,
     };
 
     // Interactive mode enters the alternate screen inside `ui::Console`
