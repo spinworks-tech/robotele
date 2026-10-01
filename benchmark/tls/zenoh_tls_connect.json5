@@ -1,0 +1,21 @@
+// Part 4 encrypted table: Zenoh peer-to-peer over TLS with mutual auth.
+// Cert paths are relative to benchmark/ (run_loopback.py runs from there).
+// Scouting is off so the TLS link is the only way the two peers can meet.
+{
+  mode: "peer",
+  listen: { endpoints: [] }, connect: { endpoints: ["tls/127.0.0.1:7447"] },
+  scouting: { multicast: { enabled: false }, gossip: { enabled: false } },
+  transport: {
+    link: {
+      tls: {
+        root_ca_certificate: "../certs/dev-ca/ca.crt",
+        listen_certificate: "../certs/operator/operator.crt",
+        listen_private_key: "../certs/operator/operator.key",
+        connect_certificate: "../certs/operator/operator.crt",
+        connect_private_key: "../certs/operator/operator.key",
+        enable_mtls: true,
+        verify_name_on_connect: true,
+      },
+    },
+  },
+}

@@ -158,6 +158,13 @@ pub struct ClientArgs {
     /// Auto-zero `vx`/`vy`/`turn` if no movement key event refreshes them
     /// within this many ms -- see `Client::on_tick`'s staleness check.
     pub move_stale_ms: u64,
+    /// spinworks-tech/robotele#6: yield `FullTeleoperation` without ending
+    /// the session. Keyed on the same movement-input staleness this struct
+    /// already tracks (`move_stale_ms`) -- see `Client::on_tick`. A real
+    /// Move/Turn key press resumes normal Command frames the very next
+    /// tick, immediately preempting any Channel C autonomy source; letting
+    /// go (auto-zero fires) hands it back the tick after that.
+    pub observer: bool,
     pub recording: roboprotocol_recording::RecorderConfig,
     /// Where `TeleopInput::SaveFrame` ('p'/gamepad Y) writes PNGs --
     /// `<--record-dir>/screenshots/` if given, else `./screenshots/` (see
@@ -425,10 +432,12 @@ struct Client {
     /// One-shot scripted action for non-interactive validation (e.g. CI,
     /// headless hardware smoke tests) -- see `ClientArgs::demo_action`.
     demo_action: Option<u8>,
-    /// Wall-clock time of the last Move/Turn key event -- see
-    /// `on_tick`'s staleness check, which zeros `last_command`'s vx/vy/turn
-    /// once this is older than `move_stale`. `None` means no movement key
-    /// has ever been pressed (nothing to go stale yet).
+    /// Wall-clock time of the last key event that rides `last_command`
+    /// (Move/Turn/arm/claw/attitude -- see `on_input`'s doc for the exact
+    /// set) -- see `on_tick`'s staleness check, which zeros `last_command`'s
+    /// vx/vy/turn once this is older than `move_stale`, and (spinworks-tech/
+    /// robotele#6) gates `--observer` mode the same way. `None` means no
+    /// such key has ever been pressed (nothing to go stale yet).
     last_move_input_at: Option<std::time::Instant>,
     move_stale: Duration,
     /// Wall-clock time we last actually received *anything* from the
@@ -939,6 +948,29 @@ impl Client {
     }
 
     fn on_input(&mut self, input: TeleopInput) {
+        // spinworks-tech/robotele#6: every variant that ends up in
+        // `self.last_command` (i.e. rides the next Channel B Command
+        // frame) refreshes this -- not just Move/Turn -- so `--observer`
+        // mode (see `on_tick`) can't silently swallow an arm/claw/attitude
+        // key: any of them immediately and automatically takes control
+        // back, same as Move/Turn already did. Action/CameraNudge/
+        // CameraReset/Estop/EstopClear ride their own streams or datagram
+        // independent of Command frames, so they're excluded here --
+        // Action in particular is intentionally left to robot-edge's own
+        // "only applies under FullTeleoperation" gate rather than
+        // reclaiming control on its own.
+        if matches!(
+            &input,
+            TeleopInput::Move { .. }
+                | TeleopInput::Turn { .. }
+                | TeleopInput::ArmNudge { .. }
+                | TeleopInput::AttitudeNudge { .. }
+                | TeleopInput::AttitudeReset
+                | TeleopInput::NeutralPose
+                | TeleopInput::ClawNudge { .. }
+        ) {
+            self.last_move_input_at = Some(std::time::Instant::now());
+        }
         match input {
             TeleopInput::Move { vx, vy } => {
                 tracing::info!(vx, vy, "move key event");
@@ -946,13 +978,11 @@ impl Client {
                 self.last_command.vy = vy;
                 self.hud.move_vx = vx;
                 self.hud.move_vy = vy;
-                self.last_move_input_at = Some(std::time::Instant::now());
             }
             TeleopInput::Turn { turn } => {
                 tracing::info!(turn, "turn key event");
                 self.last_command.turn = turn;
                 self.hud.turn = turn;
-                self.last_move_input_at = Some(std::time::Instant::now());
             }
             TeleopInput::Action(id) => self.send_action_trigger(id),
             TeleopInput::ArmNudge { dx, dz } => {
@@ -1128,6 +1158,24 @@ impl Client {
 
         if let Some(action_id) = self.demo_action.take() {
             self.send_action_trigger(action_id);
+        }
+
+        // spinworks-tech/robotele#6: `--observer` yields FullTeleoperation
+        // without ending the session. Keyed on the exact same staleness
+        // check as the auto-zero above -- "no real movement key event
+        // recently" -- so a physical key press always, immediately, and
+        // automatically reclaims control (no separate "take control" step
+        // needed), while idling lets a Channel C autonomy source (if any is
+        // asserted) win arbitration instead. Sends the heartbeat datagram
+        // (feeds robot-edge's watchdog only) rather than a Command frame,
+        // so `deadman_held`/`command_fresh` are never asserted for as long
+        // as this holds.
+        self.hud.observing = self.args.observer
+            && self.last_move_input_at.is_none_or(|t| t.elapsed() >= self.move_stale);
+        if self.hud.observing {
+            self.channel_b_seq += 1;
+            let _ = self.conn.dgram_send(&datagram::tag(datagram::DATAGRAM_TAG_HEARTBEAT, &self.channel_b_seq.to_be_bytes()));
+            return;
         }
 
         self.channel_b_seq += 1;

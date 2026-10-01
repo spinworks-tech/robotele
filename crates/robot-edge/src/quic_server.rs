@@ -75,7 +75,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
     // Started once, outside the reconnect loop, same reasoning as `recorder`
     // above: the Zenoh session and its background tasks persist across
     // reconnects. Both handles are cheap to clone into each `Session`.
-    let (telemetry_sink, command_sink, autonomy_goal) = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port).await;
+    let (telemetry_sink, command_sink, autonomy_goal, video_sink) = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port).await;
 
     // v0 keeps the single-active-connection design (no CID-routing table for
     // concurrent clients -- see module docs) but must not let one connection
@@ -133,7 +133,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
         let bridge = BridgeSupervisor::spawn(args.bridge.clone());
         let capture_handle = args.camera_config.clone().map(capture::spawn_capture);
         let camera_controls_tx = capture_handle.as_ref().map(|h| h.controls_tx.clone());
-        let video_rx = capture_handle.map(|h| channel_a::spawn_encoder(h.rx, recorder.clone()));
+        let video_rx = capture_handle.map(|h| channel_a::spawn_encoder(h.rx, recorder.clone(), video_sink.clone()));
 
         let mut session = Session {
             conn,
@@ -560,6 +560,19 @@ impl Session {
             return;
         }
         let Some((tag, payload)) = datagram::untag(data) else { return };
+        if tag == datagram::DATAGRAM_TAG_HEARTBEAT {
+            // spinworks-tech/robotele#6: an operator client (e.g.
+            // operator-console --observer) yielding FullTeleoperation
+            // without ending the session. Feeds the watchdog only --
+            // deliberately does NOT set deadman_held/command_fresh, so
+            // arbitration falls through to SemiAutonomous (if a Channel C
+            // autonomy goal is asserted) or the fail-safe ActiveImpedanceHold
+            // default otherwise. Never touches E-Stop latch state either
+            // (see the constant's own doc for why that rules out reusing
+            // EstopDatagram{latched:false} for this).
+            self.safety.on_channel_b_activity(None, Instant::now());
+            return;
+        }
         if tag != datagram::DATAGRAM_TAG_CHANNEL_B {
             // robot-edge never receives Channel A (video) datagrams -- it
             // only sends them. Anything else is unexpected; drop it rather
@@ -676,7 +689,10 @@ impl Session {
                 let seq = self.next_seq();
                 let _ = self.bridge.cmd_tx.send(BridgeCommand::Stop { seq });
             }
-            ControlSource::SemiAutonomous => {} // v0: no autonomy goals exist yet
+            // Driven from `on_tick` (which runs even when no operator command
+            // arrives), not here: an operator datagram must not be the thing
+            // that keeps an autonomy goal alive.
+            ControlSource::SemiAutonomous => {}
         }
         source
     }
@@ -737,6 +753,18 @@ impl Session {
             self.bridge_estop_active = false;
             let clear_seq = self.next_seq();
             let _ = self.bridge.cmd_tx.send(BridgeCommand::EstopClear { seq: clear_seq });
+        }
+
+        // Semi-autonomy (Channel C `autonomy_goal`): only reached when the
+        // arbitration ladder ranked it above ActiveImpedanceHold, i.e. no
+        // E-Stop/suspension and no ready teleop. Velocity is already clamped to
+        // the operator's own limits and decays to zero with the goal's TTL.
+        if source == roboprotocol_core::safety::ControlSource::SemiAutonomous {
+            let v = self.autonomy_goal.velocity();
+            let move_seq = self.next_seq();
+            let _ = self.bridge.cmd_tx.send(BridgeCommand::Move { x: v.vx as f64, y: v.vy as f64, seq: move_seq });
+            let turn_seq = self.next_seq();
+            let _ = self.bridge.cmd_tx.send(BridgeCommand::Turn { step: v.turn as f64, seq: turn_seq });
         }
 
         if self.tick_count % TELEMETRY_QUERY_EVERY_N_TICKS == 0 {

@@ -34,6 +34,17 @@
 
 pub const DATAGRAM_TAG_CHANNEL_B: u8 = 0x01;
 pub const DATAGRAM_TAG_CHANNEL_A: u8 = 0x02;
+/// spinworks-tech/robotele#6: a lightweight keepalive an operator client
+/// can send instead of a Channel B `Command` frame -- feeds the watchdog
+/// (so the session/telemetry/video sidecar stay up) without asserting the
+/// deadman or touching E-Stop latch state at all, unlike misusing
+/// `EstopDatagram{latched: false}` for this would (that actively clears
+/// *any* latched E-Stop, including one `robot-edge` set itself after a
+/// bridge crash -- SR-4 requires E-Stop never auto-clear from network
+/// state alone). Payload is just an 8-byte big-endian seq, unused by the
+/// receiver today -- present for recorder/debug parity with other
+/// datagram types, not because anything currently reads it.
+pub const DATAGRAM_TAG_HEARTBEAT: u8 = 0x03;
 
 /// Prefix `payload` with a 1-byte datagram type tag.
 pub fn tag(tag_byte: u8, payload: &[u8]) -> Vec<u8> {
@@ -61,6 +72,16 @@ mod tests {
         let (t, rest) = untag(&tagged).unwrap();
         assert_eq!(t, DATAGRAM_TAG_CHANNEL_A);
         assert_eq!(rest, &payload);
+    }
+
+    #[test]
+    fn heartbeat_tag_is_distinct_from_the_channel_tags_and_round_trips() {
+        assert_ne!(DATAGRAM_TAG_HEARTBEAT, DATAGRAM_TAG_CHANNEL_A);
+        assert_ne!(DATAGRAM_TAG_HEARTBEAT, DATAGRAM_TAG_CHANNEL_B);
+        let tagged = tag(DATAGRAM_TAG_HEARTBEAT, &42u64.to_be_bytes());
+        let (t, rest) = untag(&tagged).unwrap();
+        assert_eq!(t, DATAGRAM_TAG_HEARTBEAT);
+        assert_eq!(u64::from_be_bytes(rest.try_into().unwrap()), 42);
     }
 
     #[test]

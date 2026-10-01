@@ -36,6 +36,7 @@ struct Cli {
     video_backend: VideoBackend,
     video_overlay: bool,
     headless: bool,
+    observer: bool,
     demo_action: Option<u8>,
     move_stale_ms: u64,
     record_dir: Option<PathBuf>,
@@ -75,6 +76,7 @@ impl Cli {
         let mut video_backend = VideoBackend::Ffplay;
         let mut video_overlay = false;
         let mut headless = false;
+        let mut observer = false;
         let mut demo_action = None;
         let mut move_stale_ms = 400u64;
         let mut record_dir = None;
@@ -118,6 +120,7 @@ impl Cli {
                 }
                 "--video-overlay" => video_overlay = true,
                 "--headless" => headless = true,
+                "--observer" => observer = true,
                 "--demo-action" => demo_action = Some(it.next().context("--demo-action needs a value")?.parse()?),
                 "--move-stale-ms" => move_stale_ms = it.next().context("--move-stale-ms needs a value")?.parse()?,
                 "--record-dir" => record_dir = Some(PathBuf::from(it.next().context("--record-dir needs a value")?)),
@@ -139,7 +142,7 @@ impl Cli {
                         "Usage: operator-console [--connect ADDR] [--bind ADDR] [--server-name NAME]\n  \
                          [--cert PATH] [--key PATH] [--ca PATH] [--task-class B|C|D|E] [--tick-hz N]\n  \
                          [--video] [--video-backend ffplay|native] [--video-overlay] [--ffplay-bin PATH]\n  \
-                         [--move-stale-ms N]\n  \
+                         [--move-stale-ms N] [--observer]\n  \
                          [--record-dir PATH] [--record-extra haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
                          [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n\n\
@@ -154,6 +157,14 @@ impl Cli {
                          that and movement stutters while held.\n\
                          Arm/claw keys (i/j/k/l/u/o) set a held *position*, not a velocity -- xgolib's\n  \
                          arm(x, z)/claw(pos) hold wherever last commanded, so these never auto-stop.\n\
+                         --observer starts (and, after --move-stale-ms of no qualifying key, returns to)\n  \
+                         a passive mode: sends a keepalive instead of Command frames, so the session/\n  \
+                         telemetry/video stay up but this console never asserts FullTeleoperation --\n  \
+                         letting a Channel C autonomy source (e.g. DimOS) actually drive the robot. Any\n  \
+                         Move/Turn/arm/claw/attitude key immediately and automatically takes control\n  \
+                         back (same staleness timer as movement auto-zero); recording and E-Stop always\n  \
+                         work regardless of observer state; a stand/sit action key only applies once\n  \
+                         you've reclaimed FullTeleoperation (robot-edge rejects it otherwise).\n\
                          Recording (FR-9) needs --record-dir; 'r' then toggles video/command/telemetry/\n  \
                          key-press on and off at runtime. --record-extra adds haptic/action from launch,\n  \
                          active the whole session (they have no natural on/off point of their own).\n\
@@ -198,6 +209,7 @@ impl Cli {
             video_backend,
             video_overlay,
             headless,
+            observer,
             demo_action,
             move_stale_ms,
             record_dir,
@@ -312,6 +324,7 @@ async fn main() -> Result<()> {
         video_backend: cli.video_backend,
         video_overlay: cli.video_overlay,
         headless: cli.headless,
+        observer: cli.observer,
         demo_action: cli.demo_action,
         move_stale_ms: cli.move_stale_ms,
         recording,

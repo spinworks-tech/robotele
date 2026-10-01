@@ -29,20 +29,20 @@ def send(args: argparse.Namespace) -> None:
     payload = bytearray(args.payload_bytes)
     interval = 1.0 / args.rate_hz
     seq = 0
-    start = time.monotonic()
+    start = time.perf_counter()
     next_tick = start
     end = start + args.duration_s if args.duration_s else None
     print(f"sending {args.payload_bytes}B datagrams at {args.rate_hz}Hz to "
           f"{args.host}:{args.port}", file=sys.stderr)
-    while end is None or time.monotonic() < end:
+    while end is None or time.perf_counter() < end:
         HEADER.pack_into(payload, 0, seq, time.time())
         sock.sendto(bytes(payload), (args.host, args.port))
         seq += 1
         next_tick += interval
-        sleep_s = next_tick - time.monotonic()
+        sleep_s = next_tick - time.perf_counter()
         if sleep_s > 0:
             time.sleep(sleep_s)
-    print(f"sent {seq} datagrams over {time.monotonic() - start:.2f}s", file=sys.stderr)
+    print(f"sent {seq} datagrams over {time.perf_counter() - start:.2f}s", file=sys.stderr)
 
 
 def recv(args: argparse.Namespace) -> None:
@@ -51,11 +51,11 @@ def recv(args: argparse.Namespace) -> None:
     count = 0
     lost = 0
     last_seq = None
-    start = time.monotonic()
+    start = time.perf_counter()
     end = start + args.duration_s if args.duration_s else None
     print(f"listening on {args.host}:{args.port}", file=sys.stderr)
-    while end is None or time.monotonic() < end:
-        remaining = (end - time.monotonic()) if end else 5.0
+    while end is None or time.perf_counter() < end:
+        remaining = (end - time.perf_counter()) if end else 5.0
         sock.settimeout(max(0.05, remaining))
         try:
             data, _ = sock.recvfrom(65535)
@@ -67,7 +67,7 @@ def recv(args: argparse.Namespace) -> None:
                 lost += seq - last_seq - 1
             last_seq = seq
         count += 1
-    elapsed = time.monotonic() - start
+    elapsed = time.perf_counter() - start
     rate = count / elapsed if elapsed > 0 else 0.0
     print(f"received {count} datagrams in {elapsed:.2f}s ({rate:.1f} pkt/s), "
           f"{lost} gap(s) detected in sequence", file=sys.stderr)
