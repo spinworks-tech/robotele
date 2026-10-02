@@ -618,6 +618,126 @@ impl DepthFormat {
     }
 }
 
+// ---------------------------------------------------------------------
+// What SESSION_DESCRIBE advertises per sensor, and decoding a whole frame
+// with it.
+// ---------------------------------------------------------------------
+
+/// Pinhole intrinsics for back-projecting a depth map, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthIntrinsics {
+    pub fx: f32,
+    pub fy: f32,
+    pub cx: f32,
+    pub cy: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SensorEncoding {
+    /// Point clouds, and radar (which sets `doppler_scale_mps` and `snr`).
+    Points(PointFormat),
+    RangeImage { format: RangeImageFormat, beam_elevations_rad: Vec<f32> },
+    Depth { format: DepthFormat, intrinsics: DepthIntrinsics },
+}
+
+/// One decoded sensor frame.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SensorData {
+    Points(Vec<Point>),
+    RangeImage(RangeImage),
+    Depth(DepthImage),
+}
+
+impl SensorData {
+    /// Points, lidar returns, or pixels with depth -- what a display counts.
+    pub fn sample_count(&self) -> usize {
+        match self {
+            SensorData::Points(points) => points.len(),
+            SensorData::RangeImage(img) => img.ranges_m.iter().filter(|&&r| r > 0.0).count(),
+            SensorData::Depth(img) => img.depth_mm.iter().filter(|&&d| d > 0).count(),
+        }
+    }
+}
+
+impl SensorEncoding {
+    pub fn element_size(&self) -> usize {
+        match self {
+            SensorEncoding::Points(f) => f.element_size(),
+            SensorEncoding::RangeImage { format, .. } => format.element_size(),
+            SensorEncoding::Depth { format, .. } => format.element_size(),
+        }
+    }
+
+    /// Elements per frame, or `None` for point sets, whose size varies.
+    pub fn element_count(&self) -> Option<usize> {
+        match self {
+            SensorEncoding::Points(_) => None,
+            SensorEncoding::RangeImage { format, .. } => Some(format.element_count()),
+            SensorEncoding::Depth { format, .. } => Some(format.element_count()),
+        }
+    }
+
+    pub fn decode(&self, frame: &AssembledFrame) -> SensorData {
+        match self {
+            SensorEncoding::Points(f) => SensorData::Points(f.decode(&frame.received_elements(f.element_size()))),
+            SensorEncoding::RangeImage { format, .. } => {
+                SensorData::RangeImage(format.decode(&frame.deinterleave(format.element_size(), format.element_count())))
+            }
+            SensorEncoding::Depth { format, .. } => SensorData::Depth(format.decode(&frame.deinterleave(format.element_size(), format.element_count()))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SensorDescriptor {
+    pub sensor_id: u8,
+    pub label: String,
+    pub encoding: SensorEncoding,
+    pub max_hz: u8,
+    pub max_bitrate_kbps: u32,
+    /// Sensor origin in the robot base frame, metres.
+    pub mount_position_m: [f32; 3],
+    /// Sensor orientation in the robot base frame, quaternion x, y, z, w.
+    pub mount_orientation_xyzw: [f32; 4],
+}
+
+impl SensorDescriptor {
+    /// Checks a descriptor before anything sizes buffers from it -- the
+    /// operator receives these off the network. Every element must fit one
+    /// default-size slice, and a full frame must fit the u16 slice count.
+    pub fn validate(&self) -> Result<(), String> {
+        let positive = |v: f32| v.is_finite() && v > 0.0;
+        if self.max_hz == 0 {
+            return Err("max_hz is 0".into());
+        }
+        match &self.encoding {
+            SensorEncoding::Points(f) => {
+                if !positive(f.scale_m) || f.doppler_scale_mps.is_some_and(|s| !positive(s)) {
+                    return Err("point scales must be positive".into());
+                }
+            }
+            SensorEncoding::RangeImage { format, beam_elevations_rad } => {
+                if format.beams == 0 || format.columns == 0 || !positive(format.range_scale_m) {
+                    return Err("range image needs beams, columns and a positive range scale".into());
+                }
+                if beam_elevations_rad.len() != format.beams as usize {
+                    return Err(format!("{} beam elevations for {} beams", beam_elevations_rad.len(), format.beams));
+                }
+            }
+            SensorEncoding::Depth { format, intrinsics } => {
+                if format.width == 0 || format.height == 0 || format.segment_width == 0 || format.segment_width > format.width {
+                    return Err("depth needs a size and a segment width no wider than the image".into());
+                }
+                if !(positive(intrinsics.fx) && positive(intrinsics.fy)) {
+                    return Err("depth focal lengths must be positive".into());
+                }
+            }
+        }
+        let count = self.encoding.element_count().unwrap_or(0);
+        slice_count(count, self.encoding.element_size(), DEFAULT_SLICE_PAYLOAD).map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,6 +985,58 @@ mod tests {
         let img = fmt.decode(&frame.deinterleave(fmt.element_size(), fmt.element_count()));
         assert_eq!(img.depth_mm, depth);
         assert!(fmt.encode(&depth[..9]).is_none());
+    }
+
+    fn lidar_descriptor() -> SensorDescriptor {
+        SensorDescriptor {
+            sensor_id: 1,
+            label: "lidar".into(),
+            encoding: SensorEncoding::RangeImage {
+                format: RangeImageFormat { beams: 2, columns: 4, range_scale_m: 0.01, intensity: false },
+                beam_elevations_rad: vec![0.0, 0.1],
+            },
+            max_hz: 10,
+            max_bitrate_kbps: 1_000,
+            mount_position_m: [0.0; 3],
+            mount_orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn descriptor_validation_rejects_what_would_break_the_receiver() {
+        assert_eq!(lidar_descriptor().validate(), Ok(()));
+        let mut d = lidar_descriptor();
+        d.max_hz = 0;
+        assert!(d.validate().is_err());
+        let mut d = lidar_descriptor();
+        d.encoding = SensorEncoding::RangeImage {
+            format: RangeImageFormat { beams: 2, columns: 4, range_scale_m: 0.01, intensity: false },
+            beam_elevations_rad: vec![0.0],
+        };
+        assert!(d.validate().is_err(), "elevation count must match beams");
+        d.encoding = SensorEncoding::RangeImage {
+            format: RangeImageFormat { beams: 600, columns: 4, range_scale_m: 0.01, intensity: false },
+            beam_elevations_rad: vec![0.0; 600],
+        };
+        assert!(d.validate().is_err(), "a 1,200 B column doesn't fit a 1,100 B slice");
+        d.encoding = SensorEncoding::Depth {
+            format: DepthFormat { width: 4, height: 4, segment_width: 8 },
+            intrinsics: DepthIntrinsics { fx: 1.0, fy: 1.0, cx: 2.0, cy: 2.0 },
+        };
+        assert!(d.validate().is_err(), "segment wider than the image");
+        d.encoding = SensorEncoding::Points(PointFormat { scale_m: f32::NAN, intensity: false, doppler_scale_mps: None, snr: false });
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn encoding_decodes_a_partial_frame_and_counts_samples() {
+        let d = lidar_descriptor();
+        let SensorEncoding::RangeImage { format, .. } = &d.encoding else { unreachable!() };
+        let bytes = format.encode(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], None).unwrap();
+        let mut frame = AssembledFrame { sensor_id: 1, frame_seq: 0, capture_time_us: 0, slices: interleave(&bytes, format.element_size(), format.element_size() * 2).unwrap().into_iter().map(Some).collect() };
+        assert_eq!(d.encoding.decode(&frame).sample_count(), 8);
+        frame.slices[0] = None;
+        assert_eq!(d.encoding.decode(&frame).sample_count(), 4, "two of four columns lost");
     }
 
     #[test]

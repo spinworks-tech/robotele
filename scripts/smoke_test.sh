@@ -5,6 +5,9 @@
 # on loopback, and checks for:
 #   1. HELLO negotiated on both sides
 #   2. SESSION_DESCRIBE / SESSION_ACCEPT completed
+#   2b. sensor slices (docs/13) from two --sim-sensor sources assemble into
+#      frames on the operator -- the lidar's descriptor also makes
+#      SESSION_DESCRIBE span more than one packet
 #   3. the watchdog E-Stop latches within the Class D threshold (400ms) once
 #      the operator link goes silent
 #
@@ -41,6 +44,19 @@ fail() {
     exit 1
 }
 
+# Waits until `pattern` appears on at least `count` lines of `file`.
+wait_for_count() {
+    local file="$1" pattern="$2" count="$3" timeout_s="$4" waited=0
+    while [[ "$(grep -c "$pattern" "$file" 2>/dev/null)" -lt "$count" ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+        if [[ $waited -ge $((timeout_s * 10)) ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
 wait_for_log() {
     local file="$1" pattern="$2" timeout_s="$3" waited=0
     while ! grep -q "$pattern" "$file" 2>/dev/null; do
@@ -65,6 +81,7 @@ setsid ./target/debug/robot-edge \
     --listen "127.0.0.1:$PORT" \
     --cert "$CERT_DIR/robot/robot.crt" --key "$CERT_DIR/robot/robot.key" --ca "$CERT_DIR/dev-ca/ca.crt" \
     --stub-bridge --robot-id smoke_test \
+    --sim-sensor lidar --sim-sensor radar \
     > "$ROBOT_LOG" 2>&1 < /dev/null &
 ROBOT_PID=$!
 disown
@@ -88,6 +105,10 @@ wait_for_log "$ROBOT_LOG" "SESSION_ACCEPT received" 5 || fail "robot-edge never 
 wait_for_log "$OPERATOR_LOG" "SESSION_DESCRIBE received" 5 || fail "operator-console never received SESSION_DESCRIBE"
 echo "  ok: session handshake completed"
 
+echo "== waiting for sensor frames (lidar, radar) =="
+wait_for_count "$OPERATOR_LOG" "first sensor frame assembled" 2 10 || fail "operator-console didn't assemble a frame from both sim sensors"
+echo "  ok: sensor slices assembled into frames"
+
 echo "== killing operator-console to trigger the watchdog =="
 kill -9 "$OPERATOR_PID" 2>/dev/null
 OPERATOR_PID=""
@@ -98,4 +119,4 @@ wait_for_log "$ROBOT_LOG" "E-Stop latched" 3 || fail "watchdog never latched E-S
 echo "  ok: watchdog E-Stop latched after operator link silence"
 
 echo
-echo "PASS: HELLO -> SESSION_DESCRIBE/ACCEPT -> Channel B -> watchdog E-Stop all verified"
+echo "PASS: HELLO -> SESSION_DESCRIBE/ACCEPT -> sensor slices -> Channel B -> watchdog E-Stop all verified"

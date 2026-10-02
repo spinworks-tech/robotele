@@ -15,6 +15,7 @@ use roboprotocol_core::datagram;
 use roboprotocol_core::estop::{EstopDatagram, ESTOP_DATAGRAM_MAGIC, ESTOP_STREAM_ID};
 use roboprotocol_core::hello::{self, quantization_tier_bits, task_class_bits, HelloCapabilities, ProtocolVersion};
 use roboprotocol_core::safety::TaskClass;
+use roboprotocol_core::sensor::{AssembledFrame, FrameAssembler, SensorDescriptor, SliceHeader};
 use roboprotocol_core::timestamp;
 use roboprotocol_core::video::nal_is_critical;
 use tokio::net::UdpSocket;
@@ -29,7 +30,7 @@ use crate::gamepad::GamepadReader;
 use crate::input::{InputReader, TeleopInput};
 use crate::session_cache;
 use crate::session_handler::{self, SessionDescribeInfo};
-use crate::ui::{ConnPhase, Console, HudState};
+use crate::ui::{ConnPhase, Console, HudState, SensorHud};
 use crate::video::channel_a::ChannelAReceiver;
 use crate::video::native_playback::{self, NativeVideoTx};
 use crate::video::playback::{self, VideoTx};
@@ -336,6 +337,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         task_class: args.task_class,
         phase: Phase::AwaitingHello,
         session_info: None,
+        describe_buf: Vec::new(),
         console: Console::init(args.headless),
         input: (!args.headless).then(InputReader::new),
         // `GamepadReader::new()` itself returns `Option` (gamepad support
@@ -374,6 +376,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         last_saved_session: None,
         args,
         recorder,
+        sensors: Vec::new(),
     };
 
     // `connect_with_resume_fallback` can leave `conn` already established
@@ -408,6 +411,8 @@ struct Client {
     task_class: TaskClass,
     phase: Phase,
     session_info: Option<SessionDescribeInfo>,
+    /// Stream 1 bytes received so far; decoded at the robot's FIN.
+    describe_buf: Vec<u8>,
     input: Option<InputReader>,
     /// `None` under `--headless` (same as `input`) or if the platform
     /// gamepad backend couldn't initialize -- see `GamepadReader::new`.
@@ -467,7 +472,20 @@ struct Client {
     /// `--record-dir` was never given (see `Cli::recorder_config` in
     /// `main.rs`).
     recorder: roboprotocol_recording::Recorder,
+    /// One per sensor selected in SESSION_ACCEPT, in the same order as
+    /// `hud.sensors`; rebuilt on every SESSION_DESCRIBE.
+    sensors: Vec<SensorReceiver>,
 }
+
+/// Turns one sensor's slices back into frames (docs/13).
+struct SensorReceiver {
+    descriptor: SensorDescriptor,
+    assembler: FrameAssembler,
+    first_frame_logged: bool,
+}
+
+/// Frames in flight per sensor before the oldest is shown partial.
+const SENSOR_MAX_PENDING_FRAMES: usize = 4;
 
 impl Client {
     async fn run(&mut self, socket: &UdpSocket) -> Result<()> {
@@ -596,7 +614,10 @@ impl Client {
                 Some(Ok(conn)) => {
                     self.conn = conn;
                     self.phase = Phase::AwaitingHello;
+                    self.describe_buf.clear();
                     self.session_info = None;
+                    self.sensors.clear();
+                    self.hud.sensors.clear();
                     self.hud.phase = ConnPhase::AwaitingHello;
                     self.hud.robot_id = None;
                     self.hud.dof_count = None;
@@ -788,6 +809,17 @@ impl Client {
         let mut sbuf = vec![0u8; 65535];
         loop {
             match self.conn.stream_recv(stream_id, &mut sbuf) {
+                // SESSION_DESCRIBE can span several packets, so stream 1 is
+                // decoded whole, once the robot's FIN arrives -- decoding a
+                // partial FlatBuffer with this unverified flatbuffers version
+                // panics rather than failing cleanly.
+                Ok((len, fin)) if stream_id == 1 => {
+                    self.describe_buf.extend_from_slice(&sbuf[..len]);
+                    if fin {
+                        let describe = std::mem::take(&mut self.describe_buf);
+                        self.on_stream_data(stream_id, &describe);
+                    }
+                }
                 Ok((len, _fin)) => self.on_stream_data(stream_id, &sbuf[..len]),
                 Err(quiche::Error::Done) => break,
                 Err(e) => {
@@ -831,6 +863,16 @@ impl Client {
                         .cameras
                         .first()
                         .map(|c| format!("{}x{} {:?} @{}fps", c.resolution_w, c.resolution_h, c.codec, c.max_fps));
+                    self.sensors = info
+                        .sensors
+                        .iter()
+                        .map(|d| SensorReceiver {
+                            descriptor: d.clone(),
+                            assembler: FrameAssembler::new(FrameAssembler::deadline_for_rate(d.max_hz as f32), SENSOR_MAX_PENDING_FRAMES),
+                            first_frame_logged: false,
+                        })
+                        .collect();
+                    self.hud.sensors = info.sensors.iter().map(|d| SensorHud::new(d.label.clone())).collect();
                     self.session_info = Some(info);
                     self.phase = Phase::Operating;
                     self.hud.phase = ConnPhase::Operating;
@@ -916,8 +958,54 @@ impl Client {
                     }
                 }
             }
+            datagram::DATAGRAM_TAG_SENSOR_SLICE if self.phase == Phase::Operating => self.on_sensor_slice(&payload),
             _ => {}
         }
+    }
+
+    fn on_sensor_slice(&mut self, payload: &[u8]) {
+        let Some((header, slice)) = SliceHeader::decode(payload) else { return };
+        let Some(i) = self.sensors.iter().position(|s| s.descriptor.sensor_id == header.sensor_id) else { return };
+        self.hud.sensors[i].slice_rate.record(std::time::Instant::now(), payload.len());
+        let frames = self.sensors[i].assembler.on_slice(header, slice, timestamp::now_micros());
+        for frame in frames {
+            self.on_sensor_frame(i, frame);
+        }
+    }
+
+    /// Emits partial frames whose deadline passed. Called every tick.
+    fn poll_sensors(&mut self) {
+        let now_us = timestamp::now_micros();
+        for i in 0..self.sensors.len() {
+            for frame in self.sensors[i].assembler.poll(now_us) {
+                self.on_sensor_frame(i, frame);
+            }
+        }
+    }
+
+    /// Decodes an assembled frame. There's no sensor display yet, so a
+    /// frame only updates the HUD row (the decode still runs, so the HUD's
+    /// sample count is what a display would draw).
+    fn on_sensor_frame(&mut self, i: usize, frame: AssembledFrame) {
+        let sensor = &mut self.sensors[i];
+        let samples = sensor.descriptor.encoding.decode(&frame).sample_count();
+        if !sensor.first_frame_logged {
+            sensor.first_frame_logged = true;
+            tracing::info!(
+                sensor_id = frame.sensor_id,
+                label = %sensor.descriptor.label,
+                slices = frame.slices.len(),
+                completeness = frame.completeness(),
+                samples,
+                "first sensor frame assembled"
+            );
+        }
+        tracing::debug!(sensor_id = frame.sensor_id, frame_seq = frame.frame_seq, completeness = frame.completeness(), samples, "sensor frame");
+        let hud = &mut self.hud.sensors[i];
+        hud.frame_rate.record(std::time::Instant::now(), 0);
+        hud.last_frame_seq = Some(frame.frame_seq);
+        hud.last_completeness = frame.completeness();
+        hud.last_samples = samples;
     }
 
     fn on_telemetry(&mut self, frame: &ChannelBFrameData, wire_len: usize) {
@@ -1139,6 +1227,7 @@ impl Client {
         if self.phase != Phase::Operating {
             return;
         }
+        self.poll_sensors();
 
         self.hud.gamepad_connected = self.gamepad.as_ref().is_some_and(GamepadReader::is_connected);
         self.hud.gamepad_stick_mode = self.gamepad.as_ref().map_or("turn", GamepadReader::stick_mode_label);

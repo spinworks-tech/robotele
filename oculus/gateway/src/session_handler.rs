@@ -143,6 +143,9 @@ pub fn encode_session_accept_full(info: &SessionDescribeInfo, cached: bool) -> V
             selected_regions: Some(regions_vec),
             quantization: Some(quant_vec),
             selected_cameras: Some(cameras_vec),
+            // No sensor-slice receive path here (docs/13), so select none:
+            // the robot then sends this gateway no sensor data at all.
+            selected_sensors: None,
         },
     );
     b.finish(accept, None);

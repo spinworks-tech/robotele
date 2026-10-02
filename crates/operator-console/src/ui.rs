@@ -206,6 +206,36 @@ pub struct HudState {
     /// that FR-9.3's "degrade under pressure, never block" behavior is
     /// actually happening, rather than something silently wrong.
     pub recording_dropped: u64,
+    /// One row per sensor the operator selected (docs/13), rebuilt on every
+    /// SESSION_DESCRIBE.
+    pub sensors: Vec<SensorHud>,
+}
+
+/// Sensor-slice stats for one sensor's row in the channels panel.
+pub struct SensorHud {
+    pub label: String,
+    /// Every received slice datagram -- the bandwidth.
+    pub slice_rate: RateCounter,
+    /// Every frame assembled, complete or partial.
+    pub frame_rate: RateCounter,
+    pub last_frame_seq: Option<u32>,
+    /// Fraction of the last frame's slices that arrived, 0.0..=1.0.
+    pub last_completeness: f32,
+    /// Points, lidar returns, or pixels with depth in the last frame.
+    pub last_samples: usize,
+}
+
+impl SensorHud {
+    pub fn new(label: String) -> Self {
+        Self {
+            label,
+            slice_rate: RateCounter::new(CHANNEL_STATS_WINDOW),
+            frame_rate: RateCounter::new(CHANNEL_STATS_WINDOW),
+            last_frame_seq: None,
+            last_completeness: 0.0,
+            last_samples: 0,
+        }
+    }
 }
 
 const CHANNEL_STATS_WINDOW: Duration = Duration::from_secs(1);
@@ -257,6 +287,7 @@ impl HudState {
             gamepad_stick_mode: "turn",
             gamepad_arm_fine: false,
             recording_dropped: 0,
+            sensors: Vec::new(),
         }
     }
 
@@ -376,7 +407,7 @@ fn draw(f: &mut Frame, hud: &HudState) {
             Constraint::Length(4), // header
             Constraint::Length(3), // e-stop banner
             Constraint::Min(6),    // body
-            Constraint::Length(6), // channels panel
+            Constraint::Length(6 + hud.sensors.len() as u16), // channels panel, one row per sensor
             Constraint::Length(1), // footer
         ])
         .split(f.area());
@@ -682,6 +713,7 @@ fn draw_channels_panel(f: &mut Frame, area: Rect, hud: &HudState) {
             Cell::from(telemetry_age),
         ]),
     ];
+    let rows = rows.into_iter().chain(hud.sensors.iter().map(|s| sensor_row(s, now)));
 
     let table = Table::new(
         rows,
@@ -690,6 +722,23 @@ fn draw_channels_panel(f: &mut Frame, area: Rect, hud: &HudState) {
     .header(header)
     .block(Block::default().borders(Borders::ALL).title("channels (1s window)"));
     f.render_widget(table, area);
+}
+
+/// "S <label>" | slices/s | bandwidth | last frame seq | fps, completeness, samples.
+fn sensor_row(s: &SensorHud, now: Instant) -> Row<'static> {
+    let (slice_hz, slice_bps) = s.slice_rate.rates(now);
+    let (frame_hz, _) = s.frame_rate.rates(now);
+    let note = match s.last_frame_seq {
+        Some(_) => format!("{frame_hz:.1} fps, {:.1}% of slices, {} samples", s.last_completeness * 100.0, s.last_samples),
+        None => "no frame yet".to_string(),
+    };
+    Row::new(vec![
+        Cell::from(format!("S {}", s.label)),
+        Cell::from(format!("{slice_hz:.1}")),
+        Cell::from(fmt_rate(slice_bps)),
+        Cell::from(s.last_frame_seq.map(|q| q.to_string()).unwrap_or_else(|| "--".to_string())),
+        Cell::from(note),
+    ])
 }
 
 fn draw_footer(f: &mut Frame, area: Rect) {

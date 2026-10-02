@@ -95,11 +95,59 @@ table CameraDescriptor {
   max_bitrate_kbps: uint32;
 }
 
+// ---------------------------------------------------------------------
+// Sensor slices (docs/13-large-sensor-payloads.md) -- point clouds, lidar,
+// radar and depth maps as datagram tag 0x04. A descriptor fixes the
+// encoding for the session; exactly one of `points`/`range_image`/`depth`
+// is set, matching `kind`. Radar is a PointCloud with Doppler/SNR fields.
+// ---------------------------------------------------------------------
+
+enum SensorKind : uint8 { PointCloud, RangeImage, Depth }
+
+table PointEncoding {
+  scale_m: float32;            // metres per int16 unit
+  intensity: bool;
+  doppler_scale_mps: float32;  // m/s per int16 unit; 0 = Doppler not carried
+  snr: bool;
+}
+
+table RangeImageEncoding {
+  beams: uint16;
+  columns: uint16;              // column c is at azimuth 2*pi*c/columns
+  range_scale_m: float32;       // metres per uint16 unit; 0 = no return
+  intensity: bool;
+  beam_elevations_rad: [float32];  // one per beam
+}
+
+table DepthEncoding {
+  width: uint16;
+  height: uint16;
+  segment_width: uint16;        // pixels per element (row segment)
+  fx: float32;                  // pinhole intrinsics, pixels
+  fy: float32;
+  cx: float32;
+  cy: float32;
+}
+
+table SensorDescriptor {
+  sensor_id: uint8;
+  label: string;
+  kind: SensorKind;
+  max_hz: uint8;
+  max_bitrate_kbps: uint32;
+  mount_position_m: [float32];        // x, y, z in the robot base frame
+  mount_orientation_xyzw: [float32];  // quaternion, robot base frame
+  points: PointEncoding;
+  range_image: RangeImageEncoding;
+  depth: DepthEncoding;
+}
+
 table SessionDescribe {
   robot_id: string;
   profile_hash: uint64;
   robot_profile: RobotProfile;
   cameras: [CameraDescriptor];
+  sensors: [SensorDescriptor];       // appended: older operators ignore it
 }
 
 // category: 0=command, 1=telemetry, 2=haptic (matches ChannelBCategory below)
@@ -115,6 +163,7 @@ table SessionAccept {
   selected_regions: [uint8];
   quantization: [FieldQuantization];  // FR-3.1 haptic floor still enforced by the console, not the wire
   selected_cameras: [uint8];
+  selected_sensors: [uint8];          // appended: older robots ignore it
 }
 
 // ---------------------------------------------------------------------
