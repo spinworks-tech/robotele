@@ -45,6 +45,10 @@ pub const DATAGRAM_TAG_CHANNEL_A: u8 = 0x02;
 /// receiver today -- present for recorder/debug parity with other
 /// datagram types, not because anything currently reads it.
 pub const DATAGRAM_TAG_HEARTBEAT: u8 = 0x03;
+/// Sensor slices (`roboprotocol_core::sensor`, docs/13-large-sensor-payloads.md):
+/// one interleaved slice of a point cloud, lidar, radar or depth frame,
+/// robot to operator.
+pub const DATAGRAM_TAG_SENSOR_SLICE: u8 = 0x04;
 /// Benchmark-only (`roboprotocol_core::bench`): an opaque payload carried
 /// straight on a QUIC datagram, with no FlatBuffers frame inside, so the
 /// protocol comparison can time Channel B's transport on the same raw bytes
@@ -85,6 +89,9 @@ mod tests {
         assert_ne!(DATAGRAM_TAG_HEARTBEAT, DATAGRAM_TAG_CHANNEL_A);
         assert_ne!(DATAGRAM_TAG_HEARTBEAT, DATAGRAM_TAG_CHANNEL_B);
         for t in [DATAGRAM_TAG_CHANNEL_A, DATAGRAM_TAG_CHANNEL_B, DATAGRAM_TAG_HEARTBEAT, crate::estop::ESTOP_DATAGRAM_MAGIC] {
+            assert_ne!(DATAGRAM_TAG_SENSOR_SLICE, t);
+        }
+        for t in [DATAGRAM_TAG_CHANNEL_A, DATAGRAM_TAG_CHANNEL_B, DATAGRAM_TAG_HEARTBEAT, DATAGRAM_TAG_SENSOR_SLICE, crate::estop::ESTOP_DATAGRAM_MAGIC] {
             assert_ne!(DATAGRAM_TAG_BENCH_RAW, t);
         }
         let tagged = tag(DATAGRAM_TAG_HEARTBEAT, &42u64.to_be_bytes());
