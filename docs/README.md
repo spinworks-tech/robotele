@@ -21,6 +21,7 @@ If you're new here, read in this order:
 | 9 | [Design Review & Roadmap](09-design-review-and-roadmap.md) | Known gaps, strengths, and the path from prototype to standard |
 | 11 | [Protocol Comparison](11-protocol-comparison.md) | Channel B vs MQTT, Zenoh, WebRTC and raw UDP on loopback: latency and throughput, native and Python clients, plaintext and mTLS |
 | 12 | [Control Under Load (plan)](12-control-under-load-benchmark.md) | Benchmark plan: control-loop latency while video saturates a shaped link, on two Raspberry Pis |
+| 13 | [Large Sensor Payloads (proposal)](13-large-sensor-payloads.md) | Proposal: carrying point clouds, lidar, radar and depth maps as loss-tolerant sensor slices, with bulk objects on Channel C |
 
 ## Repository map
 
