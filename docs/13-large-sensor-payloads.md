@@ -49,15 +49,17 @@ application layer, as below.
 ## How big the data is
 
 Example sizes, raw versus the encodings proposed below. "Slices" is the
-number of 1,100-byte datagrams per frame.
+number of datagrams per frame, each carrying up to 1,100 bytes of whole
+elements (points, lidar columns, or 32-pixel depth-row segments), so the
+counts round up per element rather than per byte.
 
 | Data | Example | Raw | Proposed encoding | Slices per frame |
 | --- | --- | --- | --- | --- |
 | Navigation point cloud | 10,000 points after voxel filtering, 10 Hz | 16 B/point (float32 x, y, z, intensity): 160 KB, 12.8 Mbps | 7 B/point (int16 x, y, z + uint8 intensity): 70 KB, 5.6 Mbps | 64 |
-| 3D lidar | 64 beams × 1,024 columns, 10 Hz (e.g. Ouster OS1-64) | 16 B/point: 1.05 MB, 84 Mbps | Range image, 3 B/point (uint16 range + uint8 intensity): 197 KB, 15.7 Mbps | 179 |
+| 3D lidar | 64 beams × 1,024 columns, 10 Hz (e.g. Ouster OS1-64) | 16 B/point: 1.05 MB, 84 Mbps | Range image, 3 B/point (uint16 range + uint8 intensity): 197 KB, 15.7 Mbps | 205 |
 | 2D lidar | 720-sample scan, 15 Hz | 8 B/sample: 5.8 KB, 0.26 Mbps | Range image, one row, 3 B/sample: 2.2 KB | 2 |
 | Radar detections | 300 detections, 20 Hz | 20 B/detection: 6 KB | 9 B/detection (int16 x, y, z, Doppler + uint8 SNR): 2.7 KB, 0.43 Mbps | 3 |
-| Depth map | 640 × 480, 30 Hz | 2 B/pixel: 614 KB, 147 Mbps | 320 × 240 at 15 Hz, uint16 mm: 154 KB, 18.4 Mbps before compression | 140 |
+| Depth map | 640 × 480, 30 Hz | 2 B/pixel: 614 KB, 147 Mbps | 320 × 240 at 15 Hz, uint16 mm: 154 KB, 18.4 Mbps before compression | 142 |
 | Stereo pair | 2 × 640 × 480 grayscale, 30 Hz | 614 KB, 147 Mbps | Video on Channel A (see [Stereo](#stereo-vision)) | n/a |
 
 Two things follow from this table:
@@ -97,7 +99,7 @@ by body region." Sensor slices apply the same rule to sensor data.
 | --- | --- | --- |
 | Point cloud, radar | One point | 1/*n* of the points, spread across the whole cloud |
 | Range image (3D or 2D lidar) | One column (one azimuth) | 1/*n* of the angular resolution, everywhere |
-| Depth map | One row | 1/*n* of the vertical resolution, everywhere |
+| Depth map | A 32-pixel segment of one row (a full 640-pixel row wouldn't fit a slice) | 1/*n* of the pixels, spread across the image |
 
 Loss makes the data sparser rather than leaving a hole. That matters for
 navigation: a missing wedge of a point cloud can hide an obstacle, while a
@@ -132,8 +134,9 @@ bigger packets.
   intensity. The operator rebuilds x, y, z from the beam angles in the
   descriptor. That's a third of the size of quantized points. A 2D lidar is a
   range image with one beam.
-- **Depth image.** uint16 depth in millimetres per pixel. The operator
-  back-projects with the camera intrinsics in the descriptor.
+- **Depth image.** uint16 depth in millimetres per pixel, in 32-pixel row
+  segments. The operator back-projects with the camera intrinsics in the
+  descriptor.
 
 Compressing each slice on its own (for example zstd with a trained
 dictionary) keeps slices independent. Whether it pays off on ~1 KB slices
@@ -187,7 +190,7 @@ capture time; see [Open questions](#open-questions).
 
 Sensor slices use the robot-to-operator direction, the same one doc 12
 identifies as exposed: everything sent there joins one first-in, first-out
-datagram queue in quiche, with no priority. A 200-slice lidar frame in that
+datagram queue in quiche, with no priority. A 205-slice lidar frame in that
 queue would delay Channel B telemetry and haptic feedback exactly as video
 does today. So:
 
@@ -242,9 +245,9 @@ packet loss *p* is (1 − *p*)<sup>*n*</sup>:
 | Frame | Fragments | Intact at 0.1% loss | Intact at 1% loss |
 | --- | --- | --- | --- |
 | Navigation cloud | 64 | 94% | 53% |
-| 3D lidar range image | 179 | 84% | 17% |
-| Depth map, 320 × 240 | 140 | 87% | 24% |
-| Depth map, 640 × 480 | 559 | 57% | 0.4% |
+| 3D lidar range image | 205 | 81% | 13% |
+| Depth map, 320 × 240 | 142 | 87% | 24% |
+| Depth map, 640 × 480 | 565 | 57% | 0.3% |
 
 With slices, 1% loss means each frame arrives with 99% of its data. Forward
 error correction could make fragmentation workable, but it spends bandwidth on
