@@ -101,7 +101,14 @@ BodyRegionDescriptor
 
 CameraDescriptor
 └── codec, resolution, max_fps, bitrate range
+
+SensorDescriptor                     (point clouds, lidar, radar, depth -- doc 13)
+└── kind + encoding, geometry, mounting pose, max_hz, bitrate
 ```
+
+`SESSION_DESCRIBE` is sent on stream 1 with a FIN, and receivers decode it
+whole once the FIN arrives: a large profile or sensor descriptors can make it
+span several packets.
 
 Key ideas:
 
@@ -190,17 +197,20 @@ datagrams, for sub-5 ms local edge processing regardless of handshake state.
 
 ## Datagram channel discriminator
 
-Channel A and Channel B share one QUIC connection's unreliable-datagram flow, so
-every datagram is prefixed with a 1-byte tag, inspected before any decode is
-attempted:
+Every datagram category shares one QUIC connection's unreliable-datagram
+flow, so every datagram is prefixed with a 1-byte tag, inspected before any
+decode is attempted:
 
 | Tag | Channel | Payload |
 | --- | --- | --- |
 | `0x01` | Channel B | FlatBuffers `ChannelBFrame` |
 | `0x02` | Channel A | Video chunk header + Annex-B NAL fragment |
+| `0x03` | Heartbeat | 8-byte sequence number; feeds the watchdog without asserting the deadman |
+| `0x04` | Sensor slice | Slice header + interleaved sensor elements ([13 — Large sensor payloads](13-large-sensor-payloads.md)) |
+| `0x7F` | Benchmark | Opaque payload, ignored unless `robot-edge --bench` |
 | `0xE5` | E-Stop redundant datagram | Fixed 10-byte raw encoding (deliberately outside the sequential range) |
 
-`0x03`–`0xDF` are reserved for post-v1.0 datagram categories.
+`0x05`–`0x7E` and `0x80`–`0xDF` are reserved for later datagram categories.
 
 ## NAT traversal & relay fallback
 

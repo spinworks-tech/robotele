@@ -28,12 +28,22 @@ use crate::channel_b::{self, ChannelBCategory, ChannelBFrameData, TeleopCommand,
 use crate::hello_handler;
 use crate::safety_task::SafetyTask;
 use crate::session_handler;
+use crate::sim_sensor::{self, SensorFrame, SensorRx, SimSensorKind};
+use roboprotocol_core::sensor::{slice_frame, SensorDescriptor, DEFAULT_SLICE_PAYLOAD, SLICE_HEADER_LEN};
 use crate::video::channel_a::VideoRx;
 use crate::video::{capture, channel_a};
 use roboprotocol_core::bench::{BenchMode, BENCH_ECHO_TICK_ID};
 use roboprotocol_core::profile::RobotProfile;
 
 const MAX_DATAGRAM_SIZE: usize = 1452;
+
+/// A sensor frame is skipped outright, not queued, while quiche already
+/// holds more than this many outgoing datagrams. Sensor data is the most
+/// droppable traffic on the robot-to-operator queue, which has no priority
+/// (docs/12 "Known gap in Channel B"): without this, a 205-slice lidar frame
+/// every 100 ms on a link that can't carry it would keep that queue full and
+/// delay Channel B telemetry behind it (docs/13 "Rate control and priority").
+const SENSOR_QUEUE_BACKLOG_LIMIT: usize = 64;
 
 pub struct ServerArgs {
     pub listen: SocketAddr,
@@ -54,6 +64,9 @@ pub struct ServerArgs {
     pub recording: roboprotocol_recording::RecorderConfig,
     /// See `roboprotocol_core::bench`; `None` outside benchmarks.
     pub bench: Option<BenchMode>,
+    /// `--sim-sensor`: synthetic sensors to advertise and stream, in
+    /// sensor-id order. Empty unless asked for.
+    pub sim_sensors: Vec<SimSensorKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +92,8 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
     // above: the Zenoh session and its background tasks persist across
     // reconnects. Both handles are cheap to clone into each `Session`.
     let (telemetry_sink, command_sink, autonomy_goal, video_sink) = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port).await;
+
+    let sensors: Vec<(SimSensorKind, SensorDescriptor)> = args.sim_sensors.iter().enumerate().map(|(i, &kind)| (kind, kind.descriptor(i as u8))).collect();
 
     // v0 keeps the single-active-connection design (no CID-routing table for
     // concurrent clients -- see module docs) but must not let one connection
@@ -137,6 +152,8 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
         let capture_handle = args.camera_config.clone().map(capture::spawn_capture);
         let camera_controls_tx = capture_handle.as_ref().map(|h| h.controls_tx.clone());
         let video_rx = capture_handle.map(|h| channel_a::spawn_encoder(h.rx, recorder.clone(), video_sink.clone()));
+        // Per session, like the camera: dropping the session stops the threads.
+        let sensor_rx = (!sensors.is_empty()).then(|| sim_sensor::spawn(&sensors));
 
         let mut session = Session {
             conn,
@@ -146,6 +163,10 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             robot_id: args.robot_id.clone(),
             profile: profile.clone(),
             cameras: cameras.clone(),
+            sensors: sensors.iter().map(|(_, d)| d.clone()).collect(),
+            selected_sensors: Vec::new(),
+            sensor_rx,
+            sensor_frames_skipped: 0,
             safety: SafetyTask::with_watchdog_threshold_ms(args.task_class, args.watchdog_threshold_ms, Instant::now()),
             bridge,
             video_rx,
@@ -188,6 +209,13 @@ struct Session {
     robot_id: String,
     profile: RobotProfile,
     cameras: Vec<CameraDescriptor>,
+    /// Advertised in SESSION_DESCRIBE; frames go out only for the ids the
+    /// operator puts in `SessionAccept.selected_sensors`.
+    sensors: Vec<SensorDescriptor>,
+    selected_sensors: Vec<u8>,
+    sensor_rx: Option<SensorRx>,
+    /// Frames skipped under `SENSOR_QUEUE_BACKLOG_LIMIT`.
+    sensor_frames_skipped: u64,
     safety: SafetyTask,
     bridge: BridgeSupervisor,
     /// See `channel_a`'s module doc: SPS/PPS/IDR NALs are always
@@ -326,6 +354,12 @@ impl Session {
                 Some(event) = self.bridge.event_rx.recv() => {
                     self.on_bridge_event(event);
                 }
+                frames = recv_sensor_frames(&mut self.sensor_rx) => {
+                    if self.phase == Phase::Operating {
+                        self.send_sensor_frames(frames);
+                        self.flush(socket, &mut out).await?;
+                    }
+                }
                 Some((nal_id, nal)) = recv_video(&mut self.video_rx) => {
                     // Chunked here, not in `channel_a::spawn_encoder`,
                     // specifically so a NAL superseded by a newer one
@@ -438,7 +472,8 @@ impl Session {
             }
             1 if self.phase == Phase::AwaitingSessionAccept => {
                 let accept = session_handler::decode_session_accept(data)?;
-                tracing::info!(cached = accept.cached, "SESSION_ACCEPT received");
+                tracing::info!(cached = accept.cached, selected_sensors = ?accept.selected_sensors, "SESSION_ACCEPT received");
+                self.selected_sensors = accept.selected_sensors;
                 self.phase = Phase::Operating;
             }
             ESTOP_STREAM_ID => {
@@ -550,14 +585,60 @@ impl Session {
         if self.session_describe_sent {
             return Ok(());
         }
-        let bytes = session_handler::encode_session_describe(&self.robot_id, &self.profile, &self.cameras);
-        match self.conn.stream_send(1, &bytes, false) {
-            Ok(_) => {
+        let bytes = session_handler::encode_session_describe(&self.robot_id, &self.profile, &self.cameras, &self.sensors);
+        // FIN marks the end of SESSION_DESCRIBE: it can span several
+        // packets (a large profile, or sensor descriptors), and receivers
+        // buffer stream 1 until FIN instead of decoding each read on its
+        // own. Only our send side closes; the operator's SESSION_ACCEPT
+        // still arrives on this stream.
+        match self.conn.stream_send(1, &bytes, true) {
+            Ok(written) if written == bytes.len() => {
                 self.session_describe_sent = true;
                 Ok(())
             }
+            // Can't happen within the initial 1 MB stream window; refusing
+            // is safer than a FIN-less, half-written describe.
+            Ok(written) => anyhow::bail!("stream_send(SESSION_DESCRIBE) wrote {written} of {} bytes", bytes.len()),
             Err(quiche::Error::Done) => Ok(()),
             Err(e) => anyhow::bail!("stream_send(SESSION_DESCRIBE) failed: {e:?}"),
+        }
+    }
+
+    /// Sends each selected sensor's latest frame as slices (tag 0x04).
+    /// Slices decode on their own, so if quiche's queue fills partway
+    /// through a frame, the slices already queued still arrive as a
+    /// thinner frame.
+    fn send_sensor_frames(&mut self, frames: Vec<SensorFrame>) {
+        // Capped at the default (Channel A's chunk size) until path MTU
+        // discovery is enabled; doc 13 lets slices grow beyond it later.
+        let Some(max_payload) = self.conn.dgram_max_writable_len().map(|n| n.saturating_sub(1 + SLICE_HEADER_LEN).min(DEFAULT_SLICE_PAYLOAD)) else {
+            return;
+        };
+        for frame in frames {
+            if !self.selected_sensors.contains(&frame.sensor_id) {
+                continue;
+            }
+            let Some(element_size) = self.sensors.iter().find(|d| d.sensor_id == frame.sensor_id).map(|d| d.encoding.element_size()) else {
+                continue;
+            };
+            let queued = self.conn.dgram_send_queue_len();
+            if queued > SENSOR_QUEUE_BACKLOG_LIMIT {
+                self.sensor_frames_skipped += 1;
+                tracing::debug!(sensor_id = frame.sensor_id, queued, skipped = self.sensor_frames_skipped, "datagram queue backlogged, skipping sensor frame");
+                continue;
+            }
+            let datagrams = match slice_frame(frame.sensor_id, frame.frame_seq, frame.capture_time_us, &frame.elements, element_size, max_payload) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(sensor_id = frame.sensor_id, error = %e, "cannot slice sensor frame");
+                    continue;
+                }
+            };
+            for d in &datagrams {
+                if self.conn.dgram_send(d).is_err() {
+                    break;
+                }
+            }
         }
     }
 
@@ -942,6 +1023,13 @@ impl Session {
             }
         }
         Ok(())
+    }
+}
+
+async fn recv_sensor_frames(rx: &mut Option<SensorRx>) -> Vec<SensorFrame> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

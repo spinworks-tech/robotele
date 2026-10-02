@@ -6,6 +6,7 @@ mod hello_handler;
 mod quic_server;
 mod safety_task;
 mod session_handler;
+mod sim_sensor;
 mod video;
 mod xgo_profile;
 mod zenoh_bridge;
@@ -60,6 +61,8 @@ struct Cli {
     /// dispatching them -- see `roboprotocol_core::bench`. Requires
     /// `--stub-bridge`, since it bypasses actuation entirely.
     bench: Option<roboprotocol_core::bench::BenchMode>,
+    /// `--sim-sensor`, repeatable: synthetic sensors (docs/13).
+    sim_sensors: Vec<sim_sensor::SimSensorKind>,
 }
 
 /// Maps a `--record` list entry to a category. `robot-edge` has no
@@ -109,6 +112,7 @@ impl Cli {
         let mut record_video_budget_mb = 16u64;
         let mut record_flush_secs = 2u64;
         let mut bench = None;
+        let mut sim_sensors = Vec::new();
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -154,6 +158,10 @@ impl Cli {
                     let mode = it.next().context("--bench needs a value (echo|count)")?;
                     bench = Some(roboprotocol_core::bench::BenchMode::parse(&mode).with_context(|| format!("unknown --bench mode {mode}, expected echo|count"))?);
                 }
+                "--sim-sensor" => {
+                    let kind = it.next().context("--sim-sensor needs a value (cloud|lidar|radar|depth)")?;
+                    sim_sensors.push(sim_sensor::SimSensorKind::parse(&kind).with_context(|| format!("unknown --sim-sensor {kind}, expected cloud|lidar|radar|depth"))?);
+                }
                 "-h" | "--help" => {
                     println!(
                         "Usage: robot-edge [--listen ADDR] [--cert PATH] [--key PATH] [--ca PATH]\n  \
@@ -164,7 +172,8 @@ impl Cli {
                          [--record-dir PATH] [--record video,command,telemetry,haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
                          [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n  \
-                         [--bench echo|count]   (benchmark only; requires --stub-bridge)"
+                         [--bench echo|count]   (benchmark only; requires --stub-bridge)\n  \
+                         [--sim-sensor cloud|lidar|radar|depth]...   (synthetic sensors, repeatable)"
                     );
                     std::process::exit(0);
                 }
@@ -206,6 +215,7 @@ impl Cli {
             record_video_budget_mb,
             record_flush_secs,
             bench,
+            sim_sensors,
         })
     }
 
@@ -291,6 +301,7 @@ async fn main() -> Result<()> {
         }),
         recording,
         bench: cli.bench,
+        sim_sensors: cli.sim_sensors,
     };
 
     let profile = xgo_profile::xgo_lite_v2_profile();

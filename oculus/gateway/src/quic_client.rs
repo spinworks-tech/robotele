@@ -108,6 +108,7 @@ async fn run_session(args: &ClientArgs, state: &GatewayState, video_tx: &VideoDe
         conn,
         phase: Phase::AwaitingHello,
         video_rx: ChannelAReceiver::new(),
+        describe_buf: Vec::new(),
         robot_id: None,
         dof_count: None,
         camera: None,
@@ -125,6 +126,8 @@ struct Client<'a> {
     conn: quiche::Connection,
     phase: Phase,
     video_rx: ChannelAReceiver,
+    /// Stream 1 bytes received so far; decoded at the robot's FIN.
+    describe_buf: Vec<u8>,
     robot_id: Option<String>,
     dof_count: Option<u16>,
     camera: Option<String>,
@@ -199,6 +202,17 @@ impl Client<'_> {
         let mut sbuf = vec![0u8; 65535];
         loop {
             match self.conn.stream_recv(stream_id, &mut sbuf) {
+                // SESSION_DESCRIBE can span several packets, so stream 1 is
+                // decoded whole, once the robot's FIN arrives -- decoding a
+                // partial FlatBuffer with this unverified flatbuffers version
+                // panics rather than failing cleanly.
+                Ok((len, fin)) if stream_id == 1 => {
+                    self.describe_buf.extend_from_slice(&sbuf[..len]);
+                    if fin {
+                        let describe = std::mem::take(&mut self.describe_buf);
+                        self.on_stream_data(stream_id, &describe);
+                    }
+                }
                 Ok((len, _fin)) => self.on_stream_data(stream_id, &sbuf[..len]),
                 Err(quiche::Error::Done) => break,
                 Err(e) => {

@@ -4,12 +4,16 @@
 //! the reverse in its own `session_handler.rs`).
 
 use flatbuffers::FlatBufferBuilder;
+use flatbuffers::WIPOffset;
 use roboprotocol_core::profile::{BaseType, CameraDescriptor, Codec, CommandShape, RobotProfile};
+use roboprotocol_core::sensor::{SensorDescriptor, SensorEncoding};
 use roboprotocol_proto::{
     BaseType as FbBaseType, BodyRegionDescriptor as FbBodyRegion, BodyRegionDescriptorArgs,
     CameraDescriptor as FbCamera, CameraDescriptorArgs, Codec as FbCodec, CommandShape as FbCommandShape,
-    JointDescriptor as FbJoint, JointDescriptorArgs, RobotProfile as FbRobotProfile, RobotProfileArgs,
-    SessionAccept, SessionDescribe, SessionDescribeArgs,
+    DepthEncoding, DepthEncodingArgs, JointDescriptor as FbJoint, JointDescriptorArgs, PointEncoding,
+    PointEncodingArgs, RangeImageEncoding, RangeImageEncodingArgs, RobotProfile as FbRobotProfile, RobotProfileArgs,
+    SensorDescriptor as FbSensor, SensorDescriptorArgs, SensorKind, SessionAccept, SessionDescribe,
+    SessionDescribeArgs,
 };
 
 fn to_fb_codec(codec: Codec) -> FbCodec {
@@ -39,7 +43,66 @@ fn to_fb_base_type(base_type: BaseType) -> FbBaseType {
     }
 }
 
-pub fn encode_session_describe(robot_id: &str, profile: &RobotProfile, cameras: &[CameraDescriptor]) -> Vec<u8> {
+fn encode_sensor<'a>(b: &mut FlatBufferBuilder<'a>, s: &SensorDescriptor) -> WIPOffset<FbSensor<'a>> {
+    let label = b.create_string(&s.label);
+    let mount_position_m = b.create_vector(&s.mount_position_m);
+    let mount_orientation_xyzw = b.create_vector(&s.mount_orientation_xyzw);
+    let mut args = SensorDescriptorArgs {
+        sensor_id: s.sensor_id,
+        label: Some(label),
+        max_hz: s.max_hz,
+        max_bitrate_kbps: s.max_bitrate_kbps,
+        mount_position_m: Some(mount_position_m),
+        mount_orientation_xyzw: Some(mount_orientation_xyzw),
+        ..Default::default()
+    };
+    match &s.encoding {
+        SensorEncoding::Points(f) => {
+            args.kind = SensorKind::PointCloud;
+            args.points = Some(PointEncoding::create(
+                b,
+                &PointEncodingArgs {
+                    scale_m: f.scale_m,
+                    intensity: f.intensity,
+                    doppler_scale_mps: f.doppler_scale_mps.unwrap_or(0.0),
+                    snr: f.snr,
+                },
+            ));
+        }
+        SensorEncoding::RangeImage { format, beam_elevations_rad } => {
+            let elevations = b.create_vector(beam_elevations_rad);
+            args.kind = SensorKind::RangeImage;
+            args.range_image = Some(RangeImageEncoding::create(
+                b,
+                &RangeImageEncodingArgs {
+                    beams: format.beams,
+                    columns: format.columns,
+                    range_scale_m: format.range_scale_m,
+                    intensity: format.intensity,
+                    beam_elevations_rad: Some(elevations),
+                },
+            ));
+        }
+        SensorEncoding::Depth { format, intrinsics } => {
+            args.kind = SensorKind::Depth;
+            args.depth = Some(DepthEncoding::create(
+                b,
+                &DepthEncodingArgs {
+                    width: format.width,
+                    height: format.height,
+                    segment_width: format.segment_width,
+                    fx: intrinsics.fx,
+                    fy: intrinsics.fy,
+                    cx: intrinsics.cx,
+                    cy: intrinsics.cy,
+                },
+            ));
+        }
+    }
+    FbSensor::create(b, &args)
+}
+
+pub fn encode_session_describe(robot_id: &str, profile: &RobotProfile, cameras: &[CameraDescriptor], sensors: &[SensorDescriptor]) -> Vec<u8> {
     let mut b = FlatBufferBuilder::new();
 
     let joint_offsets: Vec<_> = profile
@@ -111,6 +174,9 @@ pub fn encode_session_describe(robot_id: &str, profile: &RobotProfile, cameras: 
         .collect();
     let cameras_vec = b.create_vector(&camera_offsets);
 
+    let sensor_offsets: Vec<_> = sensors.iter().map(|s| encode_sensor(&mut b, s)).collect();
+    let sensors_vec = b.create_vector(&sensor_offsets);
+
     let robot_id_str = b.create_string(robot_id);
 
     let describe = SessionDescribe::create(
@@ -120,6 +186,7 @@ pub fn encode_session_describe(robot_id: &str, profile: &RobotProfile, cameras: 
             profile_hash: profile.profile_hash(),
             robot_profile: Some(robot_profile),
             cameras: Some(cameras_vec),
+            sensors: Some(sensors_vec),
         },
     );
     b.finish(describe, None);
@@ -131,6 +198,8 @@ pub struct SessionAcceptInfo {
     pub cached: bool,
     pub selected_regions: Vec<u8>,
     pub selected_cameras: Vec<u8>,
+    /// Empty from an operator that predates sensor slices.
+    pub selected_sensors: Vec<u8>,
 }
 
 pub fn decode_session_accept(buf: &[u8]) -> anyhow::Result<SessionAcceptInfo> {
@@ -140,6 +209,7 @@ pub fn decode_session_accept(buf: &[u8]) -> anyhow::Result<SessionAcceptInfo> {
         cached: accept.cached(),
         selected_regions: accept.selected_regions().map(|v| v.to_vec()).unwrap_or_default(),
         selected_cameras: accept.selected_cameras().map(|v| v.to_vec()).unwrap_or_default(),
+        selected_sensors: accept.selected_sensors().map(|v| v.to_vec()).unwrap_or_default(),
     })
 }
 
@@ -152,7 +222,7 @@ mod tests {
     fn session_describe_round_trips_profile_shape() {
         let profile = xgo_lite_v2_profile();
         let cameras = vec![xgo_lite_v2_camera()];
-        let bytes = encode_session_describe("xgo_lite_v2", &profile, &cameras);
+        let bytes = encode_session_describe("xgo_lite_v2", &profile, &cameras, &[]);
 
         let describe = flatbuffers::get_root::<roboprotocol_proto::SessionDescribe>(&bytes);
         assert_eq!(describe.robot_id(), Some("xgo_lite_v2"));
