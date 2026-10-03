@@ -197,11 +197,9 @@ datagram queue in quiche, with no priority. A 205-slice lidar frame in that
 queue would delay Channel B telemetry and haptic feedback exactly as video
 does today. So:
 
-1. **Doc 12's fix comes first.** That fix stops handing lossy data to quiche
-   once the datagram queue passes a small threshold, and purges queued lossy
-   data when a Channel B frame needs to go out. `dgram_purge_outgoing` takes
-   a filter, so it can drop tag `0x04` and `0x02` datagrams while keeping
-   Channel B.
+1. **Doc 12's fix comes first** (now implemented). Lossy data waits in
+   `robot-edge` and enters quiche's queue only while it holds fewer than 8
+   datagrams, so Channel B waits behind at most 8 lossy datagrams.
 2. **The latest frame wins, per sensor.** When a new frame is ready and the
    previous one hasn't been fully handed to quiche, the rest of the old frame
    is dropped. Channel A already does this for video.
@@ -288,9 +286,13 @@ Done:
 - Schema: `SensorDescriptor` in `SessionDescribe`, `selected_sensors` in
   `SessionAccept`.
 - `robot-edge`: `--sim-sensor cloud|lidar|radar|depth`, which ray-casts a
-  small room (the reference robot has no lidar or depth sensor); per-sensor
-  latest-frame-wins sending; and an interim guard that skips a sensor frame
-  while quiche's datagram queue holds more than 64 datagrams.
+  small room (the reference robot has no lidar or depth sensor), and
+  per-sensor latest-frame-wins sending.
+- Doc 12's queue fix: video and sensor data wait in `lossy_queue.rs` and
+  enter quiche's queue at most 8 datagrams at a time, so Channel B never
+  waits behind more than that
+  ([12 — Channel B datagram priority](12-control-under-load-benchmark.md#channel-b-datagram-priority)).
+  Video and sensors share the link equally for now.
 - `operator-console`: accepts every valid sensor, assembles and decodes
   frames, and shows a row per sensor in the channels panel (slice rate,
   bandwidth, frame rate, completeness, sample count).
@@ -302,19 +304,16 @@ Done:
 
 Remaining:
 
-1. Doc 12's queue fix in `robot-edge`. The 64-datagram guard keeps sensor
-   frames from piling up, but a frame already queued still sits ahead of
-   Channel B telemetry.
-2. Per-sensor budgets in `SessionAccept`, and `SensorControl` to change them
+1. Per-sensor budgets in `SessionAccept`, and `SensorControl` to change them
    during a session.
-3. A display (Rerun, which the DimOS work already uses, renders points and
+2. A display (Rerun, which the DimOS work already uses, renders points and
    depth images).
-4. Bulk objects: unidirectional-stream config, the object header,
+3. Bulk objects: unidirectional-stream config, the object header,
    cancel-on-supersede.
-5. Recording ([07](07-recording-and-replay.md)) and `replay-decode`
+4. Recording ([07](07-recording-and-replay.md)) and `replay-decode`
    support for the new tag.
-6. Slices larger than 1,100 bytes once path MTU discovery is enabled.
-7. Benchmark: add a sensor workload to doc 12's testbed and measure frame
+5. Slices larger than 1,100 bytes once path MTU discovery is enabled.
+6. Benchmark: add a sensor workload to doc 12's testbed and measure frame
    completeness, age at display, and the effect on control round trips.
 
 ## Open questions
