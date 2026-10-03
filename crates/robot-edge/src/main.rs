@@ -3,6 +3,7 @@ mod bridge;
 mod camera_control_handler;
 mod channel_b;
 mod hello_handler;
+mod lossy_queue;
 mod quic_server;
 mod safety_task;
 mod session_handler;
@@ -63,6 +64,7 @@ struct Cli {
     bench: Option<roboprotocol_core::bench::BenchMode>,
     /// `--sim-sensor`, repeatable: synthetic sensors (docs/13).
     sim_sensors: Vec<sim_sensor::SimSensorKind>,
+    cc: quiche::CongestionControlAlgorithm,
 }
 
 /// Maps a `--record` list entry to a category. `robot-edge` has no
@@ -113,6 +115,7 @@ impl Cli {
         let mut record_flush_secs = 2u64;
         let mut bench = None;
         let mut sim_sensors = Vec::new();
+        let mut cc = quiche::CongestionControlAlgorithm::CUBIC;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -162,6 +165,10 @@ impl Cli {
                     let kind = it.next().context("--sim-sensor needs a value (cloud|lidar|radar|depth)")?;
                     sim_sensors.push(sim_sensor::SimSensorKind::parse(&kind).with_context(|| format!("unknown --sim-sensor {kind}, expected cloud|lidar|radar|depth"))?);
                 }
+                "--cc" => {
+                    let name = it.next().context("--cc needs a value (reno|cubic|bbr|bbr2)")?;
+                    cc = name.parse().map_err(|_| anyhow::anyhow!("unknown --cc {name}, expected reno|cubic|bbr|bbr2"))?;
+                }
                 "-h" | "--help" => {
                     println!(
                         "Usage: robot-edge [--listen ADDR] [--cert PATH] [--key PATH] [--ca PATH]\n  \
@@ -173,7 +180,8 @@ impl Cli {
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
                          [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n  \
                          [--bench echo|count]   (benchmark only; requires --stub-bridge)\n  \
-                         [--sim-sensor cloud|lidar|radar|depth]...   (synthetic sensors, repeatable)"
+                         [--sim-sensor cloud|lidar|radar|depth]...   (synthetic sensors, repeatable)\n  \
+                         [--cc reno|cubic|bbr|bbr2]   (congestion control, default cubic)"
                     );
                     std::process::exit(0);
                 }
@@ -216,6 +224,7 @@ impl Cli {
             record_flush_secs,
             bench,
             sim_sensors,
+            cc,
         })
     }
 
@@ -302,6 +311,7 @@ async fn main() -> Result<()> {
         recording,
         bench: cli.bench,
         sim_sensors: cli.sim_sensors,
+        cc: cli.cc,
     };
 
     let profile = xgo_profile::xgo_lite_v2_profile();

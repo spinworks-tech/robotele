@@ -17,7 +17,6 @@ use roboprotocol_core::estop::{EstopDatagram, ESTOP_DATAGRAM_MAGIC, ESTOP_STREAM
 use roboprotocol_core::hello::{self, quantization_tier_bits, task_class_bits, HelloCapabilities, ProtocolVersion};
 use roboprotocol_core::profile::CameraDescriptor;
 use roboprotocol_core::safety::TaskClass;
-use roboprotocol_core::video::chunk_nal;
 use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
 
@@ -27,6 +26,7 @@ use crate::camera_control_handler;
 use crate::channel_b::{self, ChannelBCategory, ChannelBFrameData, TeleopCommand, ALL_REGIONS};
 use crate::hello_handler;
 use crate::safety_task::SafetyTask;
+use crate::lossy_queue::{LossyQueue, QUICHE_LOSSY_LIMIT};
 use crate::session_handler;
 use crate::sim_sensor::{self, SensorFrame, SensorRx, SimSensorKind};
 use roboprotocol_core::sensor::{slice_frame, SensorDescriptor, DEFAULT_SLICE_PAYLOAD, SLICE_HEADER_LEN};
@@ -36,14 +36,6 @@ use roboprotocol_core::bench::{BenchMode, BENCH_ECHO_TICK_ID};
 use roboprotocol_core::profile::RobotProfile;
 
 const MAX_DATAGRAM_SIZE: usize = 1452;
-
-/// A sensor frame is skipped outright, not queued, while quiche already
-/// holds more than this many outgoing datagrams. Sensor data is the most
-/// droppable traffic on the robot-to-operator queue, which has no priority
-/// (docs/12 "Known gap in Channel B"): without this, a 205-slice lidar frame
-/// every 100 ms on a link that can't carry it would keep that queue full and
-/// delay Channel B telemetry behind it (docs/13 "Rate control and priority").
-const SENSOR_QUEUE_BACKLOG_LIMIT: usize = 64;
 
 pub struct ServerArgs {
     pub listen: SocketAddr,
@@ -67,6 +59,12 @@ pub struct ServerArgs {
     /// `--sim-sensor`: synthetic sensors to advertise and stream, in
     /// sensor-id order. Empty unless asked for.
     pub sim_sensors: Vec<SimSensorKind>,
+    /// `--cc`: congestion control for the robot's sending direction, where
+    /// video and sensor data can saturate the uplink. quiche's default is
+    /// CUBIC, which keeps a bottleneck's buffer nearly full; a delay-based
+    /// algorithm keeps it short, so control datagrams wait less in the
+    /// network as well as in quiche (docs/12).
+    pub cc: quiche::CongestionControlAlgorithm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +164,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             sensors: sensors.iter().map(|(_, d)| d.clone()).collect(),
             selected_sensors: Vec::new(),
             sensor_rx,
-            sensor_frames_skipped: 0,
+            lossy: LossyQueue::new(),
             safety: SafetyTask::with_watchdog_threshold_ms(args.task_class, args.watchdog_threshold_ms, Instant::now()),
             bridge,
             video_rx,
@@ -194,7 +192,15 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             bench_counter: BenchCounter::default(),
         };
 
-        match session.run(&socket, buf).await {
+        let result = session.run(&socket, buf).await;
+        let lossy = session.lossy.stats();
+        tracing::info!(
+            video_nals_dropped = lossy.video_nals_dropped,
+            sensor_frames_cut = lossy.sensor_frames_cut,
+            sensor_slices_dropped = lossy.sensor_slices_dropped,
+            "lossy datagrams superseded before sending"
+        );
+        match result {
             Ok(()) => tracing::info!("session ended, awaiting next connection"),
             Err(e) => tracing::warn!(error = ?e, "session ended with error, awaiting next connection"),
         }
@@ -214,8 +220,9 @@ struct Session {
     sensors: Vec<SensorDescriptor>,
     selected_sensors: Vec<u8>,
     sensor_rx: Option<SensorRx>,
-    /// Frames skipped under `SENSOR_QUEUE_BACKLOG_LIMIT`.
-    sensor_frames_skipped: u64,
+    /// Video chunks and sensor slices waiting to enter quiche's datagram
+    /// queue -- see `lossy_queue` for why they don't go there directly.
+    lossy: LossyQueue,
     safety: SafetyTask,
     bridge: BridgeSupervisor,
     /// See `channel_a`'s module doc: SPS/PPS/IDR NALs are always
@@ -361,14 +368,12 @@ impl Session {
                     }
                 }
                 Some((nal_id, nal)) = recv_video(&mut self.video_rx) => {
-                    // Chunked here, not in `channel_a::spawn_encoder`,
-                    // specifically so a NAL superseded by a newer one
-                    // before we get here is never chunked/sent at all --
-                    // see that module's doc comment.
+                    // Chunked by `LossyQueue`, not in
+                    // `channel_a::spawn_encoder`, so a NAL superseded by a
+                    // newer one before we get here is never chunked/sent at
+                    // all -- see that module's doc comment.
                     if self.phase == Phase::Operating {
-                        for chunk in chunk_nal(nal_id, &nal) {
-                            let _ = self.conn.dgram_send(&datagram::tag(datagram::DATAGRAM_TAG_CHANNEL_A, &chunk));
-                        }
+                        self.lossy.push_video_nal(nal_id, &nal);
                         // Every other branch flushes right after queuing
                         // datagrams; this one didn't, so a video chunk
                         // just sat in quiche's send buffer until some
@@ -604,10 +609,8 @@ impl Session {
         }
     }
 
-    /// Sends each selected sensor's latest frame as slices (tag 0x04).
-    /// Slices decode on their own, so if quiche's queue fills partway
-    /// through a frame, the slices already queued still arrive as a
-    /// thinner frame.
+    /// Queues each selected sensor's latest frame as slices (tag 0x04) in
+    /// `self.lossy`, which `flush` feeds to quiche.
     fn send_sensor_frames(&mut self, frames: Vec<SensorFrame>) {
         // Capped at the default (Channel A's chunk size) until path MTU
         // discovery is enabled; doc 13 lets slices grow beyond it later.
@@ -621,12 +624,6 @@ impl Session {
             let Some(element_size) = self.sensors.iter().find(|d| d.sensor_id == frame.sensor_id).map(|d| d.encoding.element_size()) else {
                 continue;
             };
-            let queued = self.conn.dgram_send_queue_len();
-            if queued > SENSOR_QUEUE_BACKLOG_LIMIT {
-                self.sensor_frames_skipped += 1;
-                tracing::debug!(sensor_id = frame.sensor_id, queued, skipped = self.sensor_frames_skipped, "datagram queue backlogged, skipping sensor frame");
-                continue;
-            }
             let datagrams = match slice_frame(frame.sensor_id, frame.frame_seq, frame.capture_time_us, &frame.elements, element_size, max_payload) {
                 Ok(d) => d,
                 Err(e) => {
@@ -634,10 +631,20 @@ impl Session {
                     continue;
                 }
             };
-            for d in &datagrams {
-                if self.conn.dgram_send(d).is_err() {
-                    break;
-                }
+            self.lossy.push_sensor_frame(frame.sensor_id, datagrams);
+        }
+    }
+
+    /// Moves lossy datagrams into quiche while its queue is below
+    /// `QUICHE_LOSSY_LIMIT`. Control datagrams count toward that limit too,
+    /// so lossy data never gets ahead of them.
+    fn feed_lossy(&mut self) {
+        while self.conn.dgram_send_queue_len() < QUICHE_LOSSY_LIMIT {
+            let Some(d) = self.lossy.pop() else { break };
+            // Only fails if the datagram no longer fits (the path's MTU
+            // shrank) or the connection is closing; either way drop it.
+            if let Err(e) = self.conn.dgram_send(&d) {
+                tracing::debug!(error = ?e, "dropping lossy datagram quiche refused");
             }
         }
     }
@@ -1008,6 +1015,10 @@ impl Session {
 
     async fn flush(&mut self, socket: &UdpSocket, out: &mut [u8]) -> Result<()> {
         loop {
+            // Topped up before every packet, so lossy data keeps flowing at
+            // whatever rate the congestion window allows while never
+            // queueing more than `QUICHE_LOSSY_LIMIT` deep inside quiche.
+            self.feed_lossy();
             match self.conn.send(out) {
                 Ok((len, send_info)) => {
                     if let Err(e) = socket.send_to(&out[..len], send_info.to).await {
@@ -1071,6 +1082,7 @@ fn build_quiche_config(args: &ServerArgs) -> Result<quiche::Config> {
     config.set_initial_max_streams_bidi(16);
     config.set_initial_max_streams_uni(16);
     config.enable_dgram(true, 4096, 4096);
+    config.set_cc_algorithm(args.cc);
     // 0-RTT resumption -- accepts an operator's early-arriving HELLO on
     // reconnect. See operator-console's matching config for the full
     // rationale; the read side here already drains streams regardless of
