@@ -16,11 +16,12 @@ Two things are new compared with doc 11:
 
 ## Summary
 
-- **Latency.** Channel B's median round trip is 3.8–3.9 ms, the same as
-  WebRTC (3.9 ms) and within 1.4 ms of raw UDP (2.5 ms). Zenoh and MQTT,
-  both over TCP, sit at about 10.7 ms. Every protocol's tail is dominated by
-  Wi-Fi: Channel B, WebRTC and UDP all have a p95 of 86–94 ms, most likely
-  from the laptop's Wi-Fi power saving (see [Caveats](#caveats)).
+- **Latency.** Channel B's median round trip is 2.0–2.2 ms with mutual
+  TLS, 0.4–0.6 ms above unencrypted raw UDP (1.6 ms) and ahead of WebRTC
+  (2.6 ms). Zenoh and MQTT, both over TCP, sit at 8.4–8.8 ms, about 4×
+  Channel B. Channel B's p95 is 4.7–5.8 ms. The laptop's Wi-Fi power saving
+  was hiding this: with it on, Channel B's median was 3.8–3.9 ms and its
+  p95 about 90 ms.
 - **Small messages.** At 16 B, Channel B sustained 20,000 msg/s, Zenoh
   50,000 and MQTT about 41,000 (its sender's limit). Raw UDP could not
   sustain even 10,000. Protocols that pack several small messages into one
@@ -41,7 +42,7 @@ Two things are new compared with doc 11:
 | | |
 | --- | --- |
 | Robot | Raspberry Pi CM4 (XGO-Lite V2), Wi-Fi 2.4 GHz channel 6, PHY rate 65 Mbps, signal −33 dBm, power management off |
-| Operator | Laptop, Wi-Fi 2.4 GHz channel 6, PHY rate 130 Mbps, signal −40 dBm, **power save on** |
+| Operator | Laptop, Wi-Fi 2.4 GHz channel 6, PHY rate 130 Mbps, signal −40 dBm. Power save **on** for the throughput runs and the first latency run, **off** for the latency rerun. |
 | Path | Both on the same access point; idle ping 2.5 ms minimum |
 | Channel B | `robot-edge --bench` (stub bridge) and `operator-console --bench`: QUIC + mTLS. Release builds. |
 | Others | `tools/proto-bench` native clients: Zenoh (TLS, mTLS, peer to peer, robot listening), MQTT (TLS, mTLS, mosquitto 2 on the laptop), WebRTC (webrtc-rs data channel, DTLS), raw UDP |
@@ -75,23 +76,48 @@ Three differences from doc 11:
 
 ## Latency (64 B ping-pong)
 
+With the laptop's Wi-Fi power saving **off** (`iw dev wlp0s20f3 set
+power_save off`; the robot's was already off):
+
 | Protocol | Median | p95 | p99 | Medians of the 3 runs |
 | --- | --- | --- | --- | --- |
-| Raw UDP (no encryption) | 2.52 ms | 85.7 ms | 97.8 ms | 2.39, 2.52, 2.59 |
-| **Channel B, transport only** | **3.77 ms** | 93.7 ms | 184.3 ms | 3.80, 3.70, 3.77 |
-| **Channel B, full frame** | **3.93 ms** | 88.5 ms | 114.1 ms | 3.72, 4.00, 3.93 |
-| WebRTC (DTLS) | 3.91 ms | 88.4 ms | 144.7 ms | 4.24, 3.87, 3.91 |
-| Zenoh (mTLS) | 10.66 ms | 20.3 ms | 76.2 ms | 10.44, 10.79, 10.66 |
-| MQTT (mTLS) | 10.82 ms | 25.9 ms | 116.3 ms | 10.82, 10.95, 10.38 |
+| Raw UDP (no encryption) | 1.56 ms | 3.9 ms | 9.4 ms | 1.55, 1.56, 1.64 |
+| **Channel B, transport only** | **1.96 ms** | **4.7 ms** | 16.9 ms | 1.94, 1.96, 2.00 |
+| **Channel B, full frame** | **2.16 ms** | **5.8 ms** | 7.8 ms | 2.23, 2.16, 1.96 |
+| WebRTC (DTLS) | 2.57 ms | 5.4 ms | 22.8 ms | 2.60, 2.57, 2.52 |
+| Zenoh (mTLS) | 8.36 ms | 13.4 ms | 99.5 ms | 8.33, 8.36, 8.57 |
+| MQTT (mTLS) | 8.78 ms | 47.3 ms | 131.8 ms | 8.78, 8.83, 8.68 |
 
-ICMP ping at one per second averaged 21 ms (minimum 2.5 ms, maximum 139 ms).
+- **Channel B adds 0.4–0.6 ms to raw UDP** for QUIC, mutual TLS and (full
+  frame) FlatBuffers. On loopback, doc 11 measured 5.3 µs for the same
+  overhead. The extra here hasn't been broken down; the CM4's slower CPU
+  and each end's event loop are the candidates.
+- **The TCP-based protocols are 4× slower at the median,** 8.4–8.8 ms
+  against 2.0–2.2 ms. Doc 11 saw the same ordering on loopback, where the
+  gap was tens of microseconds. Over Wi-Fi it is several milliseconds, which
+  fits TCP's acknowledgement timing adding a radio turnaround or two to each
+  exchange, but that hasn't been isolated.
+- **ICMP ping, one per second, still averaged 20 ms** (1.6 ms minimum,
+  115 ms maximum). An idle link still pays a wake-up cost somewhere,
+  possibly in the robot's Wi-Fi firmware or the access point; back-to-back
+  traffic, as in these ping-pongs, doesn't.
 
-The protocols fall into two groups. Those on UDP (Channel B, WebRTC, raw
-UDP) have medians of 2.5–3.9 ms and tails near 90 ms. Those on TCP (Zenoh,
-MQTT) have medians near 10.7 ms and much shorter p95s, around 20–26 ms. The
-cause of either pattern hasn't been isolated. A ~90 ms tail fits Wi-Fi power
-saving: a dozing radio receives buffered packets at the next beacon, about
-every 100 ms. The laptop had power saving on; the robot did not.
+With the laptop's power saving **on**, the default on this machine, the
+same test gave:
+
+| Protocol | Median | p95 | p99 |
+| --- | --- | --- | --- |
+| Raw UDP | 2.52 ms | 85.7 ms | 97.8 ms |
+| Channel B, transport only | 3.77 ms | 93.7 ms | 184.3 ms |
+| Channel B, full frame | 3.93 ms | 88.5 ms | 114.1 ms |
+| WebRTC | 3.91 ms | 88.4 ms | 144.7 ms |
+| Zenoh | 10.66 ms | 20.3 ms | 76.2 ms |
+| MQTT | 10.82 ms | 25.9 ms | 116.3 ms |
+
+A dozing radio receives buffered packets at the next beacon, about every
+100 ms, which matches the ~90 ms tails. **Operator laptops should run with
+Wi-Fi power saving off:** it costs every protocol 1–2 ms at the median and
+turns Channel B's p95 from about 5 ms into about 90 ms.
 
 ## Throughput, robot to operator
 
@@ -148,10 +174,9 @@ hold them instead. This was not tested.
 
 ## Caveats
 
-- **The laptop's Wi-Fi power saving was on** (`iw dev wlp0s20f3 get
-  power_save`), the default on this machine. It most likely explains the
-  ~90 ms tails in the latency table. The medians, and the throughput
-  results, are unlikely to be affected.
+- **The throughput runs had the laptop's Wi-Fi power saving on.** A
+  continuous stream keeps the radio awake, so they should be much less
+  exposed than ping-pong was, but they haven't been rerun to check.
 - **The access point and channel were shared** with other networks and
   devices nearby, with no control over their traffic. Earlier the same day,
   a power cut took the router down, and the laptop twice fell off the
@@ -162,10 +187,12 @@ hold them instead. This was not tested.
   somewhere on the path (the broker, the Wi-Fi driver, the access point)
   was draining messages sent before the window opened. The rate above such
   a step always failed.
-- **Two runs feed this report.** Latency, Channel B, WebRTC and raw UDP come
-  from the first run (commit `0a0ad8d`). Zenoh and MQTT were rerun with the
-  receiver warm-up and a 2 MiB MQTT packet limit (commit `76f5752`); their
-  first-run numbers were artifacts of the missing warm-up and are not used.
+- **Three runs feed this report.** Throughput for Channel B, WebRTC and raw
+  UDP, and the power-save-on latency, come from the first run (commit
+  `0a0ad8d`). Zenoh and MQTT throughput was rerun with the receiver warm-up
+  and a 2 MiB MQTT packet limit (commit `76f5752`); their first-run numbers
+  were artifacts of the missing warm-up and are not used. The power-save-off
+  latency is a third run, on the same code.
 
 ## Reproducing
 
@@ -187,13 +214,11 @@ up to 10 minutes if the robot stops answering ping. Results go to
 
 ## Next steps
 
-1. **Rerun latency with the laptop's Wi-Fi power saving off,** to separate
-   the protocols' tails from the radio's.
-2. **Find the datagram ceiling.** Raw UDP from the CM4 stops near
+1. **Find the datagram ceiling.** Raw UDP from the CM4 stops near
    1,000–1,500 packets per second, while TCP reaches twice the throughput.
    Look at the Wi-Fi driver's handling of UDP, and at UDP GSO.
-3. **Batched sends for Channel B** (`sendmmsg`/GSO), as doc 11 planned.
-4. **Bulk objects** ([13](13-large-sensor-payloads.md)), for large messages
+2. **Batched sends for Channel B** (`sendmmsg`/GSO), as doc 11 planned.
+3. **Bulk objects** ([13](13-large-sensor-payloads.md)), for large messages
    that must arrive whole.
-5. **Control under load** ([12](12-control-under-load-benchmark.md)), on
+4. **Control under load** ([12](12-control-under-load-benchmark.md)), on
    this same setup.
