@@ -373,7 +373,7 @@ impl Session {
                     // newer one before we get here is never chunked/sent at
                     // all -- see that module's doc comment.
                     if self.phase == Phase::Operating {
-                        self.lossy.push_video_nal(nal_id, &nal);
+                        self.lossy.push_video_nal(nal_id, &nal, Instant::now());
                         // Every other branch flushes right after queuing
                         // datagrams; this one didn't, so a video chunk
                         // just sat in quiche's send buffer until some
@@ -640,7 +640,7 @@ impl Session {
     /// so lossy data never gets ahead of them.
     fn feed_lossy(&mut self) {
         while self.conn.dgram_send_queue_len() < QUICHE_LOSSY_LIMIT {
-            let Some(d) = self.lossy.pop() else { break };
+            let Some(d) = self.lossy.pop(Instant::now()) else { break };
             // Only fails if the datagram no longer fits (the path's MTU
             // shrank) or the connection is closing; either way drop it.
             if let Err(e) = self.conn.dgram_send(&d) {

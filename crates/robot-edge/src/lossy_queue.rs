@@ -16,10 +16,20 @@
 //! Waiting here rather than in quiche is also what lets stale data be
 //! dropped before it is ever sent:
 //!
-//! - **Video:** a new delta NAL drops older deltas still waiting; a new IDR
+//! - **Video:** a delta NAL is dropped only once it has waited longer than
+//!   `VIDEO_MAX_WAIT`, and then every waiting delta goes, and later deltas
+//!   are skipped until the next IDR. In H.264 each delta references the one
+//!   before it, so after one is lost the rest of the group of pictures would
+//!   only decode as smeared garbage: skipping them freezes the picture
+//!   cleanly and spends the link on something useful instead. A new IDR
 //!   drops everything older except the latest SPS and PPS, which the decoder
-//!   can't do without. A dropped delta glitches the picture until the next
-//!   IDR, the same trade `video::channel_a` already makes upstream.
+//!   can't do without, and ends any skip.
+//!
+//!   An earlier version dropped a waiting delta as soon as a newer one
+//!   arrived. On the CM4 over Wi-Fi, with sensor load, that dropped 16% of
+//!   deltas -- nearly all right after IDRs, whose 40-odd chunks briefly hold
+//!   up the deltas behind them for one or two frame times -- and smeared
+//!   almost every group of pictures.
 //! - **Sensors:** a new frame replaces the unsent slices of that sensor's
 //!   previous frame. Slices already sent still decode on their own, so the
 //!   operator sees a thinner frame, not a broken one.
@@ -30,6 +40,7 @@
 //! until that's negotiated, equal shares.)
 
 use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use roboprotocol_core::datagram::{self, DATAGRAM_TAG_CHANNEL_A};
 use roboprotocol_core::video::chunk_nal;
@@ -40,12 +51,18 @@ use roboprotocol_core::video::chunk_nal;
 /// whenever the congestion window opens.
 pub const QUICHE_LOSSY_LIMIT: usize = 8;
 
+/// How long a delta NAL may wait here before video skips to the next IDR.
+/// Long enough to ride out an IDR burst (two or three frame times), short
+/// enough that the operator never watches video more than this far behind.
+pub const VIDEO_MAX_WAIT: Duration = Duration::from_millis(150);
+
 const NAL_IDR: u8 = 5;
 const NAL_SPS: u8 = 7;
 const NAL_PPS: u8 = 8;
 
 struct PendingNal {
     nal_type: u8,
+    queued_at: Instant,
     /// Tagged Channel A datagrams not yet handed to quiche.
     chunks: VecDeque<Vec<u8>>,
 }
@@ -62,6 +79,9 @@ pub struct LossyStats {
 pub struct LossyQueue {
     video: VecDeque<PendingNal>,
     sensors: BTreeMap<u8, VecDeque<Vec<u8>>>,
+    /// Set when a stale delta forced a drop: deltas are discarded until the
+    /// next IDR, since they'd only decode as corrupted pictures.
+    skip_deltas_until_idr: bool,
     /// Which class `pop` tries first next time.
     video_turn: bool,
     last_sensor: Option<u8>,
@@ -79,17 +99,37 @@ impl LossyQueue {
 
     /// Queues one NAL unit (without its start code), applying the drop
     /// rules in the module docs.
-    pub fn push_video_nal(&mut self, nal_id: u32, nal: &[u8]) {
+    pub fn push_video_nal(&mut self, nal_id: u32, nal: &[u8], now: Instant) {
         let nal_type = nal.first().map_or(0, |b| b & 0x1F);
         let before = self.video.len();
         match nal_type {
             NAL_SPS | NAL_PPS => self.video.retain(|p| p.nal_type != nal_type),
-            NAL_IDR => self.video.retain(|p| matches!(p.nal_type, NAL_SPS | NAL_PPS)),
-            _ => self.video.retain(|p| matches!(p.nal_type, NAL_IDR | NAL_SPS | NAL_PPS)),
+            NAL_IDR => {
+                self.video.retain(|p| matches!(p.nal_type, NAL_SPS | NAL_PPS));
+                self.skip_deltas_until_idr = false;
+            }
+            _ if self.skip_deltas_until_idr => {
+                self.stats.video_nals_dropped += 1;
+                return;
+            }
+            _ => {}
         }
         self.stats.video_nals_dropped += (before - self.video.len()) as u64;
         let chunks = chunk_nal(nal_id, nal).iter().map(|c| datagram::tag(DATAGRAM_TAG_CHANNEL_A, c)).collect();
-        self.video.push_back(PendingNal { nal_type, chunks });
+        self.video.push_back(PendingNal { nal_type, queued_at: now, chunks });
+    }
+
+    /// If any waiting delta is older than `VIDEO_MAX_WAIT`, drops every
+    /// waiting delta and skips deltas until the next IDR.
+    fn expire_stale_video(&mut self, now: Instant) {
+        let is_delta = |p: &PendingNal| !matches!(p.nal_type, NAL_IDR | NAL_SPS | NAL_PPS);
+        let stale = self.video.iter().any(|p| is_delta(p) && now.saturating_duration_since(p.queued_at) > VIDEO_MAX_WAIT);
+        if stale {
+            let before = self.video.len();
+            self.video.retain(|p| !is_delta(p));
+            self.stats.video_nals_dropped += (before - self.video.len()) as u64;
+            self.skip_deltas_until_idr = true;
+        }
     }
 
     /// Queues one sensor frame's tagged slice datagrams, replacing whatever
@@ -105,7 +145,8 @@ impl LossyQueue {
 
     /// The next datagram to hand to quiche, alternating between video and
     /// sensors while both have something waiting.
-    pub fn pop(&mut self) -> Option<Vec<u8>> {
+    pub fn pop(&mut self, now: Instant) -> Option<Vec<u8>> {
+        self.expire_stale_video(now);
         let first_video = self.video_turn;
         self.video_turn = !self.video_turn;
         if first_video {
@@ -144,7 +185,7 @@ mod tests {
     use super::*;
     use roboprotocol_core::video::ChunkHeader;
 
-    /// NAL type of the first chunk of each NAL left in the queue, in order.
+    /// NAL type of each NAL still waiting, in order.
     fn pending_types(q: &LossyQueue) -> Vec<u8> {
         q.video.iter().map(|p| p.nal_type).collect()
     }
@@ -155,21 +196,57 @@ mod tests {
         n
     }
 
+    const MS: Duration = Duration::from_millis(1);
+
     #[test]
-    fn a_new_delta_drops_waiting_deltas_but_keeps_critical_nals() {
+    fn fresh_deltas_wait_behind_an_idr_instead_of_being_dropped() {
+        let t0 = Instant::now();
         let mut q = LossyQueue::new();
         for (id, t) in [(0, NAL_SPS), (1, NAL_PPS), (2, NAL_IDR), (3, 1), (4, 1)] {
-            q.push_video_nal(id, &nal(t, 50));
+            q.push_video_nal(id, &nal(t, 50), t0 + id * 33 * MS);
         }
-        assert_eq!(pending_types(&q), vec![NAL_SPS, NAL_PPS, NAL_IDR, 1]);
-        assert_eq!(q.stats().video_nals_dropped, 1);
+        assert!(q.pop(t0 + 140 * MS).is_some(), "oldest delta waited 41 ms: nothing is stale yet");
+        assert_eq!(pending_types(&q), vec![NAL_PPS, NAL_IDR, 1, 1]);
+        assert_eq!(q.stats().video_nals_dropped, 0);
+    }
+
+    #[test]
+    fn a_stale_delta_drops_waiting_deltas_and_skips_to_the_next_idr() {
+        let t0 = Instant::now();
+        let mut q = LossyQueue::new();
+        q.push_video_nal(0, &nal(NAL_IDR, 50), t0);
+        q.push_video_nal(1, &nal(1, 50), t0);
+        q.push_video_nal(2, &nal(1, 50), t0 + 33 * MS);
+        // 151 ms later the first delta is stale: both deltas go, the IDR stays.
+        assert!(q.pop(t0 + 151 * MS).is_some());
+        assert_eq!(pending_types(&q), Vec::<u8>::new(), "the IDR was the one popped");
+        assert_eq!(q.stats().video_nals_dropped, 2);
+        // Later deltas in the same group of pictures are skipped...
+        q.push_video_nal(3, &nal(1, 50), t0 + 160 * MS);
+        assert_eq!(q.stats().video_nals_dropped, 3);
+        assert!(pending_types(&q).is_empty());
+        // ...until the next IDR, after which deltas flow again.
+        q.push_video_nal(4, &nal(NAL_IDR, 50), t0 + 200 * MS);
+        q.push_video_nal(5, &nal(1, 50), t0 + 233 * MS);
+        assert_eq!(pending_types(&q), vec![NAL_IDR, 1]);
+    }
+
+    #[test]
+    fn a_waiting_idr_never_goes_stale() {
+        let t0 = Instant::now();
+        let mut q = LossyQueue::new();
+        q.push_video_nal(0, &nal(NAL_IDR, 3_000), t0); // three chunks
+        assert!(q.pop(t0 + 10_000 * MS).is_some());
+        assert_eq!(pending_types(&q), vec![NAL_IDR]);
+        assert_eq!(q.stats().video_nals_dropped, 0);
     }
 
     #[test]
     fn a_new_idr_drops_everything_older_except_the_latest_parameter_sets() {
+        let t0 = Instant::now();
         let mut q = LossyQueue::new();
         for (id, t) in [(0, NAL_SPS), (1, NAL_PPS), (2, NAL_IDR), (3, 1), (4, NAL_SPS), (5, NAL_IDR)] {
-            q.push_video_nal(id, &nal(t, 50));
+            q.push_video_nal(id, &nal(t, 50), t0);
         }
         assert_eq!(pending_types(&q), vec![NAL_PPS, NAL_SPS, NAL_IDR]);
         assert_eq!(q.stats().video_nals_dropped, 3, "older SPS, older IDR and the delta");
@@ -177,11 +254,11 @@ mod tests {
 
     #[test]
     fn video_chunks_come_out_tagged_and_in_order() {
+        let t0 = Instant::now();
         let mut q = LossyQueue::new();
-        let big = nal(NAL_IDR, 3_000);
-        q.push_video_nal(9, &big);
+        q.push_video_nal(9, &nal(NAL_IDR, 3_000), t0);
         let mut chunks = Vec::new();
-        while let Some(d) = q.pop() {
+        while let Some(d) = q.pop(t0) {
             assert_eq!(d[0], DATAGRAM_TAG_CHANNEL_A);
             let (h, _) = ChunkHeader::decode(&d[1..]).unwrap();
             chunks.push(h.chunk_index);
@@ -191,21 +268,23 @@ mod tests {
 
     #[test]
     fn a_new_sensor_frame_replaces_the_unsent_rest_of_the_previous_one() {
+        let t0 = Instant::now();
         let mut q = LossyQueue::new();
         q.push_sensor_frame(1, vec![vec![1], vec![2], vec![3]]);
-        assert_eq!(q.pop(), Some(vec![1]));
+        assert_eq!(q.pop(t0), Some(vec![1]));
         q.push_sensor_frame(1, vec![vec![4], vec![5]]);
         assert_eq!(q.stats(), LossyStats { video_nals_dropped: 0, sensor_frames_cut: 1, sensor_slices_dropped: 2 });
-        assert_eq!((q.pop(), q.pop(), q.pop()), (Some(vec![4]), Some(vec![5]), None));
+        assert_eq!((q.pop(t0), q.pop(t0), q.pop(t0)), (Some(vec![4]), Some(vec![5]), None));
     }
 
     #[test]
     fn video_and_sensors_alternate_and_sensors_round_robin() {
+        let t0 = Instant::now();
         let mut q = LossyQueue::new();
-        q.push_video_nal(0, &nal(1, 3_000)); // three chunks
+        q.push_video_nal(0, &nal(1, 3_000), t0); // three chunks
         q.push_sensor_frame(2, vec![vec![0x04, 2], vec![0x04, 2]]);
         q.push_sensor_frame(7, vec![vec![0x04, 7], vec![0x04, 7]]);
-        let order: Vec<String> = std::iter::from_fn(|| q.pop())
+        let order: Vec<String> = std::iter::from_fn(|| q.pop(t0))
             .map(|d| if d[0] == DATAGRAM_TAG_CHANNEL_A { "v".to_string() } else { format!("s{}", d[1]) })
             .collect();
         assert_eq!(order, vec!["s2", "v", "s7", "v", "s2", "v", "s7"]);

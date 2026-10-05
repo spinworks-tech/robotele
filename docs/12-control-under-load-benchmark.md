@@ -63,8 +63,13 @@ datagrams (about 4 ms at 20 Mbps).
 Holding lossy data outside quiche also lets stale data be dropped before it
 is sent:
 
-- **Video:** a new delta NAL drops older waiting deltas; a new IDR drops
-  everything older except the latest SPS and PPS.
+- **Video:** a delta NAL is dropped only once it has waited more than
+  150 ms; then every waiting delta goes and later deltas are skipped until
+  the next IDR, because each delta references the one before it and the
+  rest of the group of pictures would only decode as smear. A new IDR drops
+  everything older except the latest SPS and PPS. (The first version
+  dropped a waiting delta whenever a newer one arrived; on the CM4 that
+  smeared nearly half the video under load -- see below.)
 - **Sensors:** a new frame replaces the unsent slices of that sensor's
   previous frame. Slices already sent still decode, as a thinner frame.
 - **Sharing:** video and sensors alternate one datagram at a time while both
@@ -107,6 +112,64 @@ likely cause: `robot-edge` sends packets as soon as quiche produces them and
 ignores the pacing time quiche returns (`send_info.at`), which BBR relies
 on. CUBIC stays the default until pacing is honoured and the Pi testbed
 says otherwise.
+
+### Results on the CM4 over Wi-Fi
+
+`robot-edge` on the XGO-Lite's CM4 (OV5647 camera, 640x480, 30 fps, IDR
+every 30 frames, 2 Mbps), `operator-console` on a laptop, both on the same
+Wi-Fi network. Idle round trip: 3.2 ms median. Load: the camera plus sim
+lidar, depth and cloud, about 40 Mbps offered, well above what the CM4's
+Wi-Fi uplink carries.
+
+**Video.** NAL ids traced end to end (temporary debug logging, not
+committed), 30 s per run. "Corrupted" counts delta frames that arrived after
+an earlier delta of their group of pictures was lost, so they decode as
+smear.
+
+| Run | NALs sent | Lost | Lost SPS/PPS/IDR | Deltas shown clean | Deltas shown corrupted |
+| --- | --- | --- | --- | --- | --- |
+| Camera only | 1,058 | 3 | 0 | -- | -- |
+| Under load, first rule (newer delta drops older) | 1,016 | 160 | 0 | 408 | 349 |
+| Under load, stale rule (150 ms, then skip to IDR) | 949 | 60 | 3 | 613 | 180 |
+
+Under load, sensors still arrived at close to their target rates, as
+thinner frames (about a third of each lidar and depth frame's slices, three
+quarters of the cloud's). Of the 60 NALs lost with the stale rule, 40 were
+skip-to-IDR runs (clean freezes) and 20 were scattered single losses from
+the saturated Wi-Fi link; those cause the remaining corruption. Only the
+receiver can turn those into freezes: the operator would stop feeding deltas
+to the decoder after a gap in NAL ids, until the next IDR. That is
+operator-side work, not yet done. (The operator's playback also keeps only
+the latest delta when deltas arrive faster than the decoder takes them,
+which drops about 60-70 deltas in 30 s even on an idle link, with the same
+smearing. Same fix.)
+
+**Channel B round trips** (`--bench pingpong`, 300 pings, camera plus the
+three sim sensors):
+
+| Build | Median | p95 | p99 | Pings lost |
+| --- | --- | --- | --- | --- |
+| Idle link | 3.2 ms | 5.9 ms | 7.0 ms | 0 |
+| Before the fix, run 1 | 123 ms | 402 ms | 594 ms | 5 |
+| Before the fix, run 2 | 212 ms | 369 ms | 657 ms | 11 |
+| With the fix, run 1 | 180 ms | 336 ms | 516 ms | 9 |
+| With the fix, run 2 | 135 ms | 388 ms | 557 ms | 9 |
+| With the fix, `--cc bbr2` | 483 ms | 969 ms | 989 ms | 245 |
+| With the fix, `--cc bbr2`, again | 327 ms | 877 ms | 955 ms | 250 |
+
+On Wi-Fi the fix makes no measurable difference to control latency: the
+runs differ more from each other than the builds do. Here the queue that
+grows is not quiche's but the one below it, in the CM4's Wi-Fi driver and
+the access point, which CUBIC keeps full. That is the queue the namespace
+test's netem buffer stood in for, and it is much deeper on real Wi-Fi.
+BBRv2 is far worse here: it lost over 80% of pings. Do not use `--cc bbr2`
+on Wi-Fi.
+
+Bringing control latency under load down on Wi-Fi therefore needs the robot
+to send less than the link carries -- doc 13's per-sensor budgets, sized
+from quiche's delivery-rate estimate -- or a shorter queue under quiche
+(for example `fq_codel` and a smaller transmit queue on the CM4's
+`wlan0`), or both. Those are the next experiments.
 
 So the Pi benchmark runs in two phases:
 

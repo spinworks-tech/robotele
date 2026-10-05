@@ -292,7 +292,9 @@ Done:
   enter quiche's queue at most 8 datagrams at a time, so Channel B never
   waits behind more than that
   ([12 — Channel B datagram priority](12-control-under-load-benchmark.md#channel-b-datagram-priority)).
-  Video and sensors share the link equally for now.
+  Video and sensors share the link equally for now. On the CM4 over Wi-Fi
+  this bounds quiche's queue but not the Wi-Fi driver's, so control latency
+  under sensor load still depends on budgets (next item).
 - `operator-console`: accepts every valid sensor, assembles and decodes
   frames, and shows a row per sensor in the channels panel (slice rate,
   bandwidth, frame rate, completeness, sample count).
