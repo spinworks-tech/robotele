@@ -255,6 +255,10 @@ struct RecvTally {
     msgs: u64,
     bytes: u64,
     partial: u64,
+    /// Every sliced-message byte that arrived in the window, whether or not
+    /// its message completed -- the data a loss-tolerant consumer (a point
+    /// cloud display) actually gets.
+    slice_bytes: u64,
 }
 
 impl RecvTally {
@@ -304,6 +308,9 @@ async fn recv(link: &mut Link<'_>, warmup_s: f64, duration_s: f64, mut heartbeat
                 Some(&datagram::DATAGRAM_TAG_SENSOR_SLICE) => {
                     let Some((header, slice)) = SliceHeader::decode(&dbuf[1..len]) else { continue };
                     if header.sensor_id == BENCH_SENSOR_ID {
+                        if in_window {
+                            tally.slice_bytes += slice.len() as u64;
+                        }
                         for f in assembler.on_slice(header, slice, now_us) {
                             tally.frame(&f, in_window);
                         }
@@ -322,6 +329,7 @@ async fn recv(link: &mut Link<'_>, warmup_s: f64, duration_s: f64, mut heartbeat
         "{} partial and {} superseded sliced messages (counted as not delivered)",
         tally.partial, stats.frames_superseded
     );
+    eprintln!("{} slice bytes received in the window", tally.slice_bytes);
     println!("{} msgs, {} bytes in {duration_s:.2}s", tally.msgs, tally.bytes);
     Ok(())
 }

@@ -56,11 +56,16 @@ PI_RS = f"{PI_DIR}/target/release/proto-bench"
 PI_EDGE = f"{PI_DIR}/target/release/robot-edge"
 
 SIZES = [16, 1024, 4096, 16384, 65536, 262144, 1048576]
+SLICE_THRESHOLD = 1100  # roboprotocol_core::bench::BENCH_SLICE_THRESHOLD
 MAX_SIZE = {"rs-udp": 65507, "rs-webrtc": 65535}
 RATES = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000]
 START_MBPS = 2.0  # first rate tried: the largest whose offered load is <= this
 SEND_S, WARMUP_S, WINDOW_S = 10.0, 1.0, 8.0
-PASS_RATIO = 0.99
+# 98%, not run_loopback.py's 99%: each receiver counts over a fixed 8 s of
+# wall-clock time, and Wi-Fi delay swings (~90 ms at p95) shift that count by
+# about +-1% even when nothing is lost -- measured with reliable protocols at
+# a fraction of the link (98.9%, 99.0%, 101.1%).
+PASS_RATIO = 0.98
 LATENCY_RUNS = 3
 PROTOS = sys.argv[1:] or ["channel-b-raw", "rs-zenoh-tls", "rs-mqtt-tls", "rs-webrtc", "rs-udp"]
 LATENCY_PROTOS = ["channel-b", "channel-b-raw", "rs-zenoh-tls", "rs-mqtt-tls", "rs-webrtc", "rs-udp"]
@@ -86,12 +91,30 @@ def pi_start(argv, name):
     there. Returns the log path. The command travels on stdin, so it never
     appears in a process's command line for `pgrep -f` to trip over."""
     log_path = f"/tmp/bench-{name}.log"
-    script = f"cd {PI_DIR} && setsid {' '.join(argv)} > {log_path} 2>&1 < /dev/null &\n"
+    # `cd` on its own line: `cd X && cmd &` would background the whole list
+    # as a subshell that keeps ssh's output open, so ssh would never return.
+    script = f"cd {PI_DIR}\nsetsid {' '.join(argv)} > {log_path} 2>&1 < /dev/null &\n"
     subprocess.run(["ssh", "-o", "BatchMode=yes", PI, "bash -s"], input=script, text=True, timeout=30)
     return log_path
 
 
+def wait_for_link(max_wait_s=600):
+    """Waits for the robot to answer ping, so a Wi-Fi drop (the laptop has
+    roamed off the robot's network twice) pauses the run instead of
+    recording zeros. Raises if it doesn't come back."""
+    t0 = time.time()
+    while subprocess.run(["ping", "-c", "1", "-W", "2", PI_IP], capture_output=True).returncode != 0:
+        if time.time() - t0 > max_wait_s:
+            raise RuntimeError(f"robot {PI_IP} unreachable for {max_wait_s}s")
+        if int(time.time() - t0) % 30 == 0:
+            log(f"  !! robot unreachable, waiting ({int(time.time() - t0)}s)")
+        time.sleep(2)
+    if time.time() - t0 > 3:
+        log(f"  !! link back after {time.time() - t0:.0f}s")
+
+
 def pi_stop():
+    wait_for_link()
     # Exact process names only (see pi_start): robot-edge ignores SIGINT,
     # so straight to SIGKILL.
     ssh("pkill -KILL -x robot-edge; pkill -KILL -x proto-bench; sleep 0.5; true")
@@ -110,7 +133,7 @@ def tls_args(side):
 
 def rs_args(proto, mode, side):
     """proto-bench args for one side. `side` is "robot" or "operator"."""
-    name = proto[3:].removesuffix("-tls")
+    name = proto[3:].replace("-tls", "")
     binary = PI_RS if side == "robot" else RS
     args = [binary, name, mode]
     if name == "udp":
@@ -175,6 +198,7 @@ def trial(proto, size, rate):
         time.sleep(2)
         r = local(opc_args(proto, "--bench", "recv", "--bench-warmup-s", str(WARMUP_S),
                            "--bench-duration-s", str(WINDOW_S)), timeout=120)
+        r = subprocess.CompletedProcess(r.args, r.returncode, r.stdout + r.stderr, "")
         time.sleep(1)
     elif proto == "rs-webrtc":  # the receiver is the signaling listener: it starts first
         recv = subprocess.Popen(rs_args(proto, "recv", "operator") + ["--warmup-s", str(WARMUP_S), "--duration-s", str(WINDOW_S)],
@@ -203,9 +227,19 @@ def score(proto, size, rate, sender, recv_out):
     msgs, nbytes, elapsed = (int(m.group(1)), int(m.group(2)), float(m.group(3))) if m else (0, 0, WINDOW_S)
     recv_rate = msgs / elapsed if elapsed else 0.0
     offered = min(rate, sent_rate) if sent_rate else rate
-    return {"target_hz": rate, "sent_hz": round(sent_rate, 1), "recv_hz": round(recv_rate, 1),
-            "ratio": round(recv_rate / offered, 4) if offered else 0.0,
-            "mbps": round(nbytes * 8 / elapsed / 1e6, 2) if elapsed else 0.0, "payload": size}
+    t = {"target_hz": rate, "sent_hz": round(sent_rate, 1), "recv_hz": round(recv_rate, 1),
+         "ratio": round(recv_rate / offered, 4) if offered else 0.0,
+         "mbps": round(nbytes * 8 / elapsed / 1e6, 2) if elapsed else 0.0, "payload": size}
+    m = re.search(r"(\d+) slice bytes received", recv_out)
+    if proto.startswith("channel-b") and size > SLICE_THRESHOLD and m:
+        # Sliced Channel B: scored on data delivered, since a frame missing a
+        # few slices is still usable; complete messages reported alongside.
+        padded = -(-size // 64) * 64
+        data_rate = int(m.group(1)) / elapsed if elapsed else 0.0
+        t["complete_ratio"] = t["ratio"]
+        t["ratio"] = round(data_rate / (offered * padded), 4) if offered else 0.0
+        t["data_mbps"] = round(data_rate * 8 / 1e6, 2)
+    return t
 
 
 def search(proto, size):
@@ -218,8 +252,10 @@ def search(proto, size):
             t = trial(proto, size, rate)
             t["retried"] = True
         trials.append(t)
+        extra = (f" (complete msgs {t['complete_ratio']:.3f}, data {t['data_mbps']} Mbps)"
+                 if "complete_ratio" in t else "")
         log(f"  {proto:14} {size:8}B target={rate:>7} sent={t['sent_hz']:>9} recv={t['recv_hz']:>9} "
-            f"ratio={t['ratio']:.3f} {t['mbps']} Mbps")
+            f"ratio={t['ratio']:.3f} {t['mbps']} Mbps{extra}")
         if t["ratio"] < PASS_RATIO:
             if best is None and rate == start:
                 best = {"below_start": True, **t}
