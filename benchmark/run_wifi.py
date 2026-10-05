@@ -22,11 +22,10 @@ MQTT: TLS via a broker on the laptop; WebRTC: DTLS), plus raw UDP as the
 floor. Certificates come from benchmark/results/wifi/certs, generated with
 both LAN IPs as SANs so hostname checks stay on.
 
-Setup (see the run's README in the results directory for what was used):
-  - robot: release robot-edge and proto-bench under ~/RoboProtocol, the
-    certs + zenoh_tls_robot.json5 under ~/RoboProtocol/benchmark-wifi/
-  - laptop: release robot-edge/operator-console/proto-bench, and the
-    bench-mosquitto-wifi container (ports 1884/8884, the wifi certs)
+Setup: release builds of robot-edge and proto-bench on the robot and of
+operator-console and proto-bench here, then `benchmark/setup_wifi.sh up`
+(certs, configs, broker, robot-side files) before the run and
+`benchmark/setup_wifi.sh down` after. See docs/14, "Reproducing".
 
 Usage: run_wifi.py [proto ...]    (default: all)
 """

@@ -196,21 +196,54 @@ hold them instead. This was not tested.
 
 ## Reproducing
 
-On the robot: release builds of `robot-edge` and `proto-bench` (add
-`tools/proto-bench` to the Pi's workspace), and the certificate set plus
-`zenoh_tls_robot.json5` under `~/RoboProtocol/benchmark-wifi/`. On the
-laptop: release builds of `operator-console` and `proto-bench`, and a
-mosquitto 2 container on ports 1884/8884 using the same certificate set.
-Then:
+**Raw results.** Every trial behind this report, with each run's log, is
+attached to the
+[`bench-wifi-2026-10-05`](https://github.com/spinworks-tech/robotele/releases/tag/bench-wifi-2026-10-05)
+release (`wifi-bench-results-2026-10-05.tar.gz`). The access point's name
+and local paths are replaced with placeholders. No certificates or
+binaries are published.
 
-```bash
-python3 benchmark/run_wifi.py            # everything, about 70 minutes
-SKIP_LATENCY=1 python3 benchmark/run_wifi.py rs-zenoh-tls rs-mqtt-tls   # throughput only
-```
+**Rerunning.** The two hosts are set in `benchmark/run_wifi.py` (`PI`,
+`PI_IP`, `OP_IP`).
 
-`run_wifi.py` stops any running `robot-edge` on the robot, and pauses for
-up to 10 minutes if the robot stops answering ping. Results go to
-`benchmark/results/wifi/<timestamp>/` (not committed).
+1. **The robot:**
+   - Add `"tools/proto-bench"` to the members in `~/RoboProtocol/Cargo.toml`.
+   - Sync `crates/` and `tools/proto-bench/` to the robot.
+   - Build both in release: `cargo build --release -p robot-edge -p proto-bench`.
+     That takes about 20 minutes from scratch on a CM4.
+2. **The laptop:** build in release with
+   `cargo build --release -p operator-console -p proto-bench`.
+3. **Set up, run, tear down:**
+
+   ```bash
+   benchmark/setup_wifi.sh up               # certs, configs, broker, robot-side files
+   python3 benchmark/run_wifi.py            # everything, about 70 minutes
+   SKIP_LATENCY=1 python3 benchmark/run_wifi.py rs-zenoh-tls rs-mqtt-tls   # throughput only
+   benchmark/setup_wifi.sh down             # remove certs, configs and broker again
+   ```
+
+What `setup_wifi.sh up` creates:
+
+- **A throwaway certificate set,** whose robot certificate also names both
+  LAN IPs. Without that, the TLS clients couldn't check the server's name
+  while connecting by IP. The set includes private keys, a CA key among
+  them, so `down` deletes it. Never commit or publish it.
+- **The robot's share of it,** copied to `~/RoboProtocol/benchmark-wifi/`:
+  its own certificate and key, the CA certificate (not the CA key), and the
+  Zenoh config.
+- **Configs** for Zenoh and a mosquitto 2 broker (container
+  `bench-mosquitto-wifi`, ports 1884/8884).
+
+It never touches the default certificates in `certs/`, which `robot-edge`
+and `operator-console` keep using outside the benchmark.
+
+`run_wifi.py` stops any running `robot-edge` on the robot, so restart it
+afterwards (or from the robot's LCD panel). It pauses for up to 10 minutes
+whenever the robot stops answering ping. Results go to
+`benchmark/results/wifi/<timestamp>/` (gitignored).
+
+Turn the operator laptop's Wi-Fi power saving off first (`sudo iw dev
+<interface> set power_save off`); see [Latency](#latency-64-b-ping-pong).
 
 ## Next steps
 
