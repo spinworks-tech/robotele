@@ -34,7 +34,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use roboprotocol_core::bench::{summarize_latency, BENCH_ECHO_TICK_ID};
+use roboprotocol_core::bench::{summarize_latency, BENCH_ECHO_TICK_ID, BENCH_SENSOR_ID};
+use roboprotocol_core::sensor::{AssembledFrame, FrameAssembler, SliceHeader};
 use roboprotocol_core::{datagram, timestamp};
 use tokio::net::UdpSocket;
 
@@ -52,6 +53,10 @@ pub struct BenchSpec {
 pub enum BenchKind {
     PingPong { count: usize },
     Send { rate_hz: f64, duration_s: f64 },
+    /// Count what `robot-edge --bench send` sends (robot to operator):
+    /// single bench datagrams, and sliced messages counted only when every
+    /// slice arrived. Counting covers `duration_s` after `warmup_s`.
+    Recv { warmup_s: f64, duration_s: f64 },
 }
 
 /// Same `>Qd` header as `benchmark/*_bench.py` and `tools/proto-bench`.
@@ -178,8 +183,9 @@ pub async fn run(conn: &mut quiche::Connection, socket: &UdpSocket, local: Socke
     let BenchSpec { kind, payload_bytes, raw } = spec;
     let probe = bench_datagram(0, payload_bytes, raw);
     let max = link.conn.dgram_max_writable_len().context("peer has no datagram support")?;
+    // Only the sending modes build datagrams of `payload_bytes`.
     anyhow::ensure!(
-        probe.len() <= max,
+        matches!(kind, BenchKind::Recv { .. }) || probe.len() <= max,
         "{payload_bytes} B payload makes a {} B datagram, over this connection's {max} B limit (Channel B never fragments)",
         probe.len()
     );
@@ -205,6 +211,7 @@ pub async fn run(conn: &mut quiche::Connection, socket: &UdpSocket, local: Socke
     let result = match kind {
         BenchKind::PingPong { count } => pingpong(&mut link, count, payload_bytes, raw, first_seq).await,
         BenchKind::Send { rate_hz, duration_s } => send(&mut link, payload_bytes, raw, rate_hz, duration_s, first_seq).await,
+        BenchKind::Recv { warmup_s, duration_s } => recv(&mut link, warmup_s, duration_s, heartbeat_seq).await,
     };
     let _ = link.conn.close(true, 0x0, b"bench done");
     link.flush().await?;
@@ -239,6 +246,83 @@ async fn pingpong(link: &mut Link<'_>, count: usize, payload_bytes: usize, raw: 
     }
     anyhow::ensure!(!rtts.is_empty(), "no samples collected -- is robot-edge running with --bench echo?");
     println!("{}", summarize_latency(&rtts));
+    Ok(())
+}
+
+/// Message tally for `recv`, counting only what lands inside the window.
+#[derive(Default)]
+struct RecvTally {
+    msgs: u64,
+    bytes: u64,
+    partial: u64,
+}
+
+impl RecvTally {
+    fn frame(&mut self, f: &AssembledFrame, in_window: bool) {
+        if !in_window {
+            return;
+        }
+        if f.is_complete() {
+            self.msgs += 1;
+            self.bytes += f.slices.iter().flatten().map(|s| s.len() as u64).sum::<u64>();
+        } else {
+            self.partial += 1;
+        }
+    }
+}
+
+async fn recv(link: &mut Link<'_>, warmup_s: f64, duration_s: f64, mut heartbeat_seq: u64) -> Result<()> {
+    eprintln!("receiving robot-edge --bench send traffic: {warmup_s}s warmup, then counting for {duration_s}s");
+    let start = Instant::now();
+    let (lo, hi) = (start + Duration::from_secs_f64(warmup_s), start + Duration::from_secs_f64(warmup_s + duration_s));
+    // Generous deadline: a frame is either complete well within it or was
+    // cut short at the sender and never will be.
+    let mut assembler = FrameAssembler::new(500_000, 64);
+    let mut tally = RecvTally::default();
+    let mut next_heartbeat = start;
+    let mut dbuf = vec![0u8; MAX_UDP_PAYLOAD];
+    loop {
+        let now = Instant::now();
+        if now >= hi {
+            break;
+        }
+        let in_window = now >= lo;
+        // Keeps robot-edge's watchdog fed, as in the settle phase.
+        if now >= next_heartbeat {
+            let _ = link.conn.dgram_send(&datagram::tag(datagram::DATAGRAM_TAG_HEARTBEAT, &heartbeat_seq.to_be_bytes()));
+            heartbeat_seq += 1;
+            next_heartbeat = now + Duration::from_millis(20);
+            link.flush().await?;
+        }
+        let now_us = timestamp::now_micros();
+        while let Ok(len) = link.conn.dgram_recv(&mut dbuf) {
+            match dbuf[..len].first() {
+                Some(&datagram::DATAGRAM_TAG_BENCH_RAW) if in_window => {
+                    tally.msgs += 1;
+                    tally.bytes += (len - 1) as u64;
+                }
+                Some(&datagram::DATAGRAM_TAG_SENSOR_SLICE) => {
+                    let Some((header, slice)) = SliceHeader::decode(&dbuf[1..len]) else { continue };
+                    if header.sensor_id == BENCH_SENSOR_ID {
+                        for f in assembler.on_slice(header, slice, now_us) {
+                            tally.frame(&f, in_window);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for f in assembler.poll(now_us) {
+            tally.frame(&f, in_window);
+        }
+        link.pump(next_heartbeat.min(hi)).await?;
+    }
+    let stats = assembler.stats();
+    eprintln!(
+        "{} partial and {} superseded sliced messages (counted as not delivered)",
+        tally.partial, stats.frames_superseded
+    );
+    println!("{} msgs, {} bytes in {duration_s:.2}s", tally.msgs, tally.bytes);
     Ok(())
 }
 

@@ -24,6 +24,10 @@ pub enum BenchMode {
     /// Count only, logging cumulative totals once a second (one-way
     /// throughput).
     Count,
+    /// Send paced messages to the operator instead of receiving them:
+    /// robot-to-operator throughput, the direction sensor data travels
+    /// (docs/13). `operator-console --bench recv` counts them.
+    Send,
 }
 
 impl BenchMode {
@@ -31,9 +35,45 @@ impl BenchMode {
         match s {
             "echo" => Some(Self::Echo),
             "count" => Some(Self::Count),
+            "send" => Some(Self::Send),
             _ => None,
         }
     }
+}
+
+/// `>Qd` header of every opaque bench payload: u64 seq, f64 send time
+/// (seconds since the Unix epoch), as in `benchmark/*_bench.py`.
+pub const RAW_HEADER_LEN: usize = 16;
+
+/// `robot-edge --bench send` sends a payload up to this size as one
+/// `DATAGRAM_TAG_BENCH_RAW` datagram, and a larger one as sensor slices
+/// (`crate::sensor`), through the same queue real sensor frames use.
+pub const BENCH_SLICE_THRESHOLD: usize = crate::sensor::DEFAULT_SLICE_PAYLOAD;
+
+/// Sensor id for sliced bench messages. Never advertised in
+/// SESSION_DESCRIBE, so a normal operator ignores it.
+pub const BENCH_SENSOR_ID: u8 = 0xFE;
+
+/// Element size for sliced bench messages: 17 elements to a 1,100-byte
+/// slice, like a depth map's row segments.
+pub const BENCH_ELEMENT_SIZE: usize = 64;
+
+/// An opaque bench payload of `payload_bytes` (at least `RAW_HEADER_LEN`):
+/// the seq/time header, then zero padding.
+pub fn raw_payload(seq: u64, payload_bytes: usize) -> Vec<u8> {
+    let mut out = vec![0u8; payload_bytes.max(RAW_HEADER_LEN)];
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    out[..8].copy_from_slice(&seq.to_be_bytes());
+    out[8..16].copy_from_slice(&now.to_be_bytes());
+    out
+}
+
+/// A sliced bench message's elements: `raw_payload` padded up to whole
+/// `BENCH_ELEMENT_SIZE` elements.
+pub fn sliced_payload(seq: u64, payload_bytes: usize) -> Vec<u8> {
+    let mut out = raw_payload(seq, payload_bytes);
+    out.resize(out.len().next_multiple_of(BENCH_ELEMENT_SIZE), 0);
+    out
 }
 
 /// Same method and output format as `benchmark/bench_stats.py`.
@@ -81,6 +121,20 @@ pub fn throughput_report(messages: u64, bytes: u64, elapsed_s: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_mode_parses() {
+        assert_eq!(BenchMode::parse("send"), Some(BenchMode::Send));
+    }
+
+    #[test]
+    fn bench_payloads_carry_seq_and_pad_to_size() {
+        let p = raw_payload(7, 64);
+        assert_eq!((p.len(), u64::from_be_bytes(p[..8].try_into().unwrap())), (64, 7));
+        assert_eq!(raw_payload(1, 4).len(), RAW_HEADER_LEN, "never shorter than the header");
+        assert_eq!(sliced_payload(1, 2_000).len(), 2_048);
+        assert_eq!(sliced_payload(1, 4_096).len(), 4_096);
+    }
 
     #[test]
     fn latency_summary_matches_bench_stats_py() {

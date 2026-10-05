@@ -32,7 +32,7 @@ use crate::sim_sensor::{self, SensorFrame, SensorRx, SimSensorKind};
 use roboprotocol_core::sensor::{slice_frame, SensorDescriptor, DEFAULT_SLICE_PAYLOAD, SLICE_HEADER_LEN};
 use crate::video::channel_a::VideoRx;
 use crate::video::{capture, channel_a};
-use roboprotocol_core::bench::{BenchMode, BENCH_ECHO_TICK_ID};
+use roboprotocol_core::bench::{self as bench_proto, BenchMode, BENCH_ECHO_TICK_ID};
 use roboprotocol_core::profile::RobotProfile;
 
 const MAX_DATAGRAM_SIZE: usize = 1452;
@@ -56,6 +56,8 @@ pub struct ServerArgs {
     pub recording: roboprotocol_recording::RecorderConfig,
     /// See `roboprotocol_core::bench`; `None` outside benchmarks.
     pub bench: Option<BenchMode>,
+    /// What `--bench send` sends; ignored by the other bench modes.
+    pub bench_send: BenchSendSpec,
     /// `--sim-sensor`: synthetic sensors to advertise and stream, in
     /// sensor-id order. Empty unless asked for.
     pub sim_sensors: Vec<SimSensorKind>,
@@ -65,6 +67,32 @@ pub struct ServerArgs {
     /// algorithm keeps it short, so control datagrams wait less in the
     /// network as well as in quiche (docs/12).
     pub cc: quiche::CongestionControlAlgorithm,
+}
+
+/// `--bench send`: paced messages from the robot to the operator.
+#[derive(Debug, Clone, Copy)]
+pub struct BenchSendSpec {
+    pub payload_bytes: usize,
+    pub rate_hz: f64,
+    pub duration_s: f64,
+}
+
+/// Progress of a `--bench send` run, which starts when the session reaches
+/// Operating.
+struct BenchSendState {
+    spec: BenchSendSpec,
+    start: Option<Instant>,
+    offered: u64,
+    skipped: u64,
+    done: bool,
+}
+
+impl BenchSendState {
+    /// Same `sent N messages over Ts` line as `operator-console --bench send`,
+    /// which `benchmark/run_wifi.py` parses.
+    fn report(&self, elapsed_s: f64) {
+        tracing::info!("bench send: sent {} messages over {elapsed_s:.2}s ({} skipped: datagram queue full)", self.offered, self.skipped);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,9 +218,18 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             recorder: recorder.clone(),
             bench: args.bench,
             bench_counter: BenchCounter::default(),
+            bench_send: (args.bench == Some(BenchMode::Send))
+                .then_some(BenchSendState { spec: args.bench_send, start: None, offered: 0, skipped: 0, done: false }),
         };
 
         let result = session.run(&socket, buf).await;
+        // The operator usually closes the session before the send duration
+        // is up; report what was sent by then.
+        if let Some(st) = session.bench_send.as_ref().filter(|st| !st.done) {
+            if let Some(start) = st.start {
+                st.report(start.elapsed().as_secs_f64());
+            }
+        }
         let lossy = session.lossy.stats();
         tracing::info!(
             video_nals_dropped = lossy.video_nals_dropped,
@@ -280,6 +317,7 @@ struct Session {
     recorder: roboprotocol_recording::Recorder,
     bench: Option<BenchMode>,
     bench_counter: BenchCounter,
+    bench_send: Option<BenchSendState>,
 }
 
 /// `--bench count` totals, logged cumulatively once a second from `on_tick`
@@ -332,6 +370,9 @@ impl Session {
         let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut ticker = tokio::time::interval(self.tick_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // `--bench send` pacing: each tick sends whatever is due by then.
+        let mut bench_ticker = tokio::time::interval(Duration::from_millis(1));
+        bench_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         self.flush(socket, &mut out).await?;
 
@@ -360,6 +401,10 @@ impl Session {
                 }
                 Some(event) = self.bridge.event_rx.recv() => {
                     self.on_bridge_event(event);
+                }
+                _ = bench_ticker.tick(), if self.phase == Phase::Operating && self.bench_send.as_ref().is_some_and(|b| !b.done) => {
+                    self.bench_send_step();
+                    self.flush(socket, &mut out).await?;
                 }
                 frames = recv_sensor_frames(&mut self.sensor_rx) => {
                     if self.phase == Phase::Operating {
@@ -747,7 +792,7 @@ impl Session {
                 // echo leaves in the same loop iteration the command arrived.
                 let _ = self.conn.dgram_send(&datagram::tag(datagram::DATAGRAM_TAG_CHANNEL_B, &bytes));
             }
-            BenchMode::Count => {
+            BenchMode::Count | BenchMode::Send => {
                 let c = &mut self.bench_counter;
                 c.first_rx.get_or_insert_with(Instant::now);
                 c.msgs += 1;
@@ -766,11 +811,51 @@ impl Session {
             BenchMode::Echo => {
                 let _ = self.conn.dgram_send(data);
             }
-            BenchMode::Count => {
+            BenchMode::Count | BenchMode::Send => {
                 let c = &mut self.bench_counter;
                 c.first_rx.get_or_insert_with(Instant::now);
                 c.msgs += 1;
                 c.bytes += (data.len() - 1) as u64;
+            }
+        }
+    }
+
+    /// Sends every `--bench send` message due by now (catching up, capped
+    /// per call, like `operator-console --bench send`). A payload up to
+    /// `BENCH_SLICE_THRESHOLD` is one bench datagram straight to quiche; a
+    /// larger one is sliced and queued in `self.lossy` like a real sensor
+    /// frame, so it is subject to the same latest-wins rule: a message not
+    /// fully sent before the next one is cut short and arrives incomplete.
+    fn bench_send_step(&mut self) {
+        let Some(st) = self.bench_send.as_mut() else { return };
+        let now = Instant::now();
+        let start = *st.start.get_or_insert(now);
+        let elapsed = now.duration_since(start).as_secs_f64();
+        let BenchSendSpec { payload_bytes, rate_hz, duration_s } = st.spec;
+        if elapsed >= duration_s {
+            st.done = true;
+            st.report(elapsed);
+            return;
+        }
+        let due = ((elapsed * rate_hz) as u64 + 1).min(st.offered + 256);
+        while st.offered < due {
+            let seq = st.offered;
+            st.offered += 1;
+            if payload_bytes <= bench_proto::BENCH_SLICE_THRESHOLD {
+                let d = datagram::tag(datagram::DATAGRAM_TAG_BENCH_RAW, &bench_proto::raw_payload(seq, payload_bytes));
+                if self.conn.dgram_send(&d).is_err() {
+                    st.skipped += 1;
+                }
+                continue;
+            }
+            let elements = bench_proto::sliced_payload(seq, payload_bytes);
+            match slice_frame(bench_proto::BENCH_SENSOR_ID, seq as u32, roboprotocol_core::timestamp::now_micros(), &elements, bench_proto::BENCH_ELEMENT_SIZE, DEFAULT_SLICE_PAYLOAD) {
+                Ok(datagrams) => self.lossy.push_sensor_frame(bench_proto::BENCH_SENSOR_ID, datagrams),
+                Err(e) => {
+                    tracing::warn!(error = %e, "bench send: cannot slice payload, stopping");
+                    st.done = true;
+                    return;
+                }
             }
         }
     }
