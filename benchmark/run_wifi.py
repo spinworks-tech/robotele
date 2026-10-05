@@ -31,6 +31,7 @@ Setup (see the run's README in the results directory for what was used):
 Usage: run_wifi.py [proto ...]    (default: all)
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -55,7 +56,8 @@ OPC = str(REPO / "target/release/operator-console")
 PI_RS = f"{PI_DIR}/target/release/proto-bench"
 PI_EDGE = f"{PI_DIR}/target/release/robot-edge"
 
-SIZES = [16, 1024, 4096, 16384, 65536, 262144, 1048576]
+SIZES = [int(x) for x in os.environ.get("SIZES", "16,1024,4096,16384,65536,262144,1048576").split(",")]
+SKIP_LATENCY = os.environ.get("SKIP_LATENCY") == "1"  # for a throughput-only rerun
 SLICE_THRESHOLD = 1100  # roboprotocol_core::bench::BENCH_SLICE_THRESHOLD
 MAX_SIZE = {"rs-udp": 65507, "rs-webrtc": 65535}
 RATES = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000]
@@ -210,10 +212,14 @@ def trial(proto, size, rate):
         r = subprocess.CompletedProcess(recv.args, recv.returncode, out, err)
         time.sleep(2)
     else:
+        # Sender runs 2 s longer than the others: the receiver counts only
+        # after a warmup (its subscription has to reach the publisher across
+        # the link first), and the window must still end inside the send.
         robot_log = pi_start(rs_args(proto, "send", "robot") + ["--payload-bytes", str(size), "--rate-hz", str(rate),
-                                                               "--duration-s", str(SEND_S)], "send")
-        time.sleep(WARMUP_S + 1)  # +1: ssh start-up
-        r = local(rs_args(proto, "recv", "operator") + ["--duration-s", str(WINDOW_S)], timeout=60)
+                                                               "--duration-s", str(SEND_S + 2)], "send")
+        time.sleep(1)  # ssh start-up
+        r = local(rs_args(proto, "recv", "operator") + ["--warmup-s", str(WARMUP_S + 0.5), "--duration-s", str(WINDOW_S)],
+                  timeout=60)
         time.sleep(2)
     sender = pi_read(robot_log)
     pi_stop()
@@ -286,7 +292,8 @@ def main():
     log(f"output: {OUT}  commit {meta['git']} ({meta['branch']})")
 
     log(f"== latency (64B, 2000 round trips, {LATENCY_RUNS} runs each; keeping the middle median)")
-    for proto in [p for p in LATENCY_PROTOS if p in PROTOS or p == "channel-b" and "channel-b-raw" in PROTOS]:
+    lat_protos = [] if SKIP_LATENCY else [p for p in LATENCY_PROTOS if p in PROTOS or p == "channel-b" and "channel-b-raw" in PROTOS]
+    for proto in lat_protos:
         runs = [latency(proto) for _ in range(LATENCY_RUNS)]
         results["latency_runs"][proto] = runs
         med = [float(m.group(1)) if (m := re.search(r"median RTT=([\d.]+)us", x)) else float("inf") for x in runs]

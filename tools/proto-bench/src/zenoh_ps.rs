@@ -88,7 +88,7 @@ pub async fn run(o: &Opts) -> Result<()> {
         Mode::Recv => {
             let msgs = Arc::new(AtomicU64::new(0));
             let bytes = Arc::new(AtomicU64::new(0));
-            let counting = Arc::new(AtomicBool::new(true));
+            let counting = Arc::new(AtomicBool::new(false));
             let (m, b, on) = (msgs.clone(), bytes.clone(), counting.clone());
             let _sub = z(session
                 .declare_subscriber(THROUGHPUT_TOPIC)
@@ -99,7 +99,11 @@ pub async fn run(o: &Opts) -> Result<()> {
                     }
                 })
                 .await)?;
-            eprintln!("listening on {THROUGHPUT_TOPIC} for {}s", o.duration_s);
+            eprintln!("listening on {THROUGHPUT_TOPIC} for {}s after {}s warmup", o.duration_s, o.warmup_s);
+            // The publisher only routes to subscribers it has heard about;
+            // over a real link that takes a while, so count after a warmup.
+            tokio::time::sleep(Duration::from_secs_f64(o.warmup_s)).await;
+            counting.store(true, Ordering::Relaxed);
             let start = Instant::now();
             tokio::time::sleep(Duration::from_secs_f64(o.duration_s)).await;
             counting.store(false, Ordering::Relaxed);

@@ -22,7 +22,8 @@
 //!   udp:     --host H --port P
 //!   zenoh:   --config FILE (JSON5; TLS/mTLS lives here, as in zenoh_bench.py)
 //!   mqtt:    --host H --port P [--tls --ca F --cert F --key F]
-//!   webrtc:  --host H --port P (signaling) [--listen|--connect] [--warmup-s N]
+//!   webrtc:  --host H --port P (signaling) [--listen|--connect]
+//!   recv:    [--warmup-s N] (zenoh, mqtt, webrtc: count only after N s; default 0)
 
 mod mqtt;
 mod udp;
@@ -83,7 +84,7 @@ fn parse() -> Result<(String, Opts)> {
         count: 1000,
         rate_hz: 1000.0,
         duration_s: 30.0,
-        warmup_s: 1.0,
+        warmup_s: 0.0,
         config: None,
         tls: false,
         ca: None,
