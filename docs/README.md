@@ -22,6 +22,7 @@ If you're new here, read in this order:
 | 11 | [Protocol Comparison](11-protocol-comparison.md) | Channel B vs MQTT, Zenoh, WebRTC and raw UDP on loopback: latency and throughput, native and Python clients, plaintext and mTLS |
 | 12 | [Control Under Load (plan)](12-control-under-load-benchmark.md) | Benchmark plan: control-loop latency while video saturates a shaped link, on two Raspberry Pis |
 | 13 | [Large Sensor Payloads (proposal)](13-large-sensor-payloads.md) | Proposal: carrying point clouds, lidar, radar and depth maps as loss-tolerant sensor slices, with bulk objects on Channel C |
+| 14 | [Protocol Comparison over Wi-Fi](14-protocol-comparison-wifi.md) | Doc 11 on real hardware: the robot's CM4 to an operator laptop over Wi-Fi, all protocols with mTLS, robot-to-operator throughput from 16 B to 1 MB |
 
 ## Repository map
 
