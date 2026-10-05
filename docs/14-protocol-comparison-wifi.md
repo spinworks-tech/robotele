@@ -6,6 +6,23 @@ talking over Wi-Fi through the same access point. It compares RoboProtocol's
 Channel B with Zenoh, MQTT and WebRTC, all with mutual TLS, plus raw UDP as
 the floor.
 
+## TL;DR
+
+- **Control messages: Channel B is the fastest encrypted option.** Its
+  median round trip over Wi-Fi is 2.0–2.2 ms, about 0.5 ms above
+  unencrypted raw UDP and about 4× faster than Zenoh or MQTT (8.4–8.8 ms).
+- **Turn off the operator laptop's Wi-Fi power saving.** With it on, every
+  UDP-based protocol's p95 jumps from about 5 ms to about 90 ms.
+- **Many small messages: batching wins.** At 16 B, Zenoh sustained 50,000
+  msg/s and Channel B 20,000, while raw UDP couldn't sustain 10,000.
+- **Bulk data: datagrams hit a ceiling on the CM4.** Channel B, WebRTC and
+  raw UDP all stopped at about 8–12 Mbps; MQTT over TCP reached 26 Mbps.
+  A full-rate lidar or depth stream doesn't fit until that ceiling is
+  raised.
+- **Large messages as slices deliver data, not whole messages.** At 1 MB,
+  all of the data arrived but only half the messages complete. That suits
+  point clouds; anything that must arrive whole needs reliable streams.
+
 Two things are new compared with doc 11:
 
 - **Throughput runs robot to operator.** The CM4 sends and the laptop
