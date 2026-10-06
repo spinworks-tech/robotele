@@ -237,6 +237,9 @@ def trial(proto, size, rate):
         m = re.search(r"quic: received (\d+) packets, sent (\d+)", r.stdout)
         if m:
             t["op_pkts_recv"], t["op_pkts_sent"] = int(m.group(1)), int(m.group(2))
+        m = re.search(r"delay above the minimum: p50=([\d.]+) p90=([\d.]+) p99=([\d.]+) ms", r.stdout)
+        if m:
+            t["delay_p50_ms"], t["delay_p90_ms"], t["delay_p99_ms"] = (float(x) for x in m.groups())
     return t
 
 

@@ -206,7 +206,13 @@ does today. So:
    datagrams, so Channel B waits behind at most 8 lossy datagrams.
 2. **The latest frame wins, per sensor.** When a new frame is ready and the
    previous one hasn't been fully handed to quiche, the rest of the old frame
-   is dropped. Channel A already does this for video.
+   is dropped. Channel A already does this for video. `robot-edge
+   --sensor-frame-policy finish` instead lets a started frame complete and
+   keeps only the newest frame waiting; on the CM4 that delivered more whole
+   256 KB frames but with a much longer delay tail, and made no measurable
+   difference at 16 and 64 KB
+   ([14 — Cut or finish](14-protocol-comparison-wifi.md#cut-or-finish-a-frame-the-link-cant-keep-up-with)).
+   Which suits a sensor should become a per-sensor setting.
 3. **Each sensor has a budget.** The robot advertises a maximum rate and
    bitrate per sensor. The operator picks a budget for each one in
    `SESSION_ACCEPT`, and can change it during the session with a
@@ -376,13 +382,14 @@ Remaining, in order (reordered after [the CM4 measurements](#measured-on-the-cm4
 1. Per-sensor budgets in `SessionAccept`, sized from quiche's delivery-rate
    estimate, and `SensorControl` to change them during a session. On the
    CM4 a single lidar or depth stream exceeds the link.
-2. Frames cut by link stalls. Full-size slices are done: at 256 KB they
-   reached 21 Mbps, level with raw UDP and TCP; ACKs cost only 10–20% extra
-   packets. At sensor frame rates (10–20 per second) the remaining limit
-   looks like the latest-wins queue cutting any frame still unsent when the
-   next arrives, which Wi-Fi stalls cause. Test letting a mostly-sent frame
-   finish. Batched sends (`sendmmsg`/GSO) save CPU but not packets on the
-   air, so they come later.
+2. Throughput on the CM4. Done: full-size slices (21 Mbps at 256 KB, level
+   with raw UDP and TCP), ACK cost measured (10–20% extra packets), and a
+   `finish` frame policy (whole frames at the cost of delay; no gain at
+   16–64 KB, where remaining loss is in the air). Next: make the frame
+   policy a per-sensor setting alongside the budgets. (5 GHz isn't an
+   option: the XGO-Lite's Wi-Fi only does 2.4 GHz.)
+   Batched sends (`sendmmsg`/GSO) save CPU but not packets on the air, so
+   they come later.
 3. Bulk objects: unidirectional-stream config, the object header,
    cancel-on-supersede. Whole messages need them: sliced 1 MB messages
    arrived complete only half the time.

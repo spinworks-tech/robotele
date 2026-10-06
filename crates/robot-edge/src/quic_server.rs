@@ -26,7 +26,7 @@ use crate::camera_control_handler;
 use crate::channel_b::{self, ChannelBCategory, ChannelBFrameData, TeleopCommand, ALL_REGIONS};
 use crate::hello_handler;
 use crate::safety_task::SafetyTask;
-use crate::lossy_queue::{LossyQueue, QUICHE_LOSSY_LIMIT};
+use crate::lossy_queue::{LossyQueue, SensorFramePolicy, QUICHE_LOSSY_LIMIT};
 use crate::session_handler;
 use crate::sim_sensor::{self, SensorFrame, SensorRx, SimSensorKind};
 use roboprotocol_core::sensor::{slice_frame, SensorDescriptor, DEFAULT_SLICE_PAYLOAD, SLICE_HEADER_LEN};
@@ -67,6 +67,8 @@ pub struct ServerArgs {
     /// bytes. Elements are always checked against 1,100 bytes
     /// (`DEFAULT_SLICE_PAYLOAD`), so any value from there up works.
     pub slice_payload_bytes: usize,
+    /// `--sensor-frame-policy`: see `SensorFramePolicy`.
+    pub sensor_frame_policy: SensorFramePolicy,
     /// `--cc`: congestion control for the robot's sending direction, where
     /// video and sensor data can saturate the uplink. quiche's default is
     /// CUBIC, which keeps a bottleneck's buffer nearly full; a delay-based
@@ -198,7 +200,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             sensors: sensors.iter().map(|(_, d)| d.clone()).collect(),
             selected_sensors: Vec::new(),
             sensor_rx,
-            lossy: LossyQueue::new(),
+            lossy: LossyQueue::with_sensor_policy(args.sensor_frame_policy),
             slice_payload_bytes: args.slice_payload_bytes,
             safety: SafetyTask::with_watchdog_threshold_ms(args.task_class, args.watchdog_threshold_ms, Instant::now()),
             bridge,
@@ -254,6 +256,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
         tracing::info!(
             video_nals_dropped = lossy.video_nals_dropped,
             sensor_frames_cut = lossy.sensor_frames_cut,
+            sensor_frames_skipped = lossy.sensor_frames_skipped,
             sensor_slices_dropped = lossy.sensor_slices_dropped,
             "lossy datagrams superseded before sending"
         );
