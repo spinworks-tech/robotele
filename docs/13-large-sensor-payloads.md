@@ -121,12 +121,15 @@ chunk header:
 | slice_index | u16 | *k* |
 | slice_count | u16 | *n* |
 
-That is 18 bytes, leaving up to about 1,180 bytes of slice payload within
-the 1,200-byte budget. The tables in this document assume 1,100 bytes, the
-same as Channel A's chunks, to leave room for per-slice compression framing.
-The sender sizes slices from `dgram_max_writable_len`, so
-slices grow automatically wherever path MTU discovery or jumbo frames allow
-bigger packets.
+That is 18 bytes. The tables in this document assume 1,100 bytes of slice
+payload, the same as Channel A's chunks, and every element must fit in
+1,100 bytes so a descriptor is valid on any path. The sender fills each
+slice as far as the connection allows (`dgram_max_writable_len`): on the
+CM4's 1,452-byte datagrams that's 21 elements of 64 bytes, 1,344 bytes per
+slice. Packets per second are what limit Wi-Fi from the CM4, so fuller
+slices carry more ([14 — Full-size slices on the CM4](14-protocol-comparison-wifi.md#full-size-slices-on-the-cm4)).
+`robot-edge --slice-payload-bytes` caps the size for a path with a smaller
+MTU.
 
 **Encodings.** Three are enough for v1:
 
@@ -373,12 +376,13 @@ Remaining, in order (reordered after [the CM4 measurements](#measured-on-the-cm4
 1. Per-sensor budgets in `SessionAccept`, sized from quiche's delivery-rate
    estimate, and `SensorControl` to change them during a session. On the
    CM4 a single lidar or depth stream exceeds the link.
-2. Raise Channel B's throughput from the CM4 (8–12 Mbps, against about
-   22 Mbps for full-size raw UDP or TCP). The limit is packets per second,
-   so: full-size slices (about 1,350 bytes, filling the 1,452-byte datagram
-   limit; larger still only with path MTU discovery), then measure QUIC's
-   acknowledgement traffic. Batched sends (`sendmmsg`/GSO) save CPU but not
-   packets on the air, so they come after.
+2. Frames cut by link stalls. Full-size slices are done: at 256 KB they
+   reached 21 Mbps, level with raw UDP and TCP; ACKs cost only 10–20% extra
+   packets. At sensor frame rates (10–20 per second) the remaining limit
+   looks like the latest-wins queue cutting any frame still unsent when the
+   next arrives, which Wi-Fi stalls cause. Test letting a mostly-sent frame
+   finish. Batched sends (`sendmmsg`/GSO) save CPU but not packets on the
+   air, so they come later.
 3. Bulk objects: unidirectional-stream config, the object header,
    cancel-on-supersede. Whole messages need them: sliced 1 MB messages
    arrived complete only half the time.

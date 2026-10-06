@@ -227,7 +227,17 @@ def trial(proto, size, rate):
         time.sleep(2)
     sender = pi_read(robot_log)
     pi_stop()
-    return score(proto, size, rate, sender, r.stdout)
+    t = score(proto, size, rate, sender, r.stdout)
+    if proto.startswith("channel-b"):
+        # QUIC's own counters: the robot's at session end, and what the
+        # operator received and sent back (almost all ACKs).
+        m = re.search(r"quic stats at session end sent=(\d+) recv=(\d+) lost=(\d+)", sender)
+        if m:
+            t["robot_pkts_sent"], t["robot_pkts_lost"] = int(m.group(1)), int(m.group(3))
+        m = re.search(r"quic: received (\d+) packets, sent (\d+)", r.stdout)
+        if m:
+            t["op_pkts_recv"], t["op_pkts_sent"] = int(m.group(1)), int(m.group(2))
+    return t
 
 
 def score(proto, size, rate, sender, recv_out):

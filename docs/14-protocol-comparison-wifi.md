@@ -236,10 +236,45 @@ cap it near 17 Mbps before any of that overhead, and it measured 8–12. So:
 - **Full-size slices** (about 1,350 bytes of payload, filling the 1,452-byte
   datagram limit) are worth about 20% more per packet.
 - **QUIC's acknowledgement traffic** is the next suspect for the rest of the
-  gap; it hasn't been measured.
+  gap.
 - **Batched sends (`sendmmsg`/GSO) are unlikely to help here.** They save
   system calls and CPU, but they put the same number of packets on the air,
   and the robot isn't dropping anything locally.
+
+### Full-size slices on the CM4
+
+`robot-edge` now fills each slice as far as the connection allows: 21
+elements of 64 bytes (1,344 bytes) per slice on this link, against 17
+(1,088 bytes) before. `--slice-payload-bytes` caps it for paths with a
+smaller MTU. `benchmark/slice_size_ab.py` (2026-10-06) compared the two over
+Wi-Fi, alternating them at each size, two rounds, laptop power saving off.
+Highest passing data rate:
+
+| Size | 1,100-byte slices, round 1 / 2 | Full-size slices, round 1 / 2 |
+| --- | --- | --- |
+| 16 KB | 6.6 / 6.6 Mbps | 6.6 / 6.6 Mbps |
+| 64 KB | 10.5 / 5.2 Mbps | 5.2 / 5.2 Mbps |
+| 256 KB | 4.2 / 10.5 Mbps | **10.5 / 21.0 Mbps** |
+
+- **At 256 KB, full-size slices passed one rate step higher in both rounds,**
+  reaching 21 Mbps with every message complete: twice doc 14's earlier
+  best, and level with full-size raw UDP and TCP on this link. They needed
+  12–19% fewer packets for the same data.
+- **At 16 and 64 KB there's no consistent difference;** the two rounds
+  differ more than the two variants. At those sizes a different limit
+  appears to apply: frames come every 10–50 ms, and the robot's
+  latest-wins queue cuts any frame still unsent when the next one arrives.
+  The link stalled longer than that about one ping in ten (p90 72 ms that
+  day), whatever the packet size. At 256 KB × 5–10 per second each frame has
+  100–200 ms, so bandwidth, and so packet count, is what limits it. This
+  reading fits the data but hasn't been tested directly.
+- **Acknowledgements cost 10–20% extra packets,** counted as packets the
+  operator sent per packet it received (heartbeats included). Over Wi-Fi
+  that's well below the one-in-three seen on loopback, so ACK frequency is
+  not a strong lever; quiche 0.22 doesn't support the QUIC ACK-frequency
+  extension anyway.
+- One 12-second network drop happened during round 2; the run paused and
+  carried on.
 
 ## Caveats
 
@@ -316,9 +351,11 @@ Turn the operator laptop's Wi-Fi power saving off first (`sudo iw dev
 
 ## Next steps
 
-1. **Full-size slices for Channel B,** then measure how much of the
-   remaining gap to raw UDP is QUIC's acknowledgement traffic (see
-   [Where the datagram ceiling is](#where-the-datagram-ceiling-is)).
+1. **Frames cut by link stalls.** For sensor-rate frames (10–20 per
+   second, like lidar and depth), the robot's latest-wins queue cuts frames
+   whenever Wi-Fi stalls longer than a frame period. Test whether letting a
+   mostly-sent frame finish, or measuring frame age instead of cutting on
+   arrival, delivers more usable frames.
 2. **5 GHz.** The ceiling is airtime and packet count on 2.4 GHz; the
    CM4 also supports 5 GHz, which has wider, less crowded channels.
 3. **Batched sends** (`sendmmsg`/GSO), as doc 11 planned, now lower
