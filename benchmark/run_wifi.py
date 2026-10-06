@@ -150,8 +150,13 @@ def rs_args(proto, mode, side):
     return args
 
 
+# Extra robot-edge flags for every Channel B run, e.g.
+# EDGE_EXTRA="--slice-payload-bytes 1100" to compare slice sizes.
+EDGE_EXTRA = os.environ.get("EDGE_EXTRA", "").split()
+
+
 def edge_args(mode, *extra):
-    return [PI_EDGE, "--listen", "0.0.0.0:4433", "--stub-bridge", "--bench", mode, "--zenoh-port", "17448",
+    return [PI_EDGE, *EDGE_EXTRA, "--listen", "0.0.0.0:4433", "--stub-bridge", "--bench", mode, "--zenoh-port", "17448",
             "--cert", f"{PI_CERTS}/robot/robot.crt", "--key", f"{PI_CERTS}/robot/robot.key",
             "--ca", f"{PI_CERTS}/dev-ca/ca.crt", *extra]
 
@@ -222,7 +227,17 @@ def trial(proto, size, rate):
         time.sleep(2)
     sender = pi_read(robot_log)
     pi_stop()
-    return score(proto, size, rate, sender, r.stdout)
+    t = score(proto, size, rate, sender, r.stdout)
+    if proto.startswith("channel-b"):
+        # QUIC's own counters: the robot's at session end, and what the
+        # operator received and sent back (almost all ACKs).
+        m = re.search(r"quic stats at session end sent=(\d+) recv=(\d+) lost=(\d+)", sender)
+        if m:
+            t["robot_pkts_sent"], t["robot_pkts_lost"] = int(m.group(1)), int(m.group(3))
+        m = re.search(r"quic: received (\d+) packets, sent (\d+)", r.stdout)
+        if m:
+            t["op_pkts_recv"], t["op_pkts_sent"] = int(m.group(1)), int(m.group(2))
+    return t
 
 
 def score(proto, size, rate, sender, recv_out):

@@ -330,6 +330,10 @@ async fn recv(link: &mut Link<'_>, warmup_s: f64, duration_s: f64, mut heartbeat
         tally.partial, stats.frames_superseded
     );
     eprintln!("{} slice bytes received in the window", tally.slice_bytes);
+    // During a robot -> operator run almost everything this end sends is an
+    // acknowledgement, so `sent` against `recv` is the ACK cost on the air.
+    let quic = link.conn.stats();
+    eprintln!("quic: received {} packets, sent {} (heartbeats and ACKs), lost {}", quic.recv, quic.sent, quic.lost);
     println!("{} msgs, {} bytes in {duration_s:.2}s", tally.msgs, tally.bytes);
     Ok(())
 }
