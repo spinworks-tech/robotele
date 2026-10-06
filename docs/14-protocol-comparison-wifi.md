@@ -384,11 +384,15 @@ Turn the operator laptop's Wi-Fi power saving off first (`sudo iw dev
 
 ## Next steps
 
-1. **5 GHz.** The ceiling is airtime and packet count on 2.4 GHz; the
-   CM4 also supports 5 GHz, which has wider, less crowded channels.
-2. **Batched sends** (`sendmmsg`/GSO), as doc 11 planned, now lower
-   priority: they save CPU on the robot, not packets on the air.
+1. **Control under load** ([12](12-control-under-load-benchmark.md)), on
+   this same setup: a paced 50 Hz control loop while camera and sensors
+   fill the uplink.
+2. **Per-sensor budgets** ([13](13-large-sensor-payloads.md)): on this
+   robot a single full-rate lidar or depth stream exceeds the link.
 3. **Bulk objects** ([13](13-large-sensor-payloads.md)), for large messages
    that must arrive whole.
-4. **Control under load** ([12](12-control-under-load-benchmark.md)), on
-   this same setup.
+4. **Batched sends** (`sendmmsg`/GSO), as doc 11 planned, now lower
+   priority: they save CPU on the robot, not packets on the air.
+
+5 GHz would relieve the 2.4 GHz airtime limit, but the XGO-Lite's Wi-Fi
+doesn't support it (tried), so every result here stands for this robot.

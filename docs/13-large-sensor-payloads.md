@@ -386,7 +386,8 @@ Remaining, in order (reordered after [the CM4 measurements](#measured-on-the-cm4
    with raw UDP and TCP), ACK cost measured (10–20% extra packets), and a
    `finish` frame policy (whole frames at the cost of delay; no gain at
    16–64 KB, where remaining loss is in the air). Next: make the frame
-   policy a per-sensor setting alongside the budgets, and try 5 GHz.
+   policy a per-sensor setting alongside the budgets. (5 GHz isn't an
+   option: the XGO-Lite's Wi-Fi only does 2.4 GHz.)
    Batched sends (`sendmmsg`/GSO) save CPU but not packets on the air, so
    they come later.
 3. Bulk objects: unidirectional-stream config, the object header,
