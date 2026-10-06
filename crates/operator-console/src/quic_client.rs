@@ -561,7 +561,12 @@ impl Client {
                 self.hud.disconnected_at = Some(std::time::Instant::now());
                 self.hud.reconnect_attempts = 0;
                 self.console.render(&self.hud);
-                tracing::warn!("connection closed/lost");
+                // The robot says why when it closes on purpose (e.g.
+                // "robot-edge shutting down"); otherwise the link was lost.
+                match self.conn.peer_error() {
+                    Some(e) => tracing::warn!(reason = %String::from_utf8_lossy(&e.reason), code = e.error_code, "connection closed by the robot"),
+                    None => tracing::warn!("connection closed/lost"),
+                }
                 if self.input.is_none() {
                     // Headless (e.g. scripts/smoke_test.sh): no human is
                     // watching a TUI for this, and automation expects the
