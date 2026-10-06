@@ -66,6 +66,7 @@ struct Cli {
     /// `--sim-sensor`, repeatable: synthetic sensors (docs/13).
     sim_sensors: Vec<sim_sensor::SimSensorKind>,
     cc: quiche::CongestionControlAlgorithm,
+    slice_payload_bytes: usize,
 }
 
 /// Maps a `--record` list entry to a category. `robot-edge` has no
@@ -118,6 +119,7 @@ impl Cli {
         let mut bench_send = quic_server::BenchSendSpec { payload_bytes: 64, rate_hz: 1_000.0, duration_s: 10.0 };
         let mut sim_sensors = Vec::new();
         let mut cc = quiche::CongestionControlAlgorithm::CUBIC;
+        let mut slice_payload_bytes = 0usize;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -170,6 +172,7 @@ impl Cli {
                     let kind = it.next().context("--sim-sensor needs a value (cloud|lidar|radar|depth)")?;
                     sim_sensors.push(sim_sensor::SimSensorKind::parse(&kind).with_context(|| format!("unknown --sim-sensor {kind}, expected cloud|lidar|radar|depth"))?);
                 }
+                "--slice-payload-bytes" => slice_payload_bytes = it.next().context("--slice-payload-bytes needs a value")?.parse()?,
                 "--cc" => {
                     let name = it.next().context("--cc needs a value (reno|cubic|bbr|bbr2)")?;
                     cc = name.parse().map_err(|_| anyhow::anyhow!("unknown --cc {name}, expected reno|cubic|bbr|bbr2"))?;
@@ -187,7 +190,8 @@ impl Cli {
                          [--bench echo|count|send]   (benchmark only; requires --stub-bridge)\n  \
                          [--bench-payload-bytes N] [--bench-rate-hz N] [--bench-duration-s N]   (--bench send)\n  \
                          [--sim-sensor cloud|lidar|radar|depth]...   (synthetic sensors, repeatable)\n  \
-                         [--cc reno|cubic|bbr|bbr2]   (congestion control, default cubic)"
+                         [--cc reno|cubic|bbr|bbr2]   (congestion control, default cubic)\n  \
+                         [--slice-payload-bytes N]   (sensor slice payload; default 0 = as large as the connection allows)"
                     );
                     std::process::exit(0);
                 }
@@ -232,6 +236,7 @@ impl Cli {
             bench_send,
             sim_sensors,
             cc,
+            slice_payload_bytes,
         })
     }
 
@@ -320,6 +325,7 @@ async fn main() -> Result<()> {
         bench_send: cli.bench_send,
         sim_sensors: cli.sim_sensors,
         cc: cli.cc,
+        slice_payload_bytes: cli.slice_payload_bytes,
     };
 
     let profile = xgo_profile::xgo_lite_v2_profile();

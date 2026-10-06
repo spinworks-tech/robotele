@@ -61,6 +61,12 @@ pub struct ServerArgs {
     /// `--sim-sensor`: synthetic sensors to advertise and stream, in
     /// sensor-id order. Empty unless asked for.
     pub sim_sensors: Vec<SimSensorKind>,
+    /// `--slice-payload-bytes`: payload bytes per sensor slice. 0 (the
+    /// default) fills each datagram as far as the connection allows; a
+    /// smaller value suits paths whose MTU is below the configured 1,452
+    /// bytes. Elements are always checked against 1,100 bytes
+    /// (`DEFAULT_SLICE_PAYLOAD`), so any value from there up works.
+    pub slice_payload_bytes: usize,
     /// `--cc`: congestion control for the robot's sending direction, where
     /// video and sensor data can saturate the uplink. quiche's default is
     /// CUBIC, which keeps a bottleneck's buffer nearly full; a delay-based
@@ -193,6 +199,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             selected_sensors: Vec::new(),
             sensor_rx,
             lossy: LossyQueue::new(),
+            slice_payload_bytes: args.slice_payload_bytes,
             safety: SafetyTask::with_watchdog_threshold_ms(args.task_class, args.watchdog_threshold_ms, Instant::now()),
             bridge,
             video_rx,
@@ -223,6 +230,19 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
         };
 
         let result = session.run(&socket, buf).await;
+        let quic = session.conn.stats();
+        let path = session.conn.path_stats().next();
+        tracing::info!(
+            sent = quic.sent,
+            recv = quic.recv,
+            lost = quic.lost,
+            retrans = quic.retrans,
+            sent_bytes = quic.sent_bytes,
+            rtt_ms = path.as_ref().map(|p| p.rtt.as_secs_f64() * 1e3),
+            cwnd = path.as_ref().map(|p| p.cwnd),
+            pmtu = path.as_ref().map(|p| p.pmtu),
+            "quic stats at session end"
+        );
         // The operator usually closes the session before the send duration
         // is up; report what was sent by then.
         if let Some(st) = session.bench_send.as_ref().filter(|st| !st.done) {
@@ -260,6 +280,7 @@ struct Session {
     /// Video chunks and sensor slices waiting to enter quiche's datagram
     /// queue -- see `lossy_queue` for why they don't go there directly.
     lossy: LossyQueue,
+    slice_payload_bytes: usize,
     safety: SafetyTask,
     bridge: BridgeSupervisor,
     /// See `channel_a`'s module doc: SPS/PPS/IDR NALs are always
@@ -657,11 +678,7 @@ impl Session {
     /// Queues each selected sensor's latest frame as slices (tag 0x04) in
     /// `self.lossy`, which `flush` feeds to quiche.
     fn send_sensor_frames(&mut self, frames: Vec<SensorFrame>) {
-        // Capped at the default (Channel A's chunk size) until path MTU
-        // discovery is enabled; doc 13 lets slices grow beyond it later.
-        let Some(max_payload) = self.conn.dgram_max_writable_len().map(|n| n.saturating_sub(1 + SLICE_HEADER_LEN).min(DEFAULT_SLICE_PAYLOAD)) else {
-            return;
-        };
+        let Some(max_payload) = self.slice_payload() else { return };
         for frame in frames {
             if !self.selected_sensors.contains(&frame.sensor_id) {
                 continue;
@@ -678,6 +695,19 @@ impl Session {
             };
             self.lossy.push_sensor_frame(frame.sensor_id, datagrams);
         }
+    }
+
+    /// Slice payload size for this connection: as much of each datagram as
+    /// the connection allows (on CM4 Wi-Fi, packets per second are the
+    /// limit, so fuller packets carry more; docs/14), or the configured
+    /// `--slice-payload-bytes` if smaller. Never below `DEFAULT_SLICE_PAYLOAD`
+    /// unless the connection itself allows less.
+    fn slice_payload(&self) -> Option<usize> {
+        let max = self.conn.dgram_max_writable_len()?.saturating_sub(1 + SLICE_HEADER_LEN);
+        Some(match self.slice_payload_bytes {
+            0 => max,
+            n => n.max(DEFAULT_SLICE_PAYLOAD).min(max),
+        })
     }
 
     /// Moves lossy datagrams into quiche while its queue is below
@@ -827,6 +857,7 @@ impl Session {
     /// frame, so it is subject to the same latest-wins rule: a message not
     /// fully sent before the next one is cut short and arrives incomplete.
     fn bench_send_step(&mut self) {
+        let slice_payload = self.slice_payload();
         let Some(st) = self.bench_send.as_mut() else { return };
         let now = Instant::now();
         let start = *st.start.get_or_insert(now);
@@ -849,7 +880,8 @@ impl Session {
                 continue;
             }
             let elements = bench_proto::sliced_payload(seq, payload_bytes);
-            match slice_frame(bench_proto::BENCH_SENSOR_ID, seq as u32, roboprotocol_core::timestamp::now_micros(), &elements, bench_proto::BENCH_ELEMENT_SIZE, DEFAULT_SLICE_PAYLOAD) {
+            let Some(max_payload) = slice_payload else { return };
+            match slice_frame(bench_proto::BENCH_SENSOR_ID, seq as u32, roboprotocol_core::timestamp::now_micros(), &elements, bench_proto::BENCH_ELEMENT_SIZE, max_payload) {
                 Ok(datagrams) => self.lossy.push_sensor_frame(bench_proto::BENCH_SENSOR_ID, datagrams),
                 Err(e) => {
                     tracing::warn!(error = %e, "bench send: cannot slice payload, stopping");

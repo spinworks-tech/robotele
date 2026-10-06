@@ -150,8 +150,13 @@ def rs_args(proto, mode, side):
     return args
 
 
+# Extra robot-edge flags for every Channel B run, e.g.
+# EDGE_EXTRA="--slice-payload-bytes 1100" to compare slice sizes.
+EDGE_EXTRA = os.environ.get("EDGE_EXTRA", "").split()
+
+
 def edge_args(mode, *extra):
-    return [PI_EDGE, "--listen", "0.0.0.0:4433", "--stub-bridge", "--bench", mode, "--zenoh-port", "17448",
+    return [PI_EDGE, *EDGE_EXTRA, "--listen", "0.0.0.0:4433", "--stub-bridge", "--bench", mode, "--zenoh-port", "17448",
             "--cert", f"{PI_CERTS}/robot/robot.crt", "--key", f"{PI_CERTS}/robot/robot.key",
             "--ca", f"{PI_CERTS}/dev-ca/ca.crt", *extra]
 
