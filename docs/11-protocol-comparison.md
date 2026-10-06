@@ -1,5 +1,7 @@
 # Protocol comparison: RoboProtocol Channel B vs MQTT, Zenoh and WebRTC (loopback)
 
+For the same comparison on real hardware over Wi-Fi, see [14 — Protocol comparison over Wi-Fi](14-protocol-comparison-wifi.md).
+
 This report compares RoboProtocol's teleop channel (Channel B: QUIC
 datagrams with mutual TLS) against three transports often used for robot
 teleoperation and telemetry (MQTT, Zenoh and WebRTC), with raw UDP as the

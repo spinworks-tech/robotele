@@ -17,7 +17,8 @@ fn connect(o: &Opts, role: &str) -> Result<(AsyncClient, EventLoop)> {
     let port = o.port.unwrap_or(if o.tls { 8883 } else { 1883 });
     let mut opts = MqttOptions::new(format!("proto-bench-{role}-{}", std::process::id()), o.host.clone(), port);
     opts.set_keep_alive(Duration::from_secs(30));
-    opts.set_max_packet_size(1 << 20, 1 << 20);
+    // 2 MiB: a 1 MiB payload plus the MQTT header must fit.
+    opts.set_max_packet_size(1 << 21, 1 << 21);
     if o.tls {
         let read = |p: &Option<String>, what: &str| -> Result<Vec<u8>> {
             let path = p.as_ref().with_context(|| format!("--tls needs --{what}"))?;
@@ -112,17 +113,21 @@ pub async fn run(o: &Opts) -> Result<()> {
         Mode::Recv => {
             let (client, mut events) = connect(o, "receiver")?;
             subscribe(&client, &mut events, THROUGHPUT_TOPIC).await?;
-            eprintln!("listening on {THROUGHPUT_TOPIC} for {}s", o.duration_s);
-            let start = Instant::now();
+            eprintln!("listening on {THROUGHPUT_TOPIC} for {}s after {}s warmup", o.duration_s, o.warmup_s);
+            // Polled through the warmup too (that drives the client); only
+            // counted after it.
+            let start = Instant::now() + Duration::from_secs_f64(o.warmup_s);
             let end = start + Duration::from_secs_f64(o.duration_s);
             let (mut msgs, mut bytes) = (0u64, 0u64);
             while let Ok(ev) = tokio::time::timeout(end.saturating_duration_since(Instant::now()), events.poll()).await {
                 if let Event::Incoming(Packet::Publish(p)) = ev? {
-                    msgs += 1;
-                    bytes += p.payload.len() as u64;
+                    if Instant::now() >= start {
+                        msgs += 1;
+                        bytes += p.payload.len() as u64;
+                    }
                 }
             }
-            print_throughput(msgs, bytes, start.elapsed());
+            print_throughput(msgs, bytes, Instant::now().saturating_duration_since(start));
             Ok(())
         }
     }

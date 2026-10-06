@@ -4,8 +4,9 @@
 document describes how RoboProtocol carries sensor data that doesn't fit in
 one QUIC datagram. Sensor slices, their negotiation, and a synthetic sensor
 source (`robot-edge --sim-sensor`) are implemented; per-sensor budgets,
-`SensorControl`, bulk objects and recording are not yet. See
-[Implementation work](#implementation-work).
+`SensorControl`, bulk objects and recording are not yet. First
+measurements on the robot's CM4 are in [Measured on the CM4](#measured-on-the-cm4);
+see [Implementation work](#implementation-work) for what remains.
 
 Today every RoboProtocol message is either one datagram (Channel B, at most
 1,200 bytes of payload) or a reliable stream (Channel C). Video is the one
@@ -276,6 +277,69 @@ redundancy that slicing doesn't need.
   mTLS, priorities, connection migration and recording. It stays an option
   for integrators, not the protocol's answer.
 
+## Measured on the CM4
+
+Sensor slices have now run on real hardware: the XGO-Lite's CM4 sending
+to an operator laptop over 2.4 GHz Wi-Fi. Two sets of measurements apply:
+
+- [14 — Protocol comparison over Wi-Fi](14-protocol-comparison-wifi.md):
+  synthetic payloads from 16 B to 1 MB, robot to operator, Channel B
+  against Zenoh, MQTT and WebRTC.
+- [12 — Results on the CM4 over Wi-Fi](12-control-under-load-benchmark.md#results-on-the-cm4-over-wi-fi):
+  the camera plus `--sim-sensor` lidar, depth and cloud at once.
+
+### The loss argument holds
+
+[Why not fragment and reassemble](#why-not-fragment-and-reassemble) predicts
+that a frame of *n* datagrams arrives intact with probability
+(1 − *p*)<sup>*n*</sup>. Measured, at rates the link carried:
+
+| Message | Slices | Data delivered | Messages complete |
+| --- | --- | --- | --- |
+| 16 KB × 20/s | 16 | ≥ 99.8% | 99.4% |
+| 64 KB × 10/s | 61 | ≥ 99.9% | 100% |
+| 256 KB × 5/s | 241 | ≥ 99.9% | 100% |
+| 1 MB × 1/s | 964 | ≥ 99.9% | 50% |
+
+At 1 MB, half the messages missed at least one of their 964 slices while
+essentially all of the data arrived. That implies roughly 0.07% datagram
+loss: (1 − 0.0007)<sup>964</sup> ≈ 0.5. It's a rough figure, based on
+about eight 1 MB messages in the counting window. A design that needed
+every fragment would have lost half those frames; with slices, each one
+was shown with a few points missing.
+
+### The bandwidth table doesn't fit this robot
+
+On the CM4, every datagram-based protocol topped out at about **8–12 Mbps**
+robot to operator: Channel B, WebRTC and unencrypted raw UDP alike. MQTT,
+over one TCP connection, reached 26 Mbps on the same link. A follow-up
+([14 — Where the datagram ceiling is](14-protocol-comparison-wifi.md#where-the-datagram-ceiling-is))
+found the CM4 sends about 2,000 packets per second whatever their size, so
+raw UDP with full-size 1,400-byte packets matches TCP at about 22 Mbps;
+Channel B's 1,100-byte slices and QUIC's overhead are what hold it lower.
+Against
+[How big the data is](#how-big-the-data-is):
+
+- **3D lidar (15.7 Mbps) or a 320 × 240 depth map (18.4 Mbps)** exceeds the
+  ceiling alone, before any video.
+- **The navigation cloud (5.6 Mbps)** fits, but with 2 Mbps of video it
+  is already near the bottom of that range.
+- **2D lidar and radar** (under 0.5 Mbps each) fit easily.
+
+With the camera plus sim lidar, depth and cloud together (about 40 Mbps
+offered), sensors kept their frame rates but arrived thin: about a third
+of each lidar and depth frame, and three quarters of each cloud frame. That
+is the latest-wins rule working, but it means per-sensor budgets are a
+requirement on this class of robot, not a refinement.
+
+### What the measurements don't cover yet
+
+- **Frame age at display,** and control latency while sensors load the
+  link: doc 12's benchmark with a sensor workload.
+- **Real sensor data.** Doc 14 used opaque payloads and the CM4 test used
+  `--sim-sensor`; no recorded lidar or depth data has gone through the
+  encodings yet.
+
 ## Implementation work
 
 Done:
@@ -304,19 +368,27 @@ Done:
 - The localhost smoke test streams sim lidar and radar and checks that
   both assemble.
 
-Remaining:
+Remaining, in order (reordered after [the CM4 measurements](#measured-on-the-cm4)):
 
-1. Per-sensor budgets in `SessionAccept`, and `SensorControl` to change them
-   during a session.
-2. A display (Rerun, which the DimOS work already uses, renders points and
-   depth images).
+1. Per-sensor budgets in `SessionAccept`, sized from quiche's delivery-rate
+   estimate, and `SensorControl` to change them during a session. On the
+   CM4 a single lidar or depth stream exceeds the link.
+2. Raise Channel B's throughput from the CM4 (8–12 Mbps, against about
+   22 Mbps for full-size raw UDP or TCP). The limit is packets per second,
+   so: full-size slices (about 1,350 bytes, filling the 1,452-byte datagram
+   limit; larger still only with path MTU discovery), then measure QUIC's
+   acknowledgement traffic. Batched sends (`sendmmsg`/GSO) save CPU but not
+   packets on the air, so they come after.
 3. Bulk objects: unidirectional-stream config, the object header,
-   cancel-on-supersede.
-4. Recording ([07](07-recording-and-replay.md)) and `replay-decode`
+   cancel-on-supersede. Whole messages need them: sliced 1 MB messages
+   arrived complete only half the time.
+4. A display (Rerun, which the DimOS work already uses, renders points and
+   depth images).
+5. Recording ([07](07-recording-and-replay.md)) and `replay-decode`
    support for the new tag.
-5. Slices larger than 1,100 bytes once path MTU discovery is enabled.
 6. Benchmark: add a sensor workload to doc 12's testbed and measure frame
-   completeness, age at display, and the effect on control round trips.
+   age at display and the effect on control round trips (completeness under
+   load is now measured; see above).
 
 ## Open questions
 

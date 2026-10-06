@@ -62,6 +62,7 @@ struct Cli {
     /// dispatching them -- see `roboprotocol_core::bench`. Requires
     /// `--stub-bridge`, since it bypasses actuation entirely.
     bench: Option<roboprotocol_core::bench::BenchMode>,
+    bench_send: quic_server::BenchSendSpec,
     /// `--sim-sensor`, repeatable: synthetic sensors (docs/13).
     sim_sensors: Vec<sim_sensor::SimSensorKind>,
     cc: quiche::CongestionControlAlgorithm,
@@ -114,6 +115,7 @@ impl Cli {
         let mut record_video_budget_mb = 16u64;
         let mut record_flush_secs = 2u64;
         let mut bench = None;
+        let mut bench_send = quic_server::BenchSendSpec { payload_bytes: 64, rate_hz: 1_000.0, duration_s: 10.0 };
         let mut sim_sensors = Vec::new();
         let mut cc = quiche::CongestionControlAlgorithm::CUBIC;
 
@@ -158,9 +160,12 @@ impl Cli {
                 "--record-video-budget-mb" => record_video_budget_mb = it.next().context("--record-video-budget-mb needs a value")?.parse()?,
                 "--record-flush-secs" => record_flush_secs = it.next().context("--record-flush-secs needs a value")?.parse()?,
                 "--bench" => {
-                    let mode = it.next().context("--bench needs a value (echo|count)")?;
-                    bench = Some(roboprotocol_core::bench::BenchMode::parse(&mode).with_context(|| format!("unknown --bench mode {mode}, expected echo|count"))?);
+                    let mode = it.next().context("--bench needs a value (echo|count|send)")?;
+                    bench = Some(roboprotocol_core::bench::BenchMode::parse(&mode).with_context(|| format!("unknown --bench mode {mode}, expected echo|count|send"))?);
                 }
+                "--bench-payload-bytes" => bench_send.payload_bytes = it.next().context("--bench-payload-bytes needs a value")?.parse()?,
+                "--bench-rate-hz" => bench_send.rate_hz = it.next().context("--bench-rate-hz needs a value")?.parse()?,
+                "--bench-duration-s" => bench_send.duration_s = it.next().context("--bench-duration-s needs a value")?.parse()?,
                 "--sim-sensor" => {
                     let kind = it.next().context("--sim-sensor needs a value (cloud|lidar|radar|depth)")?;
                     sim_sensors.push(sim_sensor::SimSensorKind::parse(&kind).with_context(|| format!("unknown --sim-sensor {kind}, expected cloud|lidar|radar|depth"))?);
@@ -179,7 +184,8 @@ impl Cli {
                          [--record-dir PATH] [--record video,command,telemetry,haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
                          [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n  \
-                         [--bench echo|count]   (benchmark only; requires --stub-bridge)\n  \
+                         [--bench echo|count|send]   (benchmark only; requires --stub-bridge)\n  \
+                         [--bench-payload-bytes N] [--bench-rate-hz N] [--bench-duration-s N]   (--bench send)\n  \
                          [--sim-sensor cloud|lidar|radar|depth]...   (synthetic sensors, repeatable)\n  \
                          [--cc reno|cubic|bbr|bbr2]   (congestion control, default cubic)"
                     );
@@ -223,6 +229,7 @@ impl Cli {
             record_video_budget_mb,
             record_flush_secs,
             bench,
+            bench_send,
             sim_sensors,
             cc,
         })
@@ -310,6 +317,7 @@ async fn main() -> Result<()> {
         }),
         recording,
         bench: cli.bench,
+        bench_send: cli.bench_send,
         sim_sensors: cli.sim_sensors,
         cc: cli.cc,
     };
