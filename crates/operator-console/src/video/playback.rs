@@ -34,7 +34,11 @@ use std::process::Stdio;
 use anyhow::Context;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{mpsc, watch};
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+
+use crate::video::gate::DeltaSlot;
 
 /// Writes text into a file `ffplay`'s own `drawtext` filter is watching
 /// (`reload=1`, re-read every frame) -- lets the operator console burn
@@ -76,7 +80,7 @@ fn escape_filter_value(s: &str) -> String {
 
 pub struct VideoTx {
     critical: mpsc::UnboundedSender<Vec<u8>>,
-    latest_delta: watch::Sender<Option<Vec<u8>>>,
+    latest_delta: Arc<DeltaSlot>,
 }
 
 impl VideoTx {
@@ -85,11 +89,17 @@ impl VideoTx {
     /// decides whether this NAL is always delivered or may be superseded
     /// by a later one. Errors are ignored -- a dropped receiver just
     /// means playback ended, not a session-safety event.
-    pub fn send(&self, bytes: Vec<u8>, is_critical: bool) {
+    ///
+    /// Returns `false` if a delta had to be discarded because ffplay hadn't
+    /// taken the previous one (see `DeltaSlot::offer`): the caller then
+    /// freezes deltas until the next IDR.
+    pub fn send(&self, bytes: Vec<u8>, is_critical: bool) -> bool {
         if is_critical {
+            self.latest_delta.clear();
             let _ = self.critical.send(bytes);
+            true
         } else {
-            let _ = self.latest_delta.send(Some(bytes));
+            self.latest_delta.offer(bytes)
         }
     }
 }
@@ -157,21 +167,29 @@ pub fn spawn_playback(ffplay_bin: &str, overlay: bool) -> anyhow::Result<(Child,
 
     let stdin = child.stdin.take().expect("piped stdin");
     let (critical_tx, critical_rx) = mpsc::unbounded_channel();
-    let (delta_tx, delta_rx) = watch::channel(None);
-    tokio::spawn(feed_playback(stdin, critical_rx, delta_rx));
-    Ok((child, VideoTx { critical: critical_tx, latest_delta: delta_tx }, overlay_handle))
+    let latest_delta = Arc::new(DeltaSlot::new());
+    tokio::spawn(feed_playback(stdin, critical_rx, latest_delta.clone()));
+    Ok((child, VideoTx { critical: critical_tx, latest_delta }, overlay_handle))
 }
 
-async fn feed_playback(mut stdin: ChildStdin, mut critical_rx: mpsc::UnboundedReceiver<Vec<u8>>, mut delta_rx: watch::Receiver<Option<Vec<u8>>>) {
+async fn feed_playback(mut stdin: ChildStdin, mut critical_rx: mpsc::UnboundedReceiver<Vec<u8>>, latest_delta: Arc<DeltaSlot>) {
     loop {
         let chunk = tokio::select! {
             biased;
-            Some(chunk) = critical_rx.recv() => chunk,
-            changed = delta_rx.changed() => {
-                if changed.is_err() {
-                    return; // sender dropped -- session ending
+            critical = critical_rx.recv() => match critical {
+                Some(chunk) => chunk,
+                None => return, // sender dropped -- session ending
+            },
+            _ = latest_delta.ready.notified() => {
+                // One wake-up can stand for several queued deltas: write
+                // them all, in order.
+                let mut chunk = Vec::new();
+                while let Some(delta) = latest_delta.take() {
+                    chunk.extend_from_slice(&delta);
                 }
-                let Some(chunk) = delta_rx.borrow_and_update().clone() else { continue };
+                if chunk.is_empty() {
+                    continue;
+                }
                 chunk
             }
         };
