@@ -18,6 +18,7 @@ pub mod interpolation;
 pub mod profile;
 pub mod recording;
 pub mod safety;
+pub mod sensor;
 pub mod sizing;
 pub mod timestamp;
 pub mod video;

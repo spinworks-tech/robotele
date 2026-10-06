@@ -1,8 +1,11 @@
 # Proposal: large sensor payloads (point clouds, lidar, radar, depth)
 
-**Status: proposal, not implemented.** This document proposes how
-RoboProtocol carries sensor data that doesn't fit in one QUIC datagram. It
-needs review before any code or schema changes.
+**Status: approved; sensor slices implemented, the rest pending.** This
+document describes how RoboProtocol carries sensor data that doesn't fit in
+one QUIC datagram. Sensor slices, their negotiation, and a synthetic sensor
+source (`robot-edge --sim-sensor`) are implemented; per-sensor budgets,
+`SensorControl`, bulk objects and recording are not yet. See
+[Implementation work](#implementation-work).
 
 Today every RoboProtocol message is either one datagram (Channel B, at most
 1,200 bytes of payload) or a reliable stream (Channel C). Video is the one
@@ -221,7 +224,7 @@ New, additive FlatBuffers fields, so older peers are unaffected:
 ```text
 SensorDescriptor                       (robot → operator, in SessionDescribe.sensors)
 ├── sensor_id, label
-├── kind: PointCloud | RangeImage | Radar | Depth
+├── kind: PointCloud | RangeImage | Depth   (radar: PointCloud with Doppler/SNR)
 ├── encoding fields: quantization scale, extra point fields
 ├── geometry: beam angles (range image) or intrinsics + size (depth)
 ├── mounting pose in the robot base frame
@@ -229,12 +232,20 @@ SensorDescriptor                       (robot → operator, in SessionDescribe.s
 
 SessionAccept                          (operator → robot)
 ├── selected_sensors: [sensor_id]
-└── sensor_budgets: [(sensor_id, hz, bitrate_kbps)]
+└── sensor_budgets: [(sensor_id, hz, bitrate_kbps)]   (not implemented yet)
 ```
 
 The robot sends slices only for sensors the operator selected. An operator
 built before this change never selects any, and ignores tag `0x04` if one
 arrives anyway.
+
+Sensor descriptors can push `SESSION_DESCRIBE` past one packet: a 64-beam
+lidar's elevation table alone is 256 bytes. The robot therefore ends
+`SESSION_DESCRIBE` with a FIN on stream 1, and receivers buffer stream 1
+until the FIN before decoding. Until this change, receivers decoded each
+read on its own, which broke (with a panic in the unverified FlatBuffers
+decoder) as soon as a describe spanned two packets. A receiver built with
+this change therefore needs a robot built with it too.
 
 ## Why not fragment and reassemble
 
@@ -269,28 +280,48 @@ redundancy that slicing doesn't need.
 
 ## Implementation work
 
-1. Doc 12's queue fix in `robot-edge` (a prerequisite, already planned).
-2. `roboprotocol-core::sensor`: slice header, the three encodings,
-   interleaving, and a bounded receiver modelled on `NalReassembler`.
-3. Schema: `SensorDescriptor`, the `SessionAccept` additions, `SensorControl`.
-4. `robot-edge`: per-sensor latest-frame-wins sending, with budgets.
-5. `operator-console`: frame assembly with deadlines, completeness stats, and
-   a display (Rerun, which the DimOS work already uses, renders points and
+Done:
+
+- `roboprotocol-core::sensor`: slice header, the three encodings,
+  interleaving, a bounded latest-wins `FrameAssembler` with deadlines, and
+  `SensorDescriptor` with validation.
+- Schema: `SensorDescriptor` in `SessionDescribe`, `selected_sensors` in
+  `SessionAccept`.
+- `robot-edge`: `--sim-sensor cloud|lidar|radar|depth`, which ray-casts a
+  small room (the reference robot has no lidar or depth sensor); per-sensor
+  latest-frame-wins sending; and an interim guard that skips a sensor frame
+  while quiche's datagram queue holds more than 64 datagrams.
+- `operator-console`: accepts every valid sensor, assembles and decodes
+  frames, and shows a row per sensor in the channels panel (slice rate,
+  bandwidth, frame rate, completeness, sample count).
+- `SESSION_DESCRIBE` ends with a FIN and is decoded whole (see
+  [Negotiation](#negotiation)).
+- Doc 02's tag table now lists `0x03`, `0x04` and `0x7F`.
+- The localhost smoke test streams sim lidar and radar and checks that
+  both assemble.
+
+Remaining:
+
+1. Doc 12's queue fix in `robot-edge`. The 64-datagram guard keeps sensor
+   frames from piling up, but a frame already queued still sits ahead of
+   Channel B telemetry.
+2. Per-sensor budgets in `SessionAccept`, and `SensorControl` to change them
+   during a session.
+3. A display (Rerun, which the DimOS work already uses, renders points and
    depth images).
-6. Bulk objects: unidirectional-stream config, the object header,
+4. Bulk objects: unidirectional-stream config, the object header,
    cancel-on-supersede.
-7. Recording ([07](07-recording-and-replay.md)) and `replay-decode`
+5. Recording ([07](07-recording-and-replay.md)) and `replay-decode`
    support for the new tag.
-8. Doc 02: add tag `0x04`, and also the `0x03` heartbeat and `0x7F` bench tags,
-   which are in the code but missing from the tag table.
-9. Benchmark: add a sensor workload to doc 12's testbed and measure frame
+6. Slices larger than 1,100 bytes once path MTU discovery is enabled.
+7. Benchmark: add a sensor workload to doc 12's testbed and measure frame
    completeness, age at display, and the effect on control round trips.
 
 ## Open questions
 
 - **Test data.** The XGO-Lite V2 reference robot has no lidar or depth
-  sensor. The first implementation needs a recorded dataset or a simulator
-  as its source.
+  sensor. `--sim-sensor` covers development; a recorded real-sensor dataset
+  is still needed to judge the encodings on real data.
 - **Compression.** Is per-slice compression worth it on ~1 KB slices, and
   which method (zstd with a dictionary, or a depth-specific codec such as
   RVL)?
