@@ -276,6 +276,39 @@ Highest passing data rate:
 - One 12-second network drop happened during round 2; the run paused and
   carried on.
 
+### Cut or finish a frame the link can't keep up with?
+
+When a new sensor frame arrives while the previous one is still partly
+unsent, `robot-edge` can either **cut** the old frame (drop its unsent
+slices; the default) or let it **finish** and keep only the newest frame
+waiting behind it (`--sensor-frame-policy finish`). `benchmark/frame_policy_ab.py`
+(2026-10-06) ran both at fixed rates near the limits found above,
+alternating them over 4 rounds. "Delay" is a complete message's arrival
+minus capture time, above the fastest in its run, so the clock offset
+between robot and laptop cancels. Medians over the 4 rounds:
+
+| Messages | Policy | Data delivered | Complete | Complete msgs/s | Delay p50 / p90 |
+| --- | --- | --- | --- | --- | --- |
+| 16 KB × 50/s | cut | 97.3% | 96.6% | 48.3 | 4.5 / 87 ms |
+| | finish | 99.3% | 99.3% | 49.6 | 3.1 / 64 ms |
+| 64 KB × 20/s | cut | 94.9% | 93.1% | 18.6 | 7.5 / 141 ms |
+| | finish | 91.3% | 91.6% | 18.4 | 9.4 / 133 ms |
+| 256 KB × 10/s | cut | 77.8% | 61.5% | 6.1 | 9.9 / 78 ms |
+| | finish | 78.1% | **78.1%** | **7.8** | 18.2 / **330 ms** |
+
+- **At 256 KB, finishing trades freshness for whole frames.** It delivered
+  28% more complete frames per second from the same total data, but its
+  p90 delay was 330 ms against 78 ms.
+- **At 16 and 64 KB the policy barely matters;** the differences are within
+  round-to-round variation. So at those sizes, cutting frames during link
+  stalls is *not* the main reason frames arrive incomplete, contrary to the
+  guess above. What's left is presumably packet loss in the air, which no
+  queueing policy can recover.
+- **Cut stays the default.** For teleoperation and navigation a frame's age
+  matters more than its completeness. Finish suits slow, large frames where
+  whole frames matter more, such as depth for 3D mapping, and belongs in
+  per-sensor settings once the session handshake carries them.
+
 ## Caveats
 
 - **The throughput runs had the laptop's Wi-Fi power saving on.** A
@@ -351,16 +384,11 @@ Turn the operator laptop's Wi-Fi power saving off first (`sudo iw dev
 
 ## Next steps
 
-1. **Frames cut by link stalls.** For sensor-rate frames (10–20 per
-   second, like lidar and depth), the robot's latest-wins queue cuts frames
-   whenever Wi-Fi stalls longer than a frame period. Test whether letting a
-   mostly-sent frame finish, or measuring frame age instead of cutting on
-   arrival, delivers more usable frames.
-2. **5 GHz.** The ceiling is airtime and packet count on 2.4 GHz; the
+1. **5 GHz.** The ceiling is airtime and packet count on 2.4 GHz; the
    CM4 also supports 5 GHz, which has wider, less crowded channels.
-3. **Batched sends** (`sendmmsg`/GSO), as doc 11 planned, now lower
+2. **Batched sends** (`sendmmsg`/GSO), as doc 11 planned, now lower
    priority: they save CPU on the robot, not packets on the air.
-4. **Bulk objects** ([13](13-large-sensor-payloads.md)), for large messages
+3. **Bulk objects** ([13](13-large-sensor-payloads.md)), for large messages
    that must arrive whole.
-5. **Control under load** ([12](12-control-under-load-benchmark.md)), on
+4. **Control under load** ([12](12-control-under-load-benchmark.md)), on
    this same setup.
