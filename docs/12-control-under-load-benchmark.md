@@ -29,34 +29,153 @@ real hardware, over a link that actually saturates.
 - **H3.** Above link capacity, the protocols that behave well get there by
   dropping video (lower frame rate or quality), not by delaying control.
 
-## Known gap in Channel B
+## Channel B datagram priority
 
-The test has to be able to show Channel B failing, because as shipped it may
-fail it:
+The test has to be able to show Channel B failing, because before the fix
+below it did.
 
-- **The application layer already avoids its own backlog.**
+### The gap
+
+- **The application layer already avoided its own backlog.**
   `robot-edge/src/video/channel_a.rs` coalesces video to the latest delta
   frame under backlog, while always sending SPS/PPS/IDR NAL units.
-  `robot-edge` never builds up an unbounded video queue of its own.
-- **The transport queue has no priority.** Once a video chunk is handed to
-  quiche with `dgram_send`, it joins one first-in-first-out datagram queue,
-  up to 4,096 datagrams deep (`enable_dgram(true, 4096, 4096)` in
-  `quic_server.rs`). Channel B telemetry shares that queue with no priority
-  over video. Only the E-Stop *stream* is prioritized.
+- **The transport queue has no priority.** A datagram handed to quiche with
+  `dgram_send` joins one first-in-first-out queue, up to 4,096 datagrams
+  deep (`enable_dgram(true, 4096, 4096)` in `quic_server.rs`). Channel B
+  telemetry shared that queue with video, and later with sensor slices
+  ([13](13-large-sensor-payloads.md)), with no priority. Only the E-Stop
+  *stream* is prioritized.
 - **The robot-to-operator direction is exposed.** On a 20 Mbps uplink,
-  4,096 full video datagrams (~1.4 KB each, about 5.6 MB) take about
-  2 seconds to drain, so telemetry and the benchmark echo can sit behind up
-  to 2 s of video. Commands travel the other way; they are affected only on
+  4,096 full datagrams (~1.4 KB each, about 5.6 MB) take about 2 seconds to
+  drain, so telemetry and the benchmark echo could sit behind up to 2 s of
+  lossy data. Commands travel the other way; they are affected only on
   shared-airtime links such as Wi-Fi, or through delayed ACKs.
 
-So the benchmark runs in two phases:
+### The fix
 
-1. **Baseline:** Channel B exactly as it ships.
-2. **With the fix:** `robot-edge` stops handing video to quiche once its
-   datagram queue passes a small threshold (`dgram_send_queue_len()` /
-   `dgram_send_queue_byte_size()`), and purges queued video
-   (`dgram_purge_outgoing`) when a Channel B frame needs to go out. This is
-   a protocol change and gets its own review.
+Video chunks and sensor slices no longer go to `dgram_send` directly. They
+wait in `robot-edge/src/lossy_queue.rs`, and `flush` tops quiche's queue up
+from there, before every packet, only while quiche holds fewer than 8
+datagrams. Channel B telemetry, heartbeat and bench echoes, and E-Stop
+datagrams still go straight to quiche, so they wait behind at most 8 lossy
+datagrams (about 4 ms at 20 Mbps).
+
+Holding lossy data outside quiche also lets stale data be dropped before it
+is sent:
+
+- **Video:** a delta NAL is dropped only once it has waited more than
+  150 ms; then every waiting delta goes and later deltas are skipped until
+  the next IDR, because each delta references the one before it and the
+  rest of the group of pictures would only decode as smear. A new IDR drops
+  everything older except the latest SPS and PPS. (The first version
+  dropped a waiting delta whenever a newer one arrived; on the CM4 that
+  smeared nearly half the video under load -- see below.)
+- **Sensors:** a new frame replaces the unsent slices of that sensor's
+  previous frame. Slices already sent still decode, as a thinner frame.
+- **Sharing:** video and sensors alternate one datagram at a time while both
+  are waiting, and sensors take turns among themselves.
+
+The plan above also proposed purging queued video
+(`dgram_purge_outgoing`) when a Channel B frame goes out. With quiche's
+queue capped at 8 lossy datagrams there is nothing worth purging, and a
+purge could throw away the chunks of an IDR.
+
+### First results, on a namespace link
+
+Before the Pi testbed exists, `benchmark/netns_load_test.sh` runs the same
+question on one machine: `robot-edge` and `operator-console` in two network
+namespaces joined by a veth pair, each direction shaped with `netem` to
+20 Mbps, 10 ms delay and a 100-packet queue. `robot-edge --bench echo` runs
+with sim lidar, depth and cloud (about 40 Mbps offered, twice the link), and
+`operator-console --bench pingpong` times 300 Channel B round trips. Release
+builds; the idle-link round trip is 20.9 ms.
+
+| Build | Median | p95 | p99 | Pings lost | Uplink used |
+| --- | --- | --- | --- | --- | --- |
+| Before the fix | 102.3 ms | 134.4 ms | 152.0 ms | 3 of 300 | -- |
+| With the fix (CUBIC) | 53.7 ms | 58.9 ms | 59.2 ms | 0 of 300 | 19.8 Mbps |
+
+The remaining ~33 ms above the idle round trip is the bottleneck's own
+queue, which CUBIC, quiche's default congestion control, keeps nearly full.
+
+`robot-edge --cc` selects quiche's other algorithms. On the same link:
+
+| `--cc` | Median | p95 | p99 | Pings lost | Uplink used |
+| --- | --- | --- | --- | --- | --- |
+| `cubic` (default) | 54.1 ms | 58.9 ms | 59.3 ms | 1 | 19.8 Mbps |
+| `bbr` | 42.3 ms | 43.3 ms | 58.7 ms | 10 | 10.7 Mbps |
+| `bbr2` | 30.8 ms | 57.3 ms | 58.8 ms | 2 | 11.7 Mbps |
+
+BBR and BBRv2 lower latency mostly by using about half the link, and their
+tails vary between runs (a second `bbr2` run measured a 42 ms p95). One
+likely cause: `robot-edge` sends packets as soon as quiche produces them and
+ignores the pacing time quiche returns (`send_info.at`), which BBR relies
+on. CUBIC stays the default until pacing is honoured and the Pi testbed
+says otherwise.
+
+### Results on the CM4 over Wi-Fi
+
+`robot-edge` on the XGO-Lite's CM4 (OV5647 camera, 640x480, 30 fps, IDR
+every 30 frames, 2 Mbps), `operator-console` on a laptop, both on the same
+Wi-Fi network. Idle round trip: 3.2 ms median. Load: the camera plus sim
+lidar, depth and cloud, about 40 Mbps offered, well above what the CM4's
+Wi-Fi uplink carries.
+
+**Video.** NAL ids traced end to end (temporary debug logging, not
+committed), 30 s per run. "Corrupted" counts delta frames that arrived after
+an earlier delta of their group of pictures was lost, so they decode as
+smear.
+
+| Run | NALs sent | Lost | Lost SPS/PPS/IDR | Deltas shown clean | Deltas shown corrupted |
+| --- | --- | --- | --- | --- | --- |
+| Camera only | 1,058 | 3 | 0 | -- | -- |
+| Under load, first rule (newer delta drops older) | 1,016 | 160 | 0 | 408 | 349 |
+| Under load, stale rule (150 ms, then skip to IDR) | 949 | 60 | 3 | 613 | 180 |
+
+Under load, sensors still arrived at close to their target rates, as
+thinner frames (about a third of each lidar and depth frame's slices, three
+quarters of the cloud's). Of the 60 NALs lost with the stale rule, 40 were
+skip-to-IDR runs (clean freezes) and 20 were scattered single losses from
+the saturated Wi-Fi link; those cause the remaining corruption. Only the
+receiver can turn those into freezes: the operator would stop feeding deltas
+to the decoder after a gap in NAL ids, until the next IDR. That is
+operator-side work, not yet done. (The operator's playback also keeps only
+the latest delta when deltas arrive faster than the decoder takes them,
+which drops about 60-70 deltas in 30 s even on an idle link, with the same
+smearing. Same fix.)
+
+**Channel B round trips** (`--bench pingpong`, 300 pings, camera plus the
+three sim sensors):
+
+| Build | Median | p95 | p99 | Pings lost |
+| --- | --- | --- | --- | --- |
+| Idle link | 3.2 ms | 5.9 ms | 7.0 ms | 0 |
+| Before the fix, run 1 | 123 ms | 402 ms | 594 ms | 5 |
+| Before the fix, run 2 | 212 ms | 369 ms | 657 ms | 11 |
+| With the fix, run 1 | 180 ms | 336 ms | 516 ms | 9 |
+| With the fix, run 2 | 135 ms | 388 ms | 557 ms | 9 |
+| With the fix, `--cc bbr2` | 483 ms | 969 ms | 989 ms | 245 |
+| With the fix, `--cc bbr2`, again | 327 ms | 877 ms | 955 ms | 250 |
+
+On Wi-Fi the fix makes no measurable difference to control latency: the
+runs differ more from each other than the builds do. Here the queue that
+grows is not quiche's but the one below it, in the CM4's Wi-Fi driver and
+the access point, which CUBIC keeps full. That is the queue the namespace
+test's netem buffer stood in for, and it is much deeper on real Wi-Fi.
+BBRv2 is far worse here: it lost over 80% of pings. Do not use `--cc bbr2`
+on Wi-Fi.
+
+Bringing control latency under load down on Wi-Fi therefore needs the robot
+to send less than the link carries -- doc 13's per-sensor budgets, sized
+from quiche's delivery-rate estimate -- or a shorter queue under quiche
+(for example `fq_codel` and a smaller transmit queue on the CM4's
+`wlan0`), or both. Those are the next experiments.
+
+So the Pi benchmark runs in two phases:
+
+1. **Baseline:** a build from before the fix (any commit before
+   `lossy_queue.rs`).
+2. **With the fix**, and with each `--cc` setting.
 
 Both phases get published. Showing only the "after" numbers would hide the
 very issue this benchmark exists to catch.
@@ -237,7 +356,8 @@ not passed. The robot still needs its camera.
 | Priority settings | `tools/proto-bench` | Zenoh `RealTime` for control and `DataLow` + `Drop` for video |
 | Cross-compiling for the Pis | `Cross.toml` exists | aarch64 builds of `robot-edge`, `operator-console`, `proto-bench` |
 | Matrix driver | `benchmark/run_under_load.py` | SSH, `tc` setup, collection |
-| Channel B datagram priority fix | `robot-edge/src/quic_server.rs` | Phase 2, separate review |
+| Channel B datagram priority fix | `robot-edge/src/lossy_queue.rs` | Done; see [Channel B datagram priority](#channel-b-datagram-priority) |
+| Honour quiche's pacing (`send_info.at`) | `robot-edge/src/quic_server.rs` | Needed before BBR/BBRv2 can be judged fairly |
 
 ## Open questions
 
