@@ -15,10 +15,12 @@ the floor.
   UDP-based protocol's p95 jumps from about 5 ms to about 90 ms.
 - **Many small messages: batching wins.** At 16 B, Zenoh sustained 50,000
   msg/s and Channel B 20,000, while raw UDP couldn't sustain 10,000.
-- **Bulk data: datagrams hit a ceiling on the CM4.** Channel B, WebRTC and
-  raw UDP all stopped at about 8–12 Mbps; MQTT over TCP reached 26 Mbps.
-  A full-rate lidar or depth stream doesn't fit until that ceiling is
-  raised.
+- **Bulk data: the CM4 sends about 2,000 packets per second, whatever
+  their size.** So bigger packets mean more throughput: raw UDP with
+  full-size 1,400-byte packets reached 22 Mbps, the same as TCP (21–26).
+  Channel B, with 1,100-byte slices and QUIC's overhead, stopped at about
+  8–12 Mbps. A full-rate lidar or depth stream doesn't fit until that gap
+  closes. See [Where the datagram ceiling is](#where-the-datagram-ceiling-is).
 - **Large messages as slices deliver data, not whole messages.** At 1 MB,
   all of the data arrived but only half the messages complete. That suits
   point clouds; anything that must arrive whole needs reliable streams.
@@ -44,8 +46,11 @@ Two things are new compared with doc 11:
   sustain even 10,000. Protocols that pack several small messages into one
   packet win on this link, where packets, not bytes, run out first.
 - **Large messages.** Datagram traffic from the CM4 (raw UDP, Channel B,
-  WebRTC) topped out at about 8–12 Mbps. MQTT over one TCP connection
-  reached 26 Mbps on the same link. The cause isn't isolated yet.
+  WebRTC) topped out at about 8–12 Mbps in these runs; MQTT over one TCP
+  connection reached 26 Mbps. A follow-up found the CM4 sends about 2,000
+  packets per second at any size, so full-size 1,400-byte UDP packets
+  reach about 22 Mbps, like TCP; the datagram protocols were sending
+  smaller packets ([Where the datagram ceiling is](#where-the-datagram-ceiling-is)).
 - **Channel B's sliced messages are loss-tolerant, not reliable.** It
   delivered 1 MB messages at 1 per second with all of the data accounted for
   in the scoring window, but only half of them arrived *complete*. A 1 MB
@@ -172,14 +177,11 @@ hold them instead. This was not tested.
   (about 12 Mbps of 1 KB datagrams) before the receiver fell behind. At
   16 B it couldn't sustain 10,000. Channel B reached 20,000 msg/s at 16 B
   because QUIC packs many small datagrams into one packet, and Zenoh and
-  MQTT batch similarly. Doc 11's planned batched sends (`sendmmsg`/GSO)
-  matter more on this hardware than on loopback.
+  MQTT batch similarly.
 - **TCP went further on large messages.** MQTT, on one TCP connection,
   passed at 26 Mbps with 16 KB messages. Every datagram-based protocol,
-  Channel B included, stayed at or below about 12 Mbps. Possible causes,
-  none tested yet: the CM4's Wi-Fi driver aggregating TCP better than UDP,
-  TCP offloads (GSO/TSO) that datagram sends don't get, and Channel B's
-  CUBIC window over a jittery link. This is the next thing to investigate.
+  Channel B included, stayed at or below about 12 Mbps here. A follow-up
+  test found why: [Where the datagram ceiling is](#where-the-datagram-ceiling-is).
 - **Channel B's results are uneven between neighbouring sizes.** 16 KB
   passed only at 20 msg/s (2.6 Mbps) while 4 KB passed 6.6 and 64 KB 5.2.
   Each rate was tried once (twice on failure) on a shared Wi-Fi channel; a
@@ -188,6 +190,56 @@ hold them instead. This was not tested.
   passing step means every message arrived whole. Channel B's sliced
   messages never retransmit; a passing step means at least 98% of the data
   arrived. These are different guarantees for different data.
+
+## Where the datagram ceiling is
+
+A follow-up test (`benchmark/udp_ceiling.py`, 2026-10-06) swept raw UDP at
+five packet sizes in both directions, finding the highest rate with at
+least 98% delivered. It counts everything received against everything
+sent, so it doesn't need the 8 s window or the 98% allowance for window
+edges above. For each robot-to-operator trial it also read the robot's
+interface and UDP counters.
+
+| Packet | Robot → operator | Operator → robot |
+| --- | --- | --- |
+| 64 B | 2,500 pkt/s · 1.3 Mbps | 8,000 pkt/s · 4.1 Mbps |
+| 256 B | 1,500 pkt/s · 3.1 Mbps | 2,000 pkt/s · 4.1 Mbps |
+| 512 B | 2,000 pkt/s · 8.2 Mbps | 3,000 pkt/s · 12.2 Mbps |
+| 1,024 B | 1,500 pkt/s · 12.3 Mbps | 1,000 pkt/s · 8.2 Mbps |
+| 1,400 B | **2,000 pkt/s · 22.4 Mbps** | 2,354 pkt/s · 26.4 Mbps (laptop's sending limit) |
+| TCP, one bulk stream | **20.9–25.7 Mbps** (3 runs) | – |
+
+- **The ceiling is packets, not bytes.** The robot sent about 1,500–2,500
+  packets per second at every size, so its throughput grows with packet
+  size, up to 22 Mbps at 1,400 B.
+- **Full-size UDP packets match TCP.** 22.4 Mbps against 21–26. TCP did not
+  get more out of the radio; it always sends full-size packets, and the
+  datagram protocols above mostly didn't.
+- **The robot drops nothing itself.** At every rate, including the ones
+  that failed, every packet left through its Wi-Fi interface: no interface
+  drops, no UDP send-buffer errors. Loss happens after it: in the air, at
+  the access point, or at the laptop.
+- **Small packets are limited on the robot's sending side.** The laptop
+  sent the robot 8,000 packets of 64 B per second cleanly; the robot
+  managed 2,500 the other way. One candidate is per-packet cost in the
+  CM4's Wi-Fi interface (the Wi-Fi chip sits on an SDIO bus), but this
+  hasn't been checked.
+- **The operator-to-robot column is noisy at middle sizes** (1,024 B
+  failed at 1,500 pkt/s while 1,400 B passed 2,354); each rate was run once,
+  twice on failure. Read it for the 64 B and 1,400 B rows only.
+
+**What this means for Channel B.** Its sliced payloads are 1,100 bytes, and
+QUIC adds its own header and the laptop's acknowledgement packets, which
+share the same half-duplex airtime. At ~2,000 packets/s, 1,100-byte slices
+cap it near 17 Mbps before any of that overhead, and it measured 8–12. So:
+
+- **Full-size slices** (about 1,350 bytes of payload, filling the 1,452-byte
+  datagram limit) are worth about 20% more per packet.
+- **QUIC's acknowledgement traffic** is the next suspect for the rest of the
+  gap; it hasn't been measured.
+- **Batched sends (`sendmmsg`/GSO) are unlikely to help here.** They save
+  system calls and CPU, but they put the same number of packets on the air,
+  and the robot isn't dropping anything locally.
 
 ## Caveats
 
@@ -264,11 +316,14 @@ Turn the operator laptop's Wi-Fi power saving off first (`sudo iw dev
 
 ## Next steps
 
-1. **Find the datagram ceiling.** Raw UDP from the CM4 stops near
-   1,000–1,500 packets per second, while TCP reaches twice the throughput.
-   Look at the Wi-Fi driver's handling of UDP, and at UDP GSO.
-2. **Batched sends for Channel B** (`sendmmsg`/GSO), as doc 11 planned.
-3. **Bulk objects** ([13](13-large-sensor-payloads.md)), for large messages
+1. **Full-size slices for Channel B,** then measure how much of the
+   remaining gap to raw UDP is QUIC's acknowledgement traffic (see
+   [Where the datagram ceiling is](#where-the-datagram-ceiling-is)).
+2. **5 GHz.** The ceiling is airtime and packet count on 2.4 GHz; the
+   CM4 also supports 5 GHz, which has wider, less crowded channels.
+3. **Batched sends** (`sendmmsg`/GSO), as doc 11 planned, now lower
+   priority: they save CPU on the robot, not packets on the air.
+4. **Bulk objects** ([13](13-large-sensor-payloads.md)), for large messages
    that must arrive whole.
-4. **Control under load** ([12](12-control-under-load-benchmark.md)), on
+5. **Control under load** ([12](12-control-under-load-benchmark.md)), on
    this same setup.

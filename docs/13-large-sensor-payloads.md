@@ -312,9 +312,12 @@ was shown with a few points missing.
 
 On the CM4, every datagram-based protocol topped out at about **8–12 Mbps**
 robot to operator: Channel B, WebRTC and unencrypted raw UDP alike. MQTT,
-over one TCP connection, reached 26 Mbps on the same link, so the limit is
-specific to datagram traffic rather than the radio's capacity; where it
-sits (driver, aggregation, access point) isn't isolated yet. Against
+over one TCP connection, reached 26 Mbps on the same link. A follow-up
+([14 — Where the datagram ceiling is](14-protocol-comparison-wifi.md#where-the-datagram-ceiling-is))
+found the CM4 sends about 2,000 packets per second whatever their size, so
+raw UDP with full-size 1,400-byte packets matches TCP at about 22 Mbps;
+Channel B's 1,100-byte slices and QUIC's overhead are what hold it lower.
+Against
 [How big the data is](#how-big-the-data-is):
 
 - **3D lidar (15.7 Mbps) or a 320 × 240 depth map (18.4 Mbps)** exceeds the
@@ -370,9 +373,12 @@ Remaining, in order (reordered after [the CM4 measurements](#measured-on-the-cm4
 1. Per-sensor budgets in `SessionAccept`, sized from quiche's delivery-rate
    estimate, and `SensorControl` to change them during a session. On the
    CM4 a single lidar or depth stream exceeds the link.
-2. Raise Channel B's datagram ceiling from the CM4 (8–12 Mbps against
-   26 Mbps for TCP): batched sends (`sendmmsg`/GSO), then slices larger than
-   1,100 bytes once path MTU discovery is enabled.
+2. Raise Channel B's throughput from the CM4 (8–12 Mbps, against about
+   22 Mbps for full-size raw UDP or TCP). The limit is packets per second,
+   so: full-size slices (about 1,350 bytes, filling the 1,452-byte datagram
+   limit; larger still only with path MTU discovery), then measure QUIC's
+   acknowledgement traffic. Batched sends (`sendmmsg`/GSO) save CPU but not
+   packets on the air, so they come after.
 3. Bulk objects: unidirectional-stream config, the object header,
    cancel-on-supersede. Whole messages need them: sliced 1 MB messages
    arrived complete only half the time.
