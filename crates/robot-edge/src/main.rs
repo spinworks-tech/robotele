@@ -67,6 +67,7 @@ struct Cli {
     sim_sensors: Vec<sim_sensor::SimSensorKind>,
     cc: quiche::CongestionControlAlgorithm,
     slice_payload_bytes: usize,
+    sensor_frame_policy: lossy_queue::SensorFramePolicy,
 }
 
 /// Maps a `--record` list entry to a category. `robot-edge` has no
@@ -120,6 +121,7 @@ impl Cli {
         let mut sim_sensors = Vec::new();
         let mut cc = quiche::CongestionControlAlgorithm::CUBIC;
         let mut slice_payload_bytes = 0usize;
+        let mut sensor_frame_policy = lossy_queue::SensorFramePolicy::Cut;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -172,6 +174,10 @@ impl Cli {
                     let kind = it.next().context("--sim-sensor needs a value (cloud|lidar|radar|depth)")?;
                     sim_sensors.push(sim_sensor::SimSensorKind::parse(&kind).with_context(|| format!("unknown --sim-sensor {kind}, expected cloud|lidar|radar|depth"))?);
                 }
+                "--sensor-frame-policy" => {
+                    let name = it.next().context("--sensor-frame-policy needs a value (cut|finish)")?;
+                    sensor_frame_policy = lossy_queue::SensorFramePolicy::parse(&name).with_context(|| format!("unknown --sensor-frame-policy {name}, expected cut|finish"))?;
+                }
                 "--slice-payload-bytes" => slice_payload_bytes = it.next().context("--slice-payload-bytes needs a value")?.parse()?,
                 "--cc" => {
                     let name = it.next().context("--cc needs a value (reno|cubic|bbr|bbr2)")?;
@@ -191,7 +197,8 @@ impl Cli {
                          [--bench-payload-bytes N] [--bench-rate-hz N] [--bench-duration-s N]   (--bench send)\n  \
                          [--sim-sensor cloud|lidar|radar|depth]...   (synthetic sensors, repeatable)\n  \
                          [--cc reno|cubic|bbr|bbr2]   (congestion control, default cubic)\n  \
-                         [--slice-payload-bytes N]   (sensor slice payload; default 0 = as large as the connection allows)"
+                         [--slice-payload-bytes N]   (sensor slice payload; default 0 = as large as the connection allows)\n  \
+                         [--sensor-frame-policy cut|finish]   (new sensor frame vs a partly sent one; default cut)"
                     );
                     std::process::exit(0);
                 }
@@ -237,6 +244,7 @@ impl Cli {
             sim_sensors,
             cc,
             slice_payload_bytes,
+            sensor_frame_policy,
         })
     }
 
@@ -326,6 +334,7 @@ async fn main() -> Result<()> {
         sim_sensors: cli.sim_sensors,
         cc: cli.cc,
         slice_payload_bytes: cli.slice_payload_bytes,
+        sensor_frame_policy: cli.sensor_frame_policy,
     };
 
     let profile = xgo_profile::xgo_lite_v2_profile();

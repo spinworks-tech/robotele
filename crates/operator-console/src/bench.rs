@@ -259,19 +259,35 @@ struct RecvTally {
     /// its message completed -- the data a loss-tolerant consumer (a point
     /// cloud display) actually gets.
     slice_bytes: u64,
+    /// Arrival minus robot capture time for each complete message, in µs.
+    /// The two clocks aren't synchronized, so only differences between these
+    /// mean anything: see `delay_report`.
+    delays_us: Vec<i64>,
 }
 
 impl RecvTally {
-    fn frame(&mut self, f: &AssembledFrame, in_window: bool) {
+    fn frame(&mut self, f: &AssembledFrame, in_window: bool, now_us: u64) {
         if !in_window {
             return;
         }
         if f.is_complete() {
             self.msgs += 1;
             self.bytes += f.slices.iter().flatten().map(|s| s.len() as u64).sum::<u64>();
+            self.delays_us.push(now_us as i64 - f.capture_time_us as i64);
         } else {
             self.partial += 1;
         }
+    }
+
+    /// Delay of complete messages above the fastest one in the window: a
+    /// fixed clock offset between robot and operator cancels out, leaving
+    /// the queueing and transmission delay that varies.
+    fn delay_report(&self) -> String {
+        let Some(&min) = self.delays_us.iter().min() else { return "no complete messages".to_string() };
+        let mut above: Vec<f64> = self.delays_us.iter().map(|&d| (d - min) as f64 / 1e3).collect();
+        above.sort_by(|a, b| a.total_cmp(b));
+        let pct = |p: f64| above[((above.len() - 1) as f64 * p).round() as usize];
+        format!("p50={:.1} p90={:.1} p99={:.1} ms (n={})", pct(0.5), pct(0.9), pct(0.99), above.len())
     }
 }
 
@@ -312,7 +328,7 @@ async fn recv(link: &mut Link<'_>, warmup_s: f64, duration_s: f64, mut heartbeat
                             tally.slice_bytes += slice.len() as u64;
                         }
                         for f in assembler.on_slice(header, slice, now_us) {
-                            tally.frame(&f, in_window);
+                            tally.frame(&f, in_window, now_us);
                         }
                     }
                 }
@@ -320,7 +336,7 @@ async fn recv(link: &mut Link<'_>, warmup_s: f64, duration_s: f64, mut heartbeat
             }
         }
         for f in assembler.poll(now_us) {
-            tally.frame(&f, in_window);
+            tally.frame(&f, in_window, now_us);
         }
         link.pump(next_heartbeat.min(hi)).await?;
     }
@@ -330,6 +346,7 @@ async fn recv(link: &mut Link<'_>, warmup_s: f64, duration_s: f64, mut heartbeat
         tally.partial, stats.frames_superseded
     );
     eprintln!("{} slice bytes received in the window", tally.slice_bytes);
+    eprintln!("complete-message delay above the minimum: {}", tally.delay_report());
     // During a robot -> operator run almost everything this end sends is an
     // acknowledgement, so `sent` against `recv` is the ACK cost on the air.
     let quic = link.conn.stats();

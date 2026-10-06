@@ -71,14 +71,58 @@ struct PendingNal {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct LossyStats {
     pub video_nals_dropped: u64,
+    /// `Cut`: frames whose unsent slices a newer frame replaced.
     pub sensor_frames_cut: u64,
+    /// `Finish`: frames dropped whole, before any slice was sent.
+    pub sensor_frames_skipped: u64,
     pub sensor_slices_dropped: u64,
+}
+
+/// What a sensor's queue does when a new frame arrives while the previous
+/// one isn't fully handed to quiche yet (`robot-edge --sensor-frame-policy`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SensorFramePolicy {
+    /// Replace whatever of the old frame is unsent: always the freshest data,
+    /// but a link stall longer than a frame period cuts frames short.
+    #[default]
+    Cut,
+    /// Let a frame that has started sending finish; keep only the newest of
+    /// the frames waiting behind it. Frames arrive whole, at most about one
+    /// frame period older.
+    Finish,
+}
+
+impl SensorFramePolicy {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "cut" => Some(Self::Cut),
+            "finish" => Some(Self::Finish),
+            _ => None,
+        }
+    }
+}
+
+/// One sensor's slices: the frame being sent, and under `Finish` at most
+/// one whole frame waiting behind it.
+#[derive(Default)]
+struct SensorQueue {
+    current: VecDeque<Vec<u8>>,
+    /// Some of `current` has gone to quiche already.
+    started: bool,
+    waiting: Option<Vec<Vec<u8>>>,
+}
+
+impl SensorQueue {
+    fn is_empty(&self) -> bool {
+        self.current.is_empty() && self.waiting.is_none()
+    }
 }
 
 #[derive(Default)]
 pub struct LossyQueue {
     video: VecDeque<PendingNal>,
-    sensors: BTreeMap<u8, VecDeque<Vec<u8>>>,
+    sensors: BTreeMap<u8, SensorQueue>,
+    sensor_policy: SensorFramePolicy,
     /// Set when a stale delta forced a drop: deltas are discarded until the
     /// next IDR, since they'd only decode as corrupted pictures.
     skip_deltas_until_idr: bool,
@@ -91,6 +135,10 @@ pub struct LossyQueue {
 impl LossyQueue {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_sensor_policy(sensor_policy: SensorFramePolicy) -> Self {
+        Self { sensor_policy, ..Self::default() }
     }
 
     pub fn stats(&self) -> LossyStats {
@@ -132,15 +180,35 @@ impl LossyQueue {
         }
     }
 
-    /// Queues one sensor frame's tagged slice datagrams, replacing whatever
-    /// is still unsent of that sensor's previous frame.
+    /// Queues one sensor frame's tagged slice datagrams, following the
+    /// queue's `SensorFramePolicy`.
     pub fn push_sensor_frame(&mut self, sensor_id: u8, datagrams: Vec<Vec<u8>>) {
-        let pending = self.sensors.entry(sensor_id).or_default();
-        if !pending.is_empty() {
-            self.stats.sensor_frames_cut += 1;
-            self.stats.sensor_slices_dropped += pending.len() as u64;
+        let q = self.sensors.entry(sensor_id).or_default();
+        let stats = &mut self.stats;
+        match self.sensor_policy {
+            SensorFramePolicy::Cut => {
+                if !q.current.is_empty() {
+                    stats.sensor_frames_cut += 1;
+                    stats.sensor_slices_dropped += q.current.len() as u64;
+                }
+                q.current = datagrams.into();
+                q.started = false;
+            }
+            SensorFramePolicy::Finish if q.current.is_empty() || !q.started => {
+                if !q.current.is_empty() {
+                    stats.sensor_frames_skipped += 1;
+                    stats.sensor_slices_dropped += q.current.len() as u64;
+                }
+                q.current = datagrams.into();
+                q.started = false;
+            }
+            SensorFramePolicy::Finish => {
+                if let Some(old) = q.waiting.replace(datagrams) {
+                    stats.sensor_frames_skipped += 1;
+                    stats.sensor_slices_dropped += old.len() as u64;
+                }
+            }
         }
-        *pending = datagrams.into();
     }
 
     /// The next datagram to hand to quiche, alternating between video and
@@ -176,7 +244,20 @@ impl LossyQueue {
             .find(|&id| after.is_none_or(|last| id > last))
             .or_else(|| self.sensors.iter().find(|(_, q)| !q.is_empty()).map(|(&id, _)| id))?;
         self.last_sensor = Some(next);
-        self.sensors.get_mut(&next)?.pop_front()
+        let q = self.sensors.get_mut(&next)?;
+        if q.current.is_empty() {
+            q.current = q.waiting.take()?.into();
+            q.started = false;
+        }
+        let slice = q.current.pop_front();
+        q.started = true;
+        if q.current.is_empty() {
+            if let Some(w) = q.waiting.take() {
+                q.current = w.into();
+                q.started = false;
+            }
+        }
+        slice
     }
 }
 
@@ -273,8 +354,31 @@ mod tests {
         q.push_sensor_frame(1, vec![vec![1], vec![2], vec![3]]);
         assert_eq!(q.pop(t0), Some(vec![1]));
         q.push_sensor_frame(1, vec![vec![4], vec![5]]);
-        assert_eq!(q.stats(), LossyStats { video_nals_dropped: 0, sensor_frames_cut: 1, sensor_slices_dropped: 2 });
+        assert_eq!(q.stats(), LossyStats { sensor_frames_cut: 1, sensor_slices_dropped: 2, ..LossyStats::default() });
         assert_eq!((q.pop(t0), q.pop(t0), q.pop(t0)), (Some(vec![4]), Some(vec![5]), None));
+    }
+
+    #[test]
+    fn finish_lets_a_started_frame_complete_and_keeps_only_the_newest_waiting() {
+        let t0 = Instant::now();
+        let mut q = LossyQueue::with_sensor_policy(SensorFramePolicy::Finish);
+        q.push_sensor_frame(1, vec![vec![1], vec![2], vec![3]]);
+        assert_eq!(q.pop(t0), Some(vec![1])); // frame 1 has started
+        q.push_sensor_frame(1, vec![vec![4], vec![5]]); // waits
+        q.push_sensor_frame(1, vec![vec![6], vec![7]]); // replaces the waiting one
+        let rest: Vec<_> = std::iter::from_fn(|| q.pop(t0)).collect();
+        assert_eq!(rest, vec![vec![2], vec![3], vec![6], vec![7]], "frame 1 finishes, then the newest frame");
+        assert_eq!(q.stats(), LossyStats { sensor_frames_skipped: 1, sensor_slices_dropped: 2, ..LossyStats::default() });
+    }
+
+    #[test]
+    fn finish_replaces_a_frame_that_has_not_started() {
+        let t0 = Instant::now();
+        let mut q = LossyQueue::with_sensor_policy(SensorFramePolicy::Finish);
+        q.push_sensor_frame(1, vec![vec![1], vec![2]]);
+        q.push_sensor_frame(1, vec![vec![3]]);
+        assert_eq!((q.pop(t0), q.pop(t0)), (Some(vec![3]), None));
+        assert_eq!(q.stats().sensor_frames_skipped, 1);
     }
 
     #[test]
