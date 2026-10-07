@@ -57,6 +57,10 @@ pub enum BenchKind {
     /// single bench datagrams, and sliced messages counted only when every
     /// slice arrived. Counting covers `duration_s` after `warmup_s`.
     Recv { warmup_s: f64, duration_s: f64 },
+    /// Control under load (docs/12): pings at a fixed rate, each sent on
+    /// schedule whether or not earlier replies have come back, timed after
+    /// `warmup_s`. Also counts the video and sensor bytes arriving alongside.
+    PingPace { rate_hz: f64, warmup_s: f64, duration_s: f64 },
 }
 
 /// Same `>Qd` header as `benchmark/*_bench.py` and `tools/proto-bench`.
@@ -212,6 +216,9 @@ pub async fn run(conn: &mut quiche::Connection, socket: &UdpSocket, local: Socke
         BenchKind::PingPong { count } => pingpong(&mut link, count, payload_bytes, raw, first_seq).await,
         BenchKind::Send { rate_hz, duration_s } => send(&mut link, payload_bytes, raw, rate_hz, duration_s, first_seq).await,
         BenchKind::Recv { warmup_s, duration_s } => recv(&mut link, warmup_s, duration_s, heartbeat_seq).await,
+        BenchKind::PingPace { rate_hz, warmup_s, duration_s } => {
+            pingpace(&mut link, payload_bytes, raw, rate_hz, warmup_s, duration_s, first_seq).await
+        }
     };
     let _ = link.conn.close(true, 0x0, b"bench done");
     link.flush().await?;
@@ -352,6 +359,115 @@ async fn recv(link: &mut Link<'_>, warmup_s: f64, duration_s: f64, mut heartbeat
     let quic = link.conn.stats();
     eprintln!("quic: received {} packets, sent {} (heartbeats and ACKs), lost {}", quic.recv, quic.sent, quic.lost);
     println!("{} msgs, {} bytes in {duration_s:.2}s", tally.msgs, tally.bytes);
+    Ok(())
+}
+
+/// How long after the last ping to wait for stragglers before counting
+/// the rest as lost (docs/12: "no reply within 2 s").
+const PINGPACE_GRACE: Duration = Duration::from_secs(2);
+
+/// The ping a reply belongs to, if this datagram is a bench echo; video and
+/// sensor bytes are added to the running totals instead.
+fn classify_reply(d: &[u8], video_bytes: &mut u64, sensor_bytes: &mut u64) -> Option<u64> {
+    match d.first() {
+        Some(&datagram::DATAGRAM_TAG_BENCH_RAW) => d.get(1..9).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes),
+        Some(&datagram::DATAGRAM_TAG_CHANNEL_A) => {
+            *video_bytes += d.len() as u64;
+            None
+        }
+        Some(&datagram::DATAGRAM_TAG_SENSOR_SLICE) => {
+            *sensor_bytes += d.len() as u64;
+            None
+        }
+        _ => {
+            let (tag, payload) = datagram::untag(d)?;
+            if tag != datagram::DATAGRAM_TAG_CHANNEL_B {
+                return None;
+            }
+            let f = channel_b::decode_channel_b_frame(&payload).ok()?;
+            (f.category == ChannelBCategory::Telemetry && f.tick_id == BENCH_ECHO_TICK_ID).then_some(f.seq)
+        }
+    }
+}
+
+async fn pingpace(
+    link: &mut Link<'_>,
+    payload_bytes: usize,
+    raw: bool,
+    rate_hz: f64,
+    warmup_s: f64,
+    duration_s: f64,
+    first_seq: u64,
+) -> Result<()> {
+    eprintln!("pingpace: {payload_bytes}B pings at {rate_hz}Hz, {warmup_s}s warmup then {duration_s}s timed");
+    let start = Instant::now();
+    let timed_from = start + Duration::from_secs_f64(warmup_s);
+    let send_until = timed_from + Duration::from_secs_f64(duration_s);
+    let period = Duration::from_secs_f64(1.0 / rate_hz);
+    // Timed pings: seq -> send time. Warmup pings aren't recorded.
+    let mut pending: std::collections::HashMap<u64, Instant> = std::collections::HashMap::new();
+    let (mut timed_sent, mut rtts) = (0u64, Vec::new());
+    let (mut video_bytes, mut sensor_bytes) = (0u64, 0u64);
+    let mut dbuf = vec![0u8; MAX_UDP_PAYLOAD];
+    let (mut seq, mut next_send) = (first_seq, start);
+    loop {
+        let now = Instant::now();
+        if now >= next_send && now < send_until {
+            if now >= timed_from {
+                pending.insert(seq, now);
+                timed_sent += 1;
+            }
+            let _ = link.conn.dgram_send(&bench_datagram(seq, payload_bytes, raw));
+            link.flush().await?;
+            seq += 1;
+            // On schedule, not "period after the last send": a control
+            // loop doesn't slow down because the network is slow.
+            next_send += period;
+        }
+        let in_window = (timed_from..send_until).contains(&now);
+        while let Ok(len) = link.conn.dgram_recv(&mut dbuf) {
+            let (mut v, mut s) = (0u64, 0u64);
+            if let Some(echo) = classify_reply(&dbuf[..len], &mut v, &mut s) {
+                if let Some(sent_at) = pending.remove(&echo) {
+                    rtts.push(sent_at.elapsed().as_secs_f64());
+                }
+            }
+            if in_window {
+                video_bytes += v;
+                sensor_bytes += s;
+            }
+        }
+        if now >= send_until && (pending.is_empty() || now >= send_until + PINGPACE_GRACE) {
+            break;
+        }
+        // While waiting for stragglers, keep robot-edge's watchdog fed:
+        // otherwise this pause itself latches E-Stop and pollutes the
+        // latch count (every run would show one).
+        if now >= send_until && now >= next_send {
+            let _ = link.conn.dgram_send(&datagram::tag(datagram::DATAGRAM_TAG_HEARTBEAT, &seq.to_be_bytes()));
+            link.flush().await?;
+            seq += 1;
+            next_send = now + Duration::from_millis(20);
+        }
+        let wake = if now < send_until { next_send.min(send_until) } else { next_send.min(send_until + PINGPACE_GRACE) };
+        link.pump(wake).await?;
+    }
+    let lost = pending.len() as u64;
+    rtts.sort_by(|a, b| a.total_cmp(b));
+    let ms = |p: f64| rtts.get(((rtts.len().max(1) - 1) as f64 * p).round() as usize).map_or(f64::NAN, |s| s * 1e3);
+    let over = |limit: f64| rtts.iter().filter(|&&r| r > limit).count() as f64 / timed_sent.max(1) as f64;
+    let mbps = |bytes: u64| bytes as f64 * 8.0 / duration_s / 1e6;
+    println!(
+        "pingpace sent={timed_sent} replies={} lost={lost} p50={:.2} p99={:.2} max={:.2} ms late100={:.4} late400={:.4} video_mbps={:.2} sensor_mbps={:.2}",
+        rtts.len(),
+        ms(0.5),
+        ms(0.99),
+        ms(1.0),
+        over(0.100),
+        over(0.400),
+        mbps(video_bytes),
+        mbps(sensor_bytes)
+    );
     Ok(())
 }
 
