@@ -241,6 +241,15 @@ from sending more than the link carries: doc 13's per-sensor budgets, sized
 from quiche's delivery-rate estimate, and/or a short queue under quiche
 (`fq_codel` on `wlan0`).
 
+**Shortening the queue under quiche doesn't help on this robot.** With
+`fq_codel` instead of `pfifo_fast` on the CM4's `wlan0` (3 rounds of L3,
+alternating), neither queueing discipline dropped a single packet: the
+host-side queue never filled. The backlog builds below it, in the Wi-Fi
+driver's firmware queue (`brcmfmac` on SDIO) and at the access point, where
+`tc` can't reach. The two were indistinguishable apart from Wi-Fi variance
+(two `pfifo_fast` runs hit a bad stretch: p99 11 s and 35 s, over half the
+pings lost). So the robot itself has to send less than the link carries.
+
 Caveats: two rounds only, on a shared 2.4 GHz channel. The camera's bitrate
 differed between rounds (2.1 against 0.6 Mbps, lighting most likely), which
 is why L1 and L2 vary. The link also varies from day to day: three more L3
