@@ -1029,8 +1029,9 @@ impl Session {
         let now = Instant::now();
         self.tick_count += 1;
         if let Some(rate) = &mut self.lossy_rate {
+            let quic = self.conn.stats();
             if let Some(path) = self.conn.path_stats().next() {
-                rate.update(now, path.rtt, path.min_rtt.unwrap_or(path.rtt));
+                rate.update(now, path.rtt, path.min_rtt.unwrap_or(path.rtt), quic.sent_bytes, quic.acked_bytes);
             }
         }
         if self.bench == Some(BenchMode::Count) {
