@@ -27,6 +27,7 @@ use crate::channel_b::{self, ChannelBCategory, ChannelBFrameData, TeleopCommand,
 use crate::hello_handler;
 use crate::safety_task::SafetyTask;
 use crate::lossy_queue::{LossyQueue, SensorFramePolicy, QUICHE_LOSSY_LIMIT};
+use crate::lossy_rate::LossyRateControl;
 use crate::session_handler;
 use crate::sim_sensor::{self, SensorFrame, SensorRx, SimSensorKind};
 use roboprotocol_core::sensor::{slice_frame, SensorDescriptor, DEFAULT_SLICE_PAYLOAD, SLICE_HEADER_LEN};
@@ -69,6 +70,9 @@ pub struct ServerArgs {
     pub slice_payload_bytes: usize,
     /// `--sensor-frame-policy`: see `SensorFramePolicy`.
     pub sensor_frame_policy: SensorFramePolicy,
+    /// `--lossy-rate-control on`: cap video and sensor data adaptively to
+    /// keep queueing delay low (see `lossy_rate`).
+    pub lossy_rate_control: bool,
     /// `--cc`: congestion control for the robot's sending direction, where
     /// video and sensor data can saturate the uplink. quiche's default is
     /// CUBIC, which keeps a bottleneck's buffer nearly full; a delay-based
@@ -216,6 +220,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             selected_sensors: Vec::new(),
             sensor_rx,
             lossy: LossyQueue::with_sensor_policy(args.sensor_frame_policy),
+            lossy_rate: args.lossy_rate_control.then(|| LossyRateControl::new(Instant::now())),
             slice_payload_bytes: args.slice_payload_bytes,
             safety: SafetyTask::with_watchdog_threshold_ms(args.task_class, args.watchdog_threshold_ms, Instant::now()),
             bridge,
@@ -268,6 +273,16 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
                 st.report(start.elapsed().as_secs_f64());
             }
         }
+        if let Some(rate) = &session.lossy_rate {
+            let r = rate.stats(Instant::now());
+            tracing::info!(
+                mean_mbps = r.mean_bps / 1e6,
+                min_mbps = r.min_bps / 1e6,
+                max_mbps = r.max_bps / 1e6,
+                decreases = r.decreases,
+                "lossy rate control at session end"
+            );
+        }
         let lossy = session.lossy.stats();
         tracing::info!(
             video_nals_dropped = lossy.video_nals_dropped,
@@ -299,6 +314,8 @@ struct Session {
     /// Video chunks and sensor slices waiting to enter quiche's datagram
     /// queue -- see `lossy_queue` for why they don't go there directly.
     lossy: LossyQueue,
+    /// `None` unless `--lossy-rate-control on`.
+    lossy_rate: Option<LossyRateControl>,
     slice_payload_bytes: usize,
     safety: SafetyTask,
     bridge: BridgeSupervisor,
@@ -740,7 +757,16 @@ impl Session {
     /// so lossy data never gets ahead of them.
     fn feed_lossy(&mut self) {
         while self.conn.dgram_send_queue_len() < QUICHE_LOSSY_LIMIT {
-            let Some(d) = self.lossy.pop(Instant::now()) else { break };
+            let now = Instant::now();
+            if let Some(rate) = &mut self.lossy_rate {
+                if !rate.has_room(now, MAX_DATAGRAM_SIZE) {
+                    break;
+                }
+            }
+            let Some(d) = self.lossy.pop(now) else { break };
+            if let Some(rate) = &mut self.lossy_rate {
+                rate.consume(d.len());
+            }
             // Only fails if the datagram no longer fits (the path's MTU
             // shrank) or the connection is closing; either way drop it.
             if let Err(e) = self.conn.dgram_send(&d) {
@@ -1052,6 +1078,12 @@ impl Session {
     async fn on_tick(&mut self) -> Result<()> {
         let now = Instant::now();
         self.tick_count += 1;
+        if let Some(rate) = &mut self.lossy_rate {
+            let quic = self.conn.stats();
+            if let Some(path) = self.conn.path_stats().next() {
+                rate.update(now, path.rtt, quic.sent_bytes, quic.acked_bytes);
+            }
+        }
         if self.bench == Some(BenchMode::Count) {
             self.log_bench_counter(now);
         }
