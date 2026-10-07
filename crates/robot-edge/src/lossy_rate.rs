@@ -127,7 +127,8 @@ impl LossyRateControl {
         let queue_delay = srtt.saturating_sub(base);
         if now.duration_since(self.last_trace) >= Duration::from_secs(1) {
             self.last_trace = now;
-            tracing::info!(
+            // RUST_LOG=robot_edge::lossy_rate=debug to watch it work.
+            tracing::debug!(
                 cap_mbps = self.rate_bps / 1e6,
                 srtt_ms = srtt.as_secs_f64() * 1e3,
                 base_rtt_ms = base.as_secs_f64() * 1e3,
