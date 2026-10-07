@@ -215,7 +215,9 @@ delayed too, not only the replies queued behind sensor data. The first full
 run's latch counts aren't usable: the bench paused sending while it waited
 for late replies at the end of each run, and that pause itself tripped the
 watchdog. The bench now keeps heartbeats going during that wait; an L0 check
-afterwards showed no latch.
+afterwards showed no latch. In a repeat that logged the time, the latch
+came 11.6 s into the session, about 1.6 s after the warm-up: under
+overload the robot stops within seconds.
 
 What it shows:
 
@@ -241,7 +243,13 @@ from quiche's delivery-rate estimate, and/or a short queue under quiche
 
 Caveats: two rounds only, on a shared 2.4 GHz channel. The camera's bitrate
 differed between rounds (2.1 against 0.6 Mbps, lighting most likely), which
-is why L1 and L2 vary.
+is why L1 and L2 vary. The link also varies from day to day: three more L3
+runs the next morning gave p50 194–643 ms and p99 3.0–4.8 s, worse than the
+table, with the watchdog latching in every run. One of those diagnostic runs
+failed without a summary; its error text wasn't captured, and two repeats
+completed normally. A plausible cause is QUIC's 10 s idle timeout closing
+the connection when replies stall that long, which would itself be a
+failure mode under overload, but it wasn't confirmed.
 
 So the Pi benchmark runs in two phases:
 

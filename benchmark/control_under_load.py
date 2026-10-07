@@ -65,15 +65,19 @@ def run(load, variant):
     ssh("pkill -INT -x robot-edge; sleep 1; pkill -KILL -x robot-edge; true")
     ssh(f"cd /home/pi/RoboProtocol\nsetsid target/release/robot-edge --stub-bridge --bench echo --robot-id control-load "
         f"{' '.join(LOADS[load])} > /tmp/control-load.log 2>&1 < /dev/null &\n")
-    time.sleep(5)  # camera start-up
-    subprocess.run(["rm", "-rf", str(REPO / ".session-cache")])
-    r = subprocess.run([OPC, "--connect", f"{PI_IP}:4433", "--server-name", "robot-edge", "--headless",
-                        "--bench", "pingpace", *VARIANTS[variant], "--bench-payload-bytes", "64",
-                        "--bench-rate-hz", str(RATE_HZ), "--bench-warmup-s", str(WARMUP_S),
-                        "--bench-duration-s", str(DURATION_S)],
-                       cwd=REPO, capture_output=True, text=True, timeout=WARMUP_S + DURATION_S + 60)
-    robot_log = ssh("sed 's/\\x1b\\[[0-9;]*m//g' /tmp/control-load.log").stdout
-    ssh("pkill -INT -x robot-edge; sleep 1; rm -f /tmp/control-load.log; true")
+    # Always stop robot-edge, even if this run is interrupted: an earlier
+    # interrupted run left one running on the robot with the L3 load set.
+    try:
+        time.sleep(5)  # camera start-up
+        subprocess.run(["rm", "-rf", str(REPO / ".session-cache")])
+        r = subprocess.run([OPC, "--connect", f"{PI_IP}:4433", "--server-name", "robot-edge", "--headless",
+                            "--bench", "pingpace", *VARIANTS[variant], "--bench-payload-bytes", "64",
+                            "--bench-rate-hz", str(RATE_HZ), "--bench-warmup-s", str(WARMUP_S),
+                            "--bench-duration-s", str(DURATION_S)],
+                           cwd=REPO, capture_output=True, text=True, timeout=WARMUP_S + DURATION_S + 60)
+        robot_log = ssh("sed 's/\\x1b\\[[0-9;]*m//g' /tmp/control-load.log").stdout
+    finally:
+        ssh("pkill -INT -x robot-edge; sleep 1; rm -f /tmp/control-load.log; true")
     m = re.search(r"pingpace sent=(\d+) replies=(\d+) lost=(\d+) p50=([\d.na]+) p99=([\d.na]+) max=([\d.na]+) ms "
                   r"late100=([\d.]+) late400=([\d.]+) video_mbps=([\d.]+) sensor_mbps=([\d.]+)", r.stdout)
     if not m:
