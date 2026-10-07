@@ -340,5 +340,26 @@ async fn main() -> Result<()> {
     let profile = xgo_profile::xgo_lite_v2_profile();
     let cameras = if cli.enable_camera { vec![xgo_profile::xgo_lite_v2_camera()] } else { Vec::new() };
 
-    quic_server::run(args, profile, cameras).await
+    // SIGINT (Ctrl-C, or the LCD panel's Stop) and SIGTERM (systemd, kill)
+    // both shut down cleanly: a session in progress stops the robot first
+    // (see `quic_server::Session::shut_down`). A second signal while that's
+    // under way exits at once.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("installing a SIGTERM handler");
+        for n in 0.. {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            if n > 0 {
+                tracing::warn!("second shutdown signal, exiting now");
+                std::process::exit(130);
+            }
+            tracing::info!("shutdown signal received");
+            let _ = shutdown_tx.send(true);
+        }
+    });
+
+    quic_server::run(args, profile, cameras, shutdown_rx).await
 }

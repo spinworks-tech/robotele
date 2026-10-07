@@ -21,7 +21,7 @@ use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
 
 use crate::action_trigger_handler;
-use crate::bridge::{BridgeCommand, BridgeConfig, BridgeSupervisor, SupervisorEvent};
+use crate::bridge::{BridgeCommand, BridgeConfig, BridgeEvent, BridgeSupervisor, SupervisorEvent};
 use crate::camera_control_handler;
 use crate::channel_b::{self, ChannelBCategory, ChannelBFrameData, TeleopCommand, ALL_REGIONS};
 use crate::hello_handler;
@@ -110,7 +110,15 @@ enum Phase {
     Operating,
 }
 
-pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDescriptor>) -> Result<()> {
+/// How long a shutdown waits for the bridge to acknowledge `Stop` before
+/// exiting anyway. The XGO keeps executing its last velocity command until
+/// told otherwise, so the stop must reach it before the bridge is killed.
+const SHUTDOWN_STOP_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Serves sessions until `shutdown` turns true (SIGINT/SIGTERM, see
+/// `main.rs`). A session in progress first stops the robot and closes the
+/// connection (`Session::shut_down`).
+pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDescriptor>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
     let mut config = build_quiche_config(&args)?;
     let socket = UdpSocket::bind(args.listen).await.context("binding UDP socket")?;
     let local_addr = socket.local_addr()?;
@@ -141,7 +149,14 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
     loop {
         let mut buf = vec![0u8; 65535];
 
-        let (len, peer) = match socket.recv_from(&mut buf).await.context("waiting for first packet") {
+        let first = tokio::select! {
+            r = socket.recv_from(&mut buf) => r,
+            _ = shutdown.changed() => {
+                tracing::info!("shutdown signal: no session in progress, exiting");
+                return Ok(());
+            }
+        };
+        let (len, peer) = match first.context("waiting for first packet") {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = ?e, "waiting for first packet failed, retrying");
@@ -227,6 +242,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             recorder: recorder.clone(),
             bench: args.bench,
             bench_counter: BenchCounter::default(),
+            shutdown: shutdown.clone(),
             bench_send: (args.bench == Some(BenchMode::Send))
                 .then_some(BenchSendState { spec: args.bench_send, start: None, offered: 0, skipped: 0, done: false }),
         };
@@ -342,6 +358,8 @@ struct Session {
     bench: Option<BenchMode>,
     bench_counter: BenchCounter,
     bench_send: Option<BenchSendState>,
+    /// Turns true on SIGINT/SIGTERM.
+    shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 /// `--bench count` totals, logged cumulatively once a second from `on_tick`
@@ -425,6 +443,10 @@ impl Session {
                 }
                 Some(event) = self.bridge.event_rx.recv() => {
                     self.on_bridge_event(event);
+                }
+                _ = self.shutdown.changed() => {
+                    self.shut_down(socket, &mut out).await;
+                    return Ok(());
                 }
                 _ = bench_ticker.tick(), if self.phase == Phase::Operating && self.bench_send.as_ref().is_some_and(|b| !b.done) => {
                     self.bench_send_step();
@@ -992,6 +1014,34 @@ impl Session {
             ControlSource::SemiAutonomous => {}
         }
         source
+    }
+
+    /// SIGINT/SIGTERM during a session: stop the robot, wait (briefly) for
+    /// the bridge to confirm, latch E-Stop, and close the connection so the
+    /// operator sees why at once instead of waiting out the idle timeout.
+    async fn shut_down(&mut self, socket: &UdpSocket, out: &mut [u8]) {
+        tracing::warn!("shutdown signal: stopping the robot and closing the session");
+        let stop_seq = self.next_seq();
+        let _ = self.bridge.cmd_tx.send(BridgeCommand::Stop { seq: stop_seq });
+        let estop_seq = self.next_seq();
+        let _ = self.bridge.cmd_tx.send(BridgeCommand::Estop { seq: estop_seq });
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_STOP_ACK_TIMEOUT;
+        loop {
+            match tokio::time::timeout_at(deadline, self.bridge.event_rx.recv()).await {
+                Ok(Some(SupervisorEvent::FromBridge(BridgeEvent::Ack { seq: Some(seq), ok, .. }))) if seq == stop_seq => {
+                    tracing::info!(ok, "bridge acknowledged the shutdown stop");
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break, // bridge supervisor gone
+                Err(_) => {
+                    tracing::warn!("bridge didn't acknowledge the shutdown stop in time; exiting anyway");
+                    break;
+                }
+            }
+        }
+        let _ = self.conn.close(true, 0x0, b"robot-edge shutting down");
+        let _ = self.flush(socket, out).await;
     }
 
     fn next_seq(&mut self) -> u64 {

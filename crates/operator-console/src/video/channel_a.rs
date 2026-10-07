@@ -15,16 +15,16 @@ impl ChannelAReceiver {
         Self { reassembler: NalReassembler::new(MAX_PENDING_NALS) }
     }
 
-    /// Feed one received Channel A datagram. Returns Annex-B bytes
-    /// (start code + NAL payload) ready to write straight to the
-    /// playback pipe, if this chunk completed a NAL.
-    pub fn on_datagram(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+    /// Feed one received Channel A datagram. Returns the NAL's id and its
+    /// Annex-B bytes (start code + NAL payload, ready for the playback
+    /// pipe), if this chunk completed a NAL.
+    pub fn on_datagram(&mut self, data: &[u8]) -> Option<(u32, Vec<u8>)> {
         let (header, payload) = ChunkHeader::decode(data)?;
         let nal = self.reassembler.on_chunk(header, payload)?;
         let mut out = Vec::with_capacity(START_CODE.len() + nal.len());
         out.extend_from_slice(&START_CODE);
         out.extend_from_slice(&nal);
-        Some(out)
+        Some((header.nal_id, out))
     }
 }
 

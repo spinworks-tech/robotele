@@ -172,6 +172,9 @@ pub struct HudState {
     /// the other is closer to observed fps.
     pub video_dgram_rate: RateCounter,
     pub video_frame_rate: RateCounter,
+    /// Times the picture froze (deltas held until the next IDR) after a
+    /// missing frame -- see `video::gate`.
+    pub video_freezes: u64,
     /// Channel B outbound (Command): mirrors `Client::channel_b_seq` for
     /// display -- this is the operator's own send rate, so it's normally
     /// just `tick_hz`, but tracking it observed (not assumed) catches a
@@ -277,6 +280,7 @@ impl HudState {
             camera_shutter_us: 0,
             video_dgram_rate: RateCounter::new(CHANNEL_STATS_WINDOW),
             video_frame_rate: RateCounter::new(CHANNEL_STATS_WINDOW),
+            video_freezes: 0,
             command_rate: RateCounter::new(CHANNEL_STATS_WINDOW),
             command_last_seq: 0,
             telemetry_rate: RateCounter::new(CHANNEL_STATS_WINDOW),
@@ -686,8 +690,8 @@ fn draw_channels_panel(f: &mut Frame, area: Rect, hud: &HudState) {
         None => "no data yet".to_string(),
     };
     let video_note = match &hud.camera_shape {
-        Some(shape) => format!("{shape}, {video_frame_hz:.1} fps live"),
-        None => format!("{video_frame_hz:.1} fps"),
+        Some(shape) => format!("{shape}, {video_frame_hz:.1} fps live, {} freezes", hud.video_freezes),
+        None => format!("{video_frame_hz:.1} fps, {} freezes", hud.video_freezes),
     };
 
     let rows = vec![

@@ -28,3 +28,6 @@ operator-console.log
 # Local benchmark runs (venv + outputs)
 benchmark/.venv/
 benchmark/results/
+
+# Written by operator-console --video-backend ffplay (ffplay's stderr).
+ffplay.log

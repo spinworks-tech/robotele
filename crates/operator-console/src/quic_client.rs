@@ -345,6 +345,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         // `.flatten()` on top of headless's own `Option`.
         gamepad: (!args.headless).then(GamepadReader::new).flatten(),
         video_rx: ChannelAReceiver::new(),
+        video_gate: crate::video::gate::DeltaGate::new(),
         video_tx,
         native_video_tx,
         _video_child: video_child,
@@ -418,6 +419,8 @@ struct Client {
     /// gamepad backend couldn't initialize -- see `GamepadReader::new`.
     gamepad: Option<GamepadReader>,
     video_rx: ChannelAReceiver,
+    /// Freezes the picture after a missing NAL instead of letting it smear.
+    video_gate: crate::video::gate::DeltaGate,
     /// `watch`, not a queue -- see `playback.rs`'s module doc for why a
     /// queue in front of `ffplay` is exactly the unbounded-video-lag bug
     /// this replaced.
@@ -558,7 +561,12 @@ impl Client {
                 self.hud.disconnected_at = Some(std::time::Instant::now());
                 self.hud.reconnect_attempts = 0;
                 self.console.render(&self.hud);
-                tracing::warn!("connection closed/lost");
+                // The robot says why when it closes on purpose (e.g.
+                // "robot-edge shutting down"); otherwise the link was lost.
+                match self.conn.peer_error() {
+                    Some(e) => tracing::warn!(reason = %String::from_utf8_lossy(&e.reason), code = e.error_code, "connection closed by the robot"),
+                    None => tracing::warn!("connection closed/lost"),
+                }
                 if self.input.is_none() {
                     // Headless (e.g. scripts/smoke_test.sh): no human is
                     // watching a TUI for this, and automation expects the
@@ -615,6 +623,7 @@ impl Client {
                     self.conn = conn;
                     self.phase = Phase::AwaitingHello;
                     self.describe_buf.clear();
+                    self.video_gate = crate::video::gate::DeltaGate::new();
                     self.session_info = None;
                     self.sensors.clear();
                     self.hud.sensors.clear();
@@ -934,7 +943,7 @@ impl Client {
             datagram::DATAGRAM_TAG_CHANNEL_A => {
                 let now = std::time::Instant::now();
                 self.hud.video_dgram_rate.record(now, payload.len());
-                if let Some(nal_bytes) = self.video_rx.on_datagram(&payload) {
+                if let Some((nal_id, nal_bytes)) = self.video_rx.on_datagram(&payload) {
                     self.hud.video_frame_rate.record(now, nal_bytes.len());
                     self.recorder.enqueue(
                         roboprotocol_recording::Category::VideoA,
@@ -951,11 +960,26 @@ impl Client {
                     // `video_tx`/`native_video_tx` is ever `Some` per
                     // `VideoBackend`, so `nal_bytes` only ever moves once.
                     let is_critical = nal_bytes.get(4..).is_some_and(nal_is_critical);
-                    if let Some(tx) = &self.video_tx {
-                        tx.send(nal_bytes, is_critical);
-                    } else if let Some(tx) = &self.native_video_tx {
-                        tx.send(nal_bytes, is_critical);
+                    // After a missing NAL, deltas would only smear until the
+                    // next IDR: the gate holds them back so the picture
+                    // freezes instead (see `video::gate`). Recording above
+                    // still gets everything that arrived.
+                    let nal_type = nal_bytes.get(4).map_or(0, |b| b & 0x1F);
+                    if !self.video_gate.admit(nal_id, nal_type) {
+                        self.hud.video_freezes = self.video_gate.stats().freezes;
+                        return;
                     }
+                    let delivered = if let Some(tx) = &self.video_tx {
+                        tx.send(nal_bytes, is_critical)
+                    } else if let Some(tx) = &self.native_video_tx {
+                        tx.send(nal_bytes, is_critical)
+                    } else {
+                        true
+                    };
+                    if !delivered {
+                        self.video_gate.playback_overflowed();
+                    }
+                    self.hud.video_freezes = self.video_gate.stats().freezes;
                 }
             }
             datagram::DATAGRAM_TAG_SENSOR_SLICE if self.phase == Phase::Operating => self.on_sensor_slice(&payload),

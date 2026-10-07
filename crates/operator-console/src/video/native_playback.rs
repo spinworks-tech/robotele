@@ -20,10 +20,11 @@
 //! built from `std::sync` primitives instead of `tokio::sync` since this
 //! side of the channel is a synchronous thread, not an async task.
 
+use crate::video::gate::DeltaSlot;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -37,27 +38,9 @@ use openh264::formats::YUVSource;
 /// never becomes the latency bottleneck itself.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
-struct LatestSlot {
-    value: Mutex<Option<Vec<u8>>>,
-}
-
-impl LatestSlot {
-    fn new() -> Self {
-        Self { value: Mutex::new(None) }
-    }
-
-    fn set(&self, bytes: Vec<u8>) {
-        *self.value.lock().unwrap() = Some(bytes);
-    }
-
-    fn take(&self) -> Option<Vec<u8>> {
-        self.value.lock().unwrap().take()
-    }
-}
-
 pub struct NativeVideoTx {
     critical_tx: mpsc::Sender<Vec<u8>>,
-    latest_delta: Arc<LatestSlot>,
+    latest_delta: Arc<DeltaSlot>,
     /// Set by `request_screenshot`, cleared by the render thread once it's
     /// saved the next frame it displays -- see that method's doc.
     screenshot_requested: Arc<AtomicBool>,
@@ -70,11 +53,16 @@ impl NativeVideoTx {
     /// frames). Errors are ignored -- a dropped receiver just means the
     /// window closed or the render thread exited, not a session-safety
     /// event.
-    pub fn send(&self, bytes: Vec<u8>, is_critical: bool) {
+    /// Returns `false` if a delta had to be discarded because the render
+    /// thread hadn't taken the previous one (see `DeltaSlot::offer`): the
+    /// caller then freezes deltas until the next IDR.
+    pub fn send(&self, bytes: Vec<u8>, is_critical: bool) -> bool {
         if is_critical {
+            self.latest_delta.clear();
             let _ = self.critical_tx.send(bytes);
+            true
         } else {
-            self.latest_delta.set(bytes);
+            self.latest_delta.offer(bytes)
         }
     }
 
@@ -93,7 +81,7 @@ impl NativeVideoTx {
 
 pub fn spawn_native_playback(screenshot_dir: PathBuf) -> NativeVideoTx {
     let (critical_tx, critical_rx) = mpsc::channel();
-    let latest_delta = Arc::new(LatestSlot::new());
+    let latest_delta = Arc::new(DeltaSlot::new());
     let render_delta = latest_delta.clone();
     let screenshot_requested = Arc::new(AtomicBool::new(false));
     let render_screenshot_requested = Arc::clone(&screenshot_requested);
@@ -112,7 +100,7 @@ pub fn spawn_native_playback(screenshot_dir: PathBuf) -> NativeVideoTx {
 
 fn render_loop(
     critical_rx: mpsc::Receiver<Vec<u8>>,
-    latest_delta: Arc<LatestSlot>,
+    latest_delta: Arc<DeltaSlot>,
     screenshot_requested: Arc<AtomicBool>,
     screenshot_dir: PathBuf,
 ) -> anyhow::Result<()> {
@@ -125,10 +113,19 @@ fn render_loop(
         // Critical NALs (SPS/PPS/IDR) take priority whenever one is
         // ready; `recv_timeout` both waits for one and doubles as this
         // loop's tick when none arrives, so there's no separate sleep.
-        let nal = match critical_rx.recv_timeout(POLL_INTERVAL) {
+        // A queued delta is taken at once, without waiting out the poll
+        // interval, so a burst drains as fast as it decodes.
+        let nal = match critical_rx.try_recv() {
             Ok(nal) => Some(nal),
-            Err(RecvTimeoutError::Timeout) => latest_delta.take(),
-            Err(RecvTimeoutError::Disconnected) => return Ok(()), // session ending
+            Err(TryRecvError::Disconnected) => return Ok(()), // session ending
+            Err(TryRecvError::Empty) => match latest_delta.take() {
+                Some(delta) => Some(delta),
+                None => match critical_rx.recv_timeout(POLL_INTERVAL) {
+                    Ok(nal) => Some(nal),
+                    Err(RecvTimeoutError::Timeout) => latest_delta.take(),
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                },
+            },
         };
 
         let mut displayed = false;
