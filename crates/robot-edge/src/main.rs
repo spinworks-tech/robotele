@@ -4,6 +4,7 @@ mod camera_control_handler;
 mod channel_b;
 mod hello_handler;
 mod lossy_queue;
+mod lossy_rate;
 mod quic_server;
 mod safety_task;
 mod session_handler;
@@ -68,6 +69,7 @@ struct Cli {
     cc: quiche::CongestionControlAlgorithm,
     slice_payload_bytes: usize,
     sensor_frame_policy: lossy_queue::SensorFramePolicy,
+    lossy_rate_control: bool,
 }
 
 /// Maps a `--record` list entry to a category. `robot-edge` has no
@@ -122,6 +124,7 @@ impl Cli {
         let mut cc = quiche::CongestionControlAlgorithm::CUBIC;
         let mut slice_payload_bytes = 0usize;
         let mut sensor_frame_policy = lossy_queue::SensorFramePolicy::Cut;
+        let mut lossy_rate_control = false;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -174,6 +177,13 @@ impl Cli {
                     let kind = it.next().context("--sim-sensor needs a value (cloud|lidar|radar|depth)")?;
                     sim_sensors.push(sim_sensor::SimSensorKind::parse(&kind).with_context(|| format!("unknown --sim-sensor {kind}, expected cloud|lidar|radar|depth"))?);
                 }
+                "--lossy-rate-control" => {
+                    lossy_rate_control = match it.next().context("--lossy-rate-control needs a value (on|off)")?.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        other => anyhow::bail!("unknown --lossy-rate-control {other}, expected on|off"),
+                    }
+                }
                 "--sensor-frame-policy" => {
                     let name = it.next().context("--sensor-frame-policy needs a value (cut|finish)")?;
                     sensor_frame_policy = lossy_queue::SensorFramePolicy::parse(&name).with_context(|| format!("unknown --sensor-frame-policy {name}, expected cut|finish"))?;
@@ -198,7 +208,8 @@ impl Cli {
                          [--sim-sensor cloud|lidar|radar|depth]...   (synthetic sensors, repeatable)\n  \
                          [--cc reno|cubic|bbr|bbr2]   (congestion control, default cubic)\n  \
                          [--slice-payload-bytes N]   (sensor slice payload; default 0 = as large as the connection allows)\n  \
-                         [--sensor-frame-policy cut|finish]   (new sensor frame vs a partly sent one; default cut)"
+                         [--sensor-frame-policy cut|finish]   (new sensor frame vs a partly sent one; default cut)\n  \
+                         [--lossy-rate-control on|off]   (adaptive cap on video and sensor data; default off)"
                     );
                     std::process::exit(0);
                 }
@@ -245,6 +256,7 @@ impl Cli {
             cc,
             slice_payload_bytes,
             sensor_frame_policy,
+            lossy_rate_control,
         })
     }
 
@@ -335,6 +347,7 @@ async fn main() -> Result<()> {
         cc: cli.cc,
         slice_payload_bytes: cli.slice_payload_bytes,
         sensor_frame_policy: cli.sensor_frame_policy,
+        lossy_rate_control: cli.lossy_rate_control,
     };
 
     let profile = xgo_profile::xgo_lite_v2_profile();
