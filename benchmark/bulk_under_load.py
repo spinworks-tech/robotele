@@ -3,13 +3,17 @@
 paced control from the operator laptop while robot-edge on the CM4 sends its
 camera plus sim-map occupancy grids (600 KB each) at different rates, with
 and without --lossy-rate-control. Cases alternate within rounds. Reports
-control round trips alongside the maps actually delivered. Uses
-control_under_load.py's run().
+control round trips alongside the maps actually delivered. The case order
+rotates every round and each case logs the idle ping just before it: with a
+fixed order, the last case kept landing on bad stretches of Wi-Fi (the
+first run's 'map 4/s + cap' result). Uses control_under_load.py's run().
 
 Usage: bulk_under_load.py [rounds]
 """
 import json
+import re
 import statistics
+import subprocess
 import sys
 
 import control_under_load as c
@@ -23,18 +27,28 @@ CASES = {
 }
 
 
+def idle_ping():
+    out = subprocess.run(["ping", "-c", "10", "-i", "0.2", c.PI_IP], capture_output=True, text=True).stdout
+    times = sorted(float(t) for t in re.findall(r"time=([\d.]+)", out))
+    return times[len(times) // 2] if times else float("nan")
+
+
 def main():
     rows = []
+    names = list(CASES)
     for rnd in range(1, ROUNDS + 1):
-        for name, flags in CASES.items():
+        shift = (rnd - 1) % len(names)
+        for name in names[shift:] + names[:shift]:
+            flags = CASES[name]
+            ping = idle_ping()
             c.LOADS["bulk"] = flags
             t = c.run("bulk", "raw")
-            t.update(case=name, round=rnd)
+            t.update(case=name, round=rnd, idle_ping_p50=ping)
             rows.append(t)
             if "error" in t:
                 c.log(f"  round {rnd} {name:20} ERROR {t['error'][-200:]}")
                 continue
-            c.log(f"  round {rnd} {name:20} p50={t['p50']:.1f} p99={t['p99']:.0f} ms >100ms={t['late100']:.1%} "
+            c.log(f"  round {rnd} {name:20} [idle ping {ping:.1f} ms] p50={t['p50']:.1f} p99={t['p99']:.0f} ms >100ms={t['late100']:.1%} "
                   f">400ms={t['late400']:.1%} lost={int(t['lost'])} video={t['video_mbps']:.1f} Mbps "
                   f"maps={int(t['bulk_objects'])} ({t['bulk_mbps']:.1f} Mbps) latches={t['estop_latches']}")
     (c.OUT / "bulk.json").write_text(json.dumps(rows, indent=2))

@@ -206,6 +206,29 @@ On a 5 Mbps link with a map published every 0.5 s, the operator received a
 complete map about every second (versions 1, 3, 5, ... 26 of 30), which is
 as fast as 600 KB fits through 5 Mbps.
 
+**Effect on control, on the CM4 over Wi-Fi** (`benchmark/bulk_under_load.py`,
+2026-10-07, 50 Hz paced control as in doc 12, camera running, medians over 2
+rounds):
+
+| Robot sends | Control p50 | p99 | Over 400 ms | Maps delivered |
+| --- | --- | --- | --- | --- |
+| Camera only | 9 ms | 186 ms | 0% | – |
+| + a map every second | 29 ms | 344 ms | 0.4% | 60 of 60 (4.8 Mbps) |
+| + 4 maps a second | 53 ms | 448 ms | 1.6% | 134 (10.8 Mbps) |
+
+A map a second is affordable: every one arrived and control stayed usable,
+its median up ~20 ms and its p99 roughly doubled. Four a second costs
+more: the tail grew and one run tripped the watchdog repeatedly. A fourth
+case, 4 maps a second with `--lossy-rate-control on`, came out far worse
+(p50 206 ms, p99 5.9 s), but it always ran last in its round, and the
+Wi-Fi that evening swung between good and very poor within minutes;
+control was bad while the cap held our own traffic to ~1 Mbps, so the
+congestion wasn't ours. On a stable shaped 20 Mbps link the same case
+behaves as intended: the cap took control from p50 50 / p99 62 ms to 22 /
+34 ms while still delivering 14 Mbps of maps (16 without the cap). The
+script now rotates the case order and logs the idle ping before each case;
+the CM4 cap case needs rerunning that way.
+
 Not done yet: requesting an object (such as a full-resolution snapshot) from
 the operator side, recording bulk objects, and advertising available objects
 in `SESSION_DESCRIBE`.
