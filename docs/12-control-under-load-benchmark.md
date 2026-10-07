@@ -1,7 +1,11 @@
 # Benchmark plan: control latency under video load
 
-**Status: plan, not yet run.** This document defines the benchmark; results
-will be added to it once the testbed exists.
+**Status: Channel B measured on the robot; the multi-protocol testbed is
+not built yet.** This document defines the benchmark. Channel B's results
+on the XGO-Lite's CM4 over Wi-Fi are in
+[Paced 50 Hz control on the CM4](#paced-50-hz-control-on-the-cm4); the
+comparison with Zenoh, MQTT and WebRTC on the two-Pi testbed is still to
+do.
 
 This follows [11 — Protocol comparison](11-protocol-comparison.md), which
 measures each protocol on an idle link. Idle-link numbers don't answer the
@@ -170,6 +174,91 @@ to send less than the link carries -- doc 13's per-sensor budgets, sized
 from quiche's delivery-rate estimate -- or a shorter queue under quiche
 (for example `fq_codel` and a smaller transmit queue on the CM4's
 `wlan0`), or both. Those are the next experiments.
+
+### Paced 50 Hz control on the CM4
+
+The test this document is about, run for Channel B on the robot itself
+(2026-10-06, `benchmark/control_under_load.py`, PR #31's build). The
+operator laptop sends 64 B pings at a paced 50 Hz, each on schedule whether
+or not earlier replies are back (`operator-console --bench pingpace`):
+10 s warm-up, then 60 s timed, 3,000 pings per run. `robot-edge --bench
+echo` answers them while its uplink carries a load. Instead of this
+document's pre-encoded video file, the load is the robot's own camera plus
+`--sim-sensor` data, since only Channel B is being measured. Same 2.4 GHz
+link as the results above, laptop Wi-Fi power saving off.
+
+| Load (robot → operator) | Delivered |
+| --- | --- |
+| **L0** control only | – |
+| **L1** camera, 640×480 at 30 fps | 0.6–2.1 Mbps of video |
+| **L2** camera + navigation cloud | + 6.5 Mbps of sensor data |
+| **L3** camera + lidar + depth + cloud, about 40 Mbps offered (2× the link) | ~1 Mbps of video + ~21 Mbps of sensor data |
+
+Medians over 2 rounds. "Inflation" is p99 against L0 of the same variant.
+
+| Load | Variant | p50 | p99 | Max | > 100 ms | > 400 ms | Lost (of 3,000) | Inflation |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| L0 | transport only | 2.2 ms | 130 ms | 268 ms | 5.3% | 0% | 0 | 1.0× |
+| L0 | full frame | 2.4 ms | 151 ms | 419 ms | 5.7% | 0.18% | 12 | 1.0× |
+| L1 | transport only | 2.9 ms | 218 ms | 391 ms | 8.0% | 0.07% | 5 | 1.7× |
+| L1 | full frame | 4.6 ms | 148 ms | 250 ms | 7.2% | 0% | 2 | 1.0× |
+| L2 | transport only | 6.3 ms | 263 ms | 408 ms | 15.1% | 0.03% | 34 | 2.0× |
+| L2 | full frame | 7.7 ms | 288 ms | 442 ms | 15.1% | 0.14% | 28 | 1.9× |
+| L3 | transport only | **249 ms** | **922 ms** | 1,102 ms | **78.7%** | **18.8%** | 176 | **7.1×** |
+| L3 | full frame | **196 ms** | **1,046 ms** | 1,223 ms | **67.8%** | **11.7%** | 156 | **6.9×** |
+
+**The watchdog.** At L3 the robot's watchdog (400 ms without a command,
+task class D) latched in all four runs of a repeat. A latch stays latched
+until cleared, so this means "at least once per minute". On a real session
+the robot would have stopped. So under overload, pings *to* the robot were
+delayed too, not only the replies queued behind sensor data. The first full
+run's latch counts aren't usable: the bench paused sending while it waited
+for late replies at the end of each run, and that pause itself tripped the
+watchdog. The bench now keeps heartbeats going during that wait; an L0 check
+afterwards showed no latch. In a repeat that logged the time, the latch
+came 11.6 s into the session, about 1.6 s after the warm-up: under
+overload the robot stops within seconds.
+
+What it shows:
+
+- **The link itself stalls.** With no load at all, 5% of pings took over
+  100 ms. Any protocol running on this Wi-Fi inherits that.
+- **Moderate load is tolerable.** With the camera alone the median barely
+  moves. At L2 (about 8.5 Mbps delivered) the median stays under 10 ms and
+  the p99 doubles, but almost nothing passes 400 ms.
+- **Overload breaks control.** At L3 the median goes to 200–250 ms, the p99
+  to about 1 s, and the watchdog latches. The robot's own queue is bounded
+  (see [The fix](#the-fix)), but the robot keeps the Wi-Fi driver's queue
+  and the access point's full. The CM4's `wlan0` queue alone holds 1,000
+  packets, about half a second at this link's ~2,000 packets per second.
+- **Video survived, degraded:** about 1 Mbps still arrived at L3.
+
+**Against [What counts as an advantage](#what-counts-as-an-advantage)**, at
+L3: p99 inflation is 7× (the bar is 2×) and pings exceed 400 ms (the bar
+is none). Video is delivered, degraded, which passes. So Channel B fails
+this benchmark on the robot under overload. The fix has to keep the robot
+from sending more than the link carries: doc 13's per-sensor budgets, sized
+from quiche's delivery-rate estimate, and/or a short queue under quiche
+(`fq_codel` on `wlan0`).
+
+**Shortening the queue under quiche doesn't help on this robot.** With
+`fq_codel` instead of `pfifo_fast` on the CM4's `wlan0` (3 rounds of L3,
+alternating), neither queueing discipline dropped a single packet: the
+host-side queue never filled. The backlog builds below it, in the Wi-Fi
+driver's firmware queue (`brcmfmac` on SDIO) and at the access point, where
+`tc` can't reach. The two were indistinguishable apart from Wi-Fi variance
+(two `pfifo_fast` runs hit a bad stretch: p99 11 s and 35 s, over half the
+pings lost). So the robot itself has to send less than the link carries.
+
+Caveats: two rounds only, on a shared 2.4 GHz channel. The camera's bitrate
+differed between rounds (2.1 against 0.6 Mbps, lighting most likely), which
+is why L1 and L2 vary. The link also varies from day to day: three more L3
+runs the next morning gave p50 194–643 ms and p99 3.0–4.8 s, worse than the
+table, with the watchdog latching in every run. One of those diagnostic runs
+failed without a summary; its error text wasn't captured, and two repeats
+completed normally. A plausible cause is QUIC's 10 s idle timeout closing
+the connection when replies stall that long, which would itself be a
+failure mode under overload, but it wasn't confirmed.
 
 So the Pi benchmark runs in two phases:
 
@@ -350,7 +439,7 @@ not passed. The robot still needs its camera.
 | Item | Where | Notes |
 |---|---|---|
 | Bench echo/count | `robot-edge --bench`, `operator-console --bench` | Done (doc 11) |
-| Paced control ping-pong, reporting late fractions | `operator-console --bench`, `tools/proto-bench` | New mode: fixed-rate pings, replies matched by sequence number |
+| Paced control ping-pong, reporting late fractions | `operator-console --bench pingpace` (done), `tools/proto-bench` (to do) | Fixed-rate pings, replies matched by sequence number; Channel B measured on the CM4 |
 | File-backed camera wrapper | `benchmark/` script | For `robot-edge --camera-bin` |
 | Video publisher and receiver | `tools/proto-bench` | Zenoh, MQTT, and WebRTC (RTP track) |
 | Priority settings | `tools/proto-bench` | Zenoh `RealTime` for control and `DataLow` + `Drop` for video |
