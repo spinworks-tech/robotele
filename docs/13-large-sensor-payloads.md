@@ -165,20 +165,50 @@ under loss.
 
 Some large data must arrive whole and is updated rarely: an occupancy grid
 or map, an accumulated keyframe cloud, or a full-resolution depth frame the
-operator asks for. These go on Channel C, using the MoQ pattern:
+operator asks for. These go on Channel C, using the Media over QUIC pattern.
+**Implemented** (`roboprotocol_core::bulk`, `robot-edge/src/bulk_sender.rs`):
 
-- **One unidirectional stream per object.** The stream starts with a small
-  header (object kind, source id, version, byte length, encoding), followed
-  by the bytes.
-- **The latest version wins.** When version *v+1* of an object starts,
-  the sender cancels any unfinished stream for version *v*
-  (`stream_shutdown`, which sends RESET_STREAM). The receiver drops the
-  partial copy.
-- **Low priority.** Streams are sent at a lower urgency than the E-Stop
-  stream (`stream_priority`, already used for E-Stop).
-- **A config change is needed first.** Neither endpoint calls
-  `set_initial_max_stream_data_uni`, and quiche's default is 0, so the peer
-  currently can't send any data on a unidirectional stream.
+- **One unidirectional stream per object.** Each object goes on its own
+  server-initiated unidirectional stream: a 24-byte header (format, kind,
+  source id, encoding, version, byte length, capture time), the bytes, then
+  FIN. Streams are reliable, so an object arrives whole or not at all. The
+  receiver checks the length against the header, caps objects at 64 MB, and
+  drops partial or outdated versions.
+- **Kinds:** occupancy grid (encoding 1: a 20-byte grid header, then one
+  byte per cell, 0 free / 100 occupied / 255 unknown), keyframe cloud, depth
+  snapshot, and opaque blob.
+- **A version in flight always finishes; the newest waits.** While one
+  version of an object is being sent, a newer one waits, and a still-newer
+  one replaces the waiting version, which never started. This proposal first
+  said the newer version should cancel the stream in flight
+  (RESET_STREAM). That starves: with 600 KB maps every 0.5 s on a 5 Mbps
+  link, all 30 versions were cancelled in flight and none arrived. Live
+  sensor frames can be cut because a partial frame is still useful; a
+  partial map is not.
+- **Lowest priority, one at a time.** Bulk streams use urgency 7
+  (E-Stop's is 0) and are non-incremental, so quiche finishes one before
+  starting the next. quiche puts datagrams ahead of stream data in every
+  packet, so a map never sits in front of a control command inside a packet.
+  When `--lossy-rate-control` is on, bulk bytes also come out of the rate
+  cap's budget, after video and sensor datagrams.
+- **A small flow-control window: 256 KB per stream.** quiche's default of 0
+  let neither side send on a unidirectional stream at all. 4 MB was too
+  much: the sender counts an object as done once quiche has accepted all of
+  it, and with a window that size whole maps were "done" long before they
+  were sent, so newer versions piled up in quiche's buffers. 256 KB still
+  allows ~100 Mbps at a 20 ms round trip.
+- **Trying it:** `robot-edge --sim-map SECONDS` publishes the sim room's
+  occupancy grid (1,000 × 600 cells at 2 cm, 600 KB).
+  `operator-console --bulk-save-dir DIR` writes the latest version of each
+  object there, a map also as a `.pgm` image, and the HUD shows a bulk row.
+
+On a 5 Mbps link with a map published every 0.5 s, the operator received a
+complete map about every second (versions 1, 3, 5, ... 26 of 30), which is
+as fast as 600 KB fits through 5 Mbps.
+
+Not done yet: requesting an object (such as a full-resolution snapshot) from
+the operator side, recording bulk objects, and advertising available objects
+in `SESSION_DESCRIBE`.
 
 Streams are also the fallback for any sensor stream the operator wants
 lossless, at the cost of latency under loss.
@@ -390,9 +420,8 @@ Remaining, in order (reordered after [the CM4 measurements](#measured-on-the-cm4
    option: the XGO-Lite's Wi-Fi only does 2.4 GHz.)
    Batched sends (`sendmmsg`/GSO) save CPU but not packets on the air, so
    they come later.
-3. Bulk objects: unidirectional-stream config, the object header,
-   cancel-on-supersede. Whole messages need them: sliced 1 MB messages
-   arrived complete only half the time.
+3. Bulk objects: done (see [Bulk objects](#bulk-objects)). Remaining:
+   on-request objects, recording, and advertising them in the handshake.
 4. A display (Rerun, which the DimOS work already uses, renders points and
    depth images).
 5. Recording ([07](07-recording-and-replay.md)) and `replay-decode`
