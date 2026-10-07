@@ -212,6 +212,9 @@ pub struct HudState {
     /// One row per sensor the operator selected (docs/13), rebuilt on every
     /// SESSION_DESCRIBE.
     pub sensors: Vec<SensorHud>,
+    /// Bulk objects (docs/13): the last one received and the running counts.
+    pub bulk_last: Option<String>,
+    pub bulk_stats: roboprotocol_core::bulk::BulkStats,
 }
 
 /// Sensor-slice stats for one sensor's row in the channels panel.
@@ -292,6 +295,8 @@ impl HudState {
             gamepad_arm_fine: false,
             recording_dropped: 0,
             sensors: Vec::new(),
+            bulk_last: None,
+            bulk_stats: roboprotocol_core::bulk::BulkStats::default(),
         }
     }
 
@@ -411,7 +416,7 @@ fn draw(f: &mut Frame, hud: &HudState) {
             Constraint::Length(4), // header
             Constraint::Length(3), // e-stop banner
             Constraint::Min(6),    // body
-            Constraint::Length(6 + hud.sensors.len() as u16), // channels panel, one row per sensor
+            Constraint::Length(7 + hud.sensors.len() as u16), // channels panel: one row per sensor, plus bulk
             Constraint::Length(1), // footer
         ])
         .split(f.area());
@@ -717,7 +722,18 @@ fn draw_channels_panel(f: &mut Frame, area: Rect, hud: &HudState) {
             Cell::from(telemetry_age),
         ]),
     ];
-    let rows = rows.into_iter().chain(hud.sensors.iter().map(|s| sensor_row(s, now)));
+    let bulk = &hud.bulk_stats;
+    let bulk_row = Row::new(vec![
+        Cell::from("C (bulk)"),
+        Cell::from("--"),
+        Cell::from("--"),
+        Cell::from(bulk.completed.to_string()),
+        Cell::from(match &hud.bulk_last {
+            Some(last) => format!("{last}, {} superseded, {} rejected", bulk.superseded, bulk.rejected),
+            None => "no object yet".to_string(),
+        }),
+    ]);
+    let rows = rows.into_iter().chain(hud.sensors.iter().map(|s| sensor_row(s, now))).chain(std::iter::once(bulk_row));
 
     let table = Table::new(
         rows,

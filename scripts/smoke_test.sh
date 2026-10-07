@@ -8,6 +8,7 @@
 #   2b. sensor slices (docs/13) from two --sim-sensor sources assemble into
 #      frames on the operator -- the lidar's descriptor also makes
 #      SESSION_DESCRIBE span more than one packet
+#   2c. a bulk object (docs/13, --sim-map) arrives whole on its own stream
 #   3. the watchdog E-Stop latches within the Class D threshold (400ms) once
 #      the operator link goes silent
 #
@@ -81,7 +82,7 @@ setsid ./target/debug/robot-edge \
     --listen "127.0.0.1:$PORT" \
     --cert "$CERT_DIR/robot/robot.crt" --key "$CERT_DIR/robot/robot.key" --ca "$CERT_DIR/dev-ca/ca.crt" \
     --stub-bridge --robot-id smoke_test \
-    --sim-sensor lidar --sim-sensor radar \
+    --sim-sensor lidar --sim-sensor radar --sim-map 1 \
     > "$ROBOT_LOG" 2>&1 < /dev/null &
 ROBOT_PID=$!
 disown
@@ -109,6 +110,10 @@ echo "== waiting for sensor frames (lidar, radar) =="
 wait_for_count "$OPERATOR_LOG" "first sensor frame assembled" 2 10 || fail "operator-console didn't assemble a frame from both sim sensors"
 echo "  ok: sensor slices assembled into frames"
 
+echo "== waiting for a bulk object (sim map) =="
+wait_for_log "$OPERATOR_LOG" "bulk object received" 10 || fail "operator-console never received a bulk object"
+echo "  ok: bulk object received"
+
 echo "== killing operator-console to trigger the watchdog =="
 kill -9 "$OPERATOR_PID" 2>/dev/null
 OPERATOR_PID=""
@@ -119,4 +124,4 @@ wait_for_log "$ROBOT_LOG" "E-Stop latched" 3 || fail "watchdog never latched E-S
 echo "  ok: watchdog E-Stop latched after operator link silence"
 
 echo
-echo "PASS: HELLO -> SESSION_DESCRIBE/ACCEPT -> sensor slices -> Channel B -> watchdog E-Stop all verified"
+echo "PASS: HELLO -> SESSION_DESCRIBE/ACCEPT -> sensor slices -> bulk objects -> Channel B -> watchdog E-Stop all verified"

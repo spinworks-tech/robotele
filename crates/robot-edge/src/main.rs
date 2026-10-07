@@ -8,6 +8,7 @@ mod lossy_rate;
 mod quic_server;
 mod safety_task;
 mod session_handler;
+mod bulk_sender;
 mod sim_sensor;
 mod video;
 mod xgo_profile;
@@ -70,6 +71,7 @@ struct Cli {
     slice_payload_bytes: usize,
     sensor_frame_policy: lossy_queue::SensorFramePolicy,
     lossy_rate_control: bool,
+    sim_map_period: Option<Duration>,
 }
 
 /// Maps a `--record` list entry to a category. `robot-edge` has no
@@ -125,6 +127,7 @@ impl Cli {
         let mut slice_payload_bytes = 0usize;
         let mut sensor_frame_policy = lossy_queue::SensorFramePolicy::Cut;
         let mut lossy_rate_control = false;
+        let mut sim_map_period = None;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -177,6 +180,11 @@ impl Cli {
                     let kind = it.next().context("--sim-sensor needs a value (cloud|lidar|radar|depth)")?;
                     sim_sensors.push(sim_sensor::SimSensorKind::parse(&kind).with_context(|| format!("unknown --sim-sensor {kind}, expected cloud|lidar|radar|depth"))?);
                 }
+                "--sim-map" => {
+                    let secs: f64 = it.next().context("--sim-map needs a period in seconds")?.parse()?;
+                    anyhow::ensure!(secs >= 0.1, "--sim-map period must be at least 0.1 s");
+                    sim_map_period = Some(Duration::from_secs_f64(secs));
+                }
                 "--lossy-rate-control" => {
                     lossy_rate_control = match it.next().context("--lossy-rate-control needs a value (on|off)")?.as_str() {
                         "on" => true,
@@ -209,7 +217,8 @@ impl Cli {
                          [--cc reno|cubic|bbr|bbr2]   (congestion control, default cubic)\n  \
                          [--slice-payload-bytes N]   (sensor slice payload; default 0 = as large as the connection allows)\n  \
                          [--sensor-frame-policy cut|finish]   (new sensor frame vs a partly sent one; default cut)\n  \
-                         [--lossy-rate-control on|off]   (adaptive cap on video and sensor data; default off)"
+                         [--lossy-rate-control on|off]   (adaptive cap on video and sensor data; default off)\n  \
+                         [--sim-map SECONDS]   (publish the sim room's occupancy grid as a bulk object this often)"
                     );
                     std::process::exit(0);
                 }
@@ -257,6 +266,7 @@ impl Cli {
             slice_payload_bytes,
             sensor_frame_policy,
             lossy_rate_control,
+            sim_map_period,
         })
     }
 
@@ -348,6 +358,7 @@ async fn main() -> Result<()> {
         slice_payload_bytes: cli.slice_payload_bytes,
         sensor_frame_policy: cli.sensor_frame_policy,
         lossy_rate_control: cli.lossy_rate_control,
+        sim_map_period: cli.sim_map_period,
     };
 
     let profile = xgo_profile::xgo_lite_v2_profile();

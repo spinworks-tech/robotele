@@ -27,6 +27,7 @@ use crate::channel_b::{self, ChannelBCategory, ChannelBFrameData, TeleopCommand,
 use crate::hello_handler;
 use crate::safety_task::SafetyTask;
 use crate::lossy_queue::{LossyQueue, SensorFramePolicy, QUICHE_LOSSY_LIMIT};
+use crate::bulk_sender::{self, BulkSender};
 use crate::lossy_rate::LossyRateControl;
 use crate::session_handler;
 use crate::sim_sensor::{self, SensorFrame, SensorRx, SimSensorKind};
@@ -37,6 +38,14 @@ use roboprotocol_core::bench::{self as bench_proto, BenchMode, BENCH_ECHO_TICK_I
 use roboprotocol_core::profile::RobotProfile;
 
 const MAX_DATAGRAM_SIZE: usize = 1452;
+
+/// Flow-control window per unidirectional stream. Small on purpose: it's
+/// how far quiche may buffer a bulk object ahead of what the receiver has
+/// read, and `bulk_sender` treats an object as done once quiche has taken
+/// all of it. With a 4 MB window a whole map was "done" long before it was
+/// sent, and newer versions piled up behind it in quiche's buffers. 256 KB
+/// still allows ~100 Mbps at 20 ms RTT.
+pub const BULK_STREAM_WINDOW: u64 = 256 * 1024;
 
 pub struct ServerArgs {
     pub listen: SocketAddr,
@@ -73,6 +82,9 @@ pub struct ServerArgs {
     /// `--lossy-rate-control on`: cap video and sensor data adaptively to
     /// keep queueing delay low (see `lossy_rate`).
     pub lossy_rate_control: bool,
+    /// `--sim-map SECONDS`: publish the sim room's occupancy grid as a bulk
+    /// object this often (docs/13, "Bulk objects").
+    pub sim_map_period: Option<Duration>,
     /// `--cc`: congestion control for the robot's sending direction, where
     /// video and sensor data can saturate the uplink. quiche's default is
     /// CUBIC, which keeps a bottleneck's buffer nearly full; a delay-based
@@ -88,6 +100,17 @@ pub struct BenchSendSpec {
     pub rate_hz: f64,
     pub duration_s: f64,
 }
+
+/// `--sim-map`: the occupancy grid's next version and how often to send it.
+struct SimMap {
+    period: Duration,
+    version: u32,
+    started: Instant,
+}
+
+/// Map cells of 2 cm: the 20 m x 12 m sim room is a 1,000 x 600 grid, a
+/// 600 KB object.
+const SIM_MAP_RESOLUTION_M: f32 = 0.02;
 
 /// Progress of a `--bench send` run, which starts when the session reaches
 /// Operating.
@@ -221,6 +244,8 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             sensor_rx,
             lossy: LossyQueue::with_sensor_policy(args.sensor_frame_policy),
             lossy_rate: args.lossy_rate_control.then(|| LossyRateControl::new(Instant::now())),
+            bulk: BulkSender::new(),
+            sim_map: args.sim_map_period.map(|period| SimMap { period, version: 0, started: Instant::now() }),
             slice_payload_bytes: args.slice_payload_bytes,
             safety: SafetyTask::with_watchdog_threshold_ms(args.task_class, args.watchdog_threshold_ms, Instant::now()),
             bridge,
@@ -283,6 +308,10 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
                 "lossy rate control at session end"
             );
         }
+        let bulk = session.bulk.stats();
+        if bulk.published > 0 {
+            tracing::info!(published = bulk.published, completed = bulk.completed, superseded = bulk.superseded, "bulk objects at session end");
+        }
         let lossy = session.lossy.stats();
         tracing::info!(
             video_nals_dropped = lossy.video_nals_dropped,
@@ -316,6 +345,8 @@ struct Session {
     lossy: LossyQueue,
     /// `None` unless `--lossy-rate-control on`.
     lossy_rate: Option<LossyRateControl>,
+    bulk: BulkSender,
+    sim_map: Option<SimMap>,
     slice_payload_bytes: usize,
     safety: SafetyTask,
     bridge: BridgeSupervisor,
@@ -432,6 +463,8 @@ impl Session {
         // `--bench send` pacing: each tick sends whatever is due by then.
         let mut bench_ticker = tokio::time::interval(Duration::from_millis(1));
         bench_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut map_ticker = tokio::time::interval(self.sim_map.as_ref().map_or(Duration::from_secs(3600), |m| m.period));
+        map_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         self.flush(socket, &mut out).await?;
 
@@ -464,6 +497,10 @@ impl Session {
                 _ = self.shutdown.changed() => {
                     self.shut_down(socket, &mut out).await;
                     return Ok(());
+                }
+                _ = map_ticker.tick(), if self.phase == Phase::Operating && self.sim_map.is_some() => {
+                    self.publish_sim_map();
+                    self.flush(socket, &mut out).await?;
                 }
                 _ = bench_ticker.tick(), if self.phase == Phase::Operating && self.bench_send.as_ref().is_some_and(|b| !b.done) => {
                     self.bench_send_step();
@@ -750,6 +787,35 @@ impl Session {
             0 => max,
             n => n.max(DEFAULT_SLICE_PAYLOAD).min(max),
         })
+    }
+
+    /// Publishes the next version of the sim map (`--sim-map`).
+    fn publish_sim_map(&mut self) {
+        let Some(map) = self.sim_map.as_mut() else { return };
+        map.version += 1;
+        let grid = crate::sim_sensor::occupancy_grid(map.started.elapsed().as_secs_f32(), SIM_MAP_RESOLUTION_M);
+        let payload = grid.encode();
+        let header = bulk_sender::header(
+            roboprotocol_core::bulk::BulkKind::OccupancyGrid,
+            0,
+            roboprotocol_core::bulk::OCCUPANCY_GRID_ENCODING,
+            map.version,
+            &payload,
+        );
+        self.bulk.publish(&mut self.conn, header, &payload);
+    }
+
+    /// Writes waiting bulk object data, after the lossy datagrams and within
+    /// what's left of the rate cap's budget when that's on.
+    fn pump_bulk(&mut self) {
+        if self.bulk.pending_bytes() == 0 {
+            return;
+        }
+        let budget = self.lossy_rate.as_mut().map(|r| r.available(Instant::now()));
+        let written = self.bulk.pump(&mut self.conn, budget);
+        if let Some(rate) = &mut self.lossy_rate {
+            rate.consume(written);
+        }
     }
 
     /// Moves lossy datagrams into quiche while its queue is below
@@ -1221,6 +1287,7 @@ impl Session {
             // whatever rate the congestion window allows while never
             // queueing more than `QUICHE_LOSSY_LIMIT` deep inside quiche.
             self.feed_lossy();
+            self.pump_bulk();
             match self.conn.send(out) {
                 Ok((len, send_info)) => {
                     if let Err(e) = socket.send_to(&out[..len], send_info.to).await {
@@ -1283,6 +1350,9 @@ fn build_quiche_config(args: &ServerArgs) -> Result<quiche::Config> {
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
     config.set_initial_max_streams_bidi(16);
     config.set_initial_max_streams_uni(16);
+    // Bulk objects travel on unidirectional streams (docs/13); quiche's
+    // default of 0 would let neither side send any data on one.
+    config.set_initial_max_stream_data_uni(BULK_STREAM_WINDOW);
     config.enable_dgram(true, 4096, 4096);
     config.set_cc_algorithm(args.cc);
     // 0-RTT resumption -- accepts an operator's early-arriving HELLO on
