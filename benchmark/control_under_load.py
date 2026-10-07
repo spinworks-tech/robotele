@@ -77,7 +77,9 @@ def run(load, variant):
                            cwd=REPO, capture_output=True, text=True, timeout=WARMUP_S + DURATION_S + 60)
         robot_log = ssh("sed 's/\\x1b\\[[0-9;]*m//g' /tmp/control-load.log").stdout
     finally:
-        ssh("pkill -INT -x robot-edge; sleep 1; rm -f /tmp/control-load.log; true")
+        # SIGINT first (a clean stop), then SIGKILL: builds before the
+        # SIGINT handler ignore SIGINT.
+        ssh("pkill -INT -x robot-edge; sleep 1; pkill -KILL -x robot-edge; rm -f /tmp/control-load.log; true")
     m = re.search(r"pingpace sent=(\d+) replies=(\d+) lost=(\d+) p50=([\d.na]+) p99=([\d.na]+) max=([\d.na]+) ms "
                   r"late100=([\d.]+) late400=([\d.]+) video_mbps=([\d.]+) sensor_mbps=([\d.]+)", r.stdout)
     if not m:

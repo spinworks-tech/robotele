@@ -250,6 +250,42 @@ driver's firmware queue (`brcmfmac` on SDIO) and at the access point, where
 (two `pfifo_fast` runs hit a bad stretch: p99 11 s and 35 s, over half the
 pings lost). So the robot itself has to send less than the link carries.
 
+**Capping the robot's own lossy traffic does work, when the link is
+usable.** `robot-edge --lossy-rate-control on` (`lossy_rate.rs`) caps video
+and sensor datagrams with a token bucket. Its rate follows queueing delay:
+the smoothed RTT minus the lowest smoothed RTT of the last 5 minutes. It's
+cut 20% every 100 ms while that delay is over 20 ms, or while data went out
+and nothing new was acknowledged; it rises 0.25 Mbps per 100 ms otherwise,
+with a floor of 1 Mbps. Control traffic is never metered.
+`benchmark/rate_control_ab.py`, L3, cap off against on (2026-10-07):
+
+| Run | Idle ping p50 / p90 | Cap | Control p50 / p99 | > 400 ms | Watchdog latched | Sensors / video delivered |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 2.4 / 7.5 ms | off | 1,948 / 8,989 ms | 35% | yes | 18.6 / 0.9 Mbps |
+| 1 | | **on** | **15 / 183 ms** | **0%** | **no** | **5.7 / 1.5 Mbps** |
+| 2 | 30 / 115 ms | off | 361 / 11,321 ms | 26% | yes | 19.9 / 1.1 Mbps |
+| 2 | | on | 397 / 2,351 ms | 44% | yes | 0.3 / 0.1 Mbps |
+
+- **On a usable link (run 1), the cap meets the goal.** Under 2× overload,
+  control kept a 15 ms median, nothing over 400 ms and no watchdog latch,
+  while sensors still delivered 5.7 Mbps and video 1.5 Mbps. Without the
+  cap: a 2 s median and a latch. A run the day before, with an earlier
+  version of the controller, showed the same (p50 19 ms, p99 258 ms,
+  nothing over 400 ms).
+- **On a link already congested by something else (run 2, idle ping 30 ms
+  before any of our traffic), it can't help.** The cap cut our traffic to
+  its floor, as designed, and control was still poor: a sender can't
+  remove congestion it isn't causing.
+- **The first version was blind.** quiche 0.22's `PathStats::min_rtt`
+  reports `None` from about a second into a session (its windowed minimum
+  drops to exactly zero), and the fallback made the measured queueing
+  delay zero: the cap rose to its ceiling while control round trips reached
+  3 s. A once-a-second trace of the controller showed it; the controller
+  now tracks its own baseline.
+- **Not yet conclusive.** A third round and a camera-only pair were ruined
+  by the operator laptop dropping off Wi-Fi mid-run. The cap stays off by
+  default until a full multi-round run on a stable link confirms it.
+
 Caveats: two rounds only, on a shared 2.4 GHz channel. The camera's bitrate
 differed between rounds (2.1 against 0.6 Mbps, lighting most likely), which
 is why L1 and L2 vary. The link also varies from day to day: three more L3
