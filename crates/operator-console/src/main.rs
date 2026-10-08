@@ -24,6 +24,8 @@ use roboprotocol_core::safety::TaskClass;
 use crate::quic_client::{ClientArgs, VideoBackend};
 
 struct Cli {
+    /// `--bulk-save-dir`: write each bulk object's latest version here.
+    bulk_save_dir: Option<PathBuf>,
     connect: SocketAddr,
     bind: SocketAddr,
     server_name: String,
@@ -99,6 +101,7 @@ impl Cli {
         let mut bench_duration_s = 30.0f64;
         let mut bench_raw = false;
         let mut bench_warmup_s = 1.0f64;
+        let mut bulk_save_dir = None;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -148,6 +151,7 @@ impl Cli {
                 "--record-video-budget-mb" => record_video_budget_mb = it.next().context("--record-video-budget-mb needs a value")?.parse()?,
                 "--record-flush-secs" => record_flush_secs = it.next().context("--record-flush-secs needs a value")?.parse()?,
                 "--bench" => bench_mode = Some(it.next().context("--bench needs a value (pingpong|send|recv|pingpace)")?),
+                "--bulk-save-dir" => bulk_save_dir = Some(PathBuf::from(it.next().context("--bulk-save-dir needs a value")?)),
                 "--bench-warmup-s" => bench_warmup_s = it.next().context("--bench-warmup-s needs a value")?.parse()?,
                 "--bench-count" => bench_count = it.next().context("--bench-count needs a value")?.parse()?,
                 "--bench-payload-bytes" => bench_payload_bytes = it.next().context("--bench-payload-bytes needs a value")?.parse()?,
@@ -158,7 +162,7 @@ impl Cli {
                     println!(
                         "Usage: operator-console [--connect ADDR] [--bind ADDR] [--server-name NAME]\n  \
                          [--cert PATH] [--key PATH] [--ca PATH] [--task-class B|C|D|E] [--tick-hz N]\n  \
-                         [--video] [--video-backend ffplay|native] [--video-overlay] [--ffplay-bin PATH]\n  \
+                         [--bulk-save-dir DIR] [--video] [--video-backend ffplay|native] [--video-overlay] [--ffplay-bin PATH]\n  \
                          [--move-stale-ms N] [--observer]\n  \
                          [--record-dir PATH] [--record-extra haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
@@ -252,6 +256,7 @@ impl Cli {
             record_video_budget_mb,
             record_flush_secs,
             bench,
+            bulk_save_dir,
         })
     }
 
@@ -363,6 +368,7 @@ async fn main() -> Result<()> {
         recording,
         screenshot_dir,
         bench: cli.bench,
+        bulk_save_dir: cli.bulk_save_dir,
     };
 
     // Interactive mode enters the alternate screen inside `ui::Console`

@@ -128,6 +128,32 @@ impl Link<'_> {
         self.flush().await
     }
 
+    /// Reads any bulk-object streams (docs/13) so their flow control keeps
+    /// moving during a benchmark; returns (objects completed, bytes read).
+    fn drain_bulk(&mut self, rx: &mut roboprotocol_core::bulk::BulkReceiver) -> (u64, u64) {
+        let (mut objects, mut bytes) = (0, 0);
+        let mut sbuf = vec![0u8; 65535];
+        let readable: Vec<u64> = self.conn.readable().collect();
+        for id in readable.into_iter().filter(|&id| roboprotocol_core::bulk::is_bulk_stream(id)) {
+            loop {
+                match self.conn.stream_recv(id, &mut sbuf) {
+                    Ok((len, fin)) => {
+                        bytes += len as u64;
+                        if let Ok(Some(_)) = rx.on_data(id, &sbuf[..len], fin) {
+                            objects += 1;
+                        }
+                    }
+                    Err(quiche::Error::StreamReset(_)) => {
+                        rx.on_reset(id);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        (objects, bytes)
+    }
+
     /// Echo seqs among the Channel B datagrams received so far.
     fn drain_echoes(&mut self) -> Vec<u64> {
         let mut seqs = Vec::new();
@@ -408,6 +434,8 @@ async fn pingpace(
     let mut pending: std::collections::HashMap<u64, Instant> = std::collections::HashMap::new();
     let (mut timed_sent, mut rtts) = (0u64, Vec::new());
     let (mut video_bytes, mut sensor_bytes) = (0u64, 0u64);
+    let mut bulk_rx = roboprotocol_core::bulk::BulkReceiver::new();
+    let (mut bulk_objects, mut bulk_bytes) = (0u64, 0u64);
     let mut dbuf = vec![0u8; MAX_UDP_PAYLOAD];
     let (mut seq, mut next_send) = (first_seq, start);
     loop {
@@ -425,6 +453,11 @@ async fn pingpace(
             next_send += period;
         }
         let in_window = (timed_from..send_until).contains(&now);
+        let (objects, bytes) = link.drain_bulk(&mut bulk_rx);
+        if in_window {
+            bulk_objects += objects;
+            bulk_bytes += bytes;
+        }
         while let Ok(len) = link.conn.dgram_recv(&mut dbuf) {
             let (mut v, mut s) = (0u64, 0u64);
             if let Some(echo) = classify_reply(&dbuf[..len], &mut v, &mut s) {
@@ -458,7 +491,7 @@ async fn pingpace(
     let over = |limit: f64| rtts.iter().filter(|&&r| r > limit).count() as f64 / timed_sent.max(1) as f64;
     let mbps = |bytes: u64| bytes as f64 * 8.0 / duration_s / 1e6;
     println!(
-        "pingpace sent={timed_sent} replies={} lost={lost} p50={:.2} p99={:.2} max={:.2} ms late100={:.4} late400={:.4} video_mbps={:.2} sensor_mbps={:.2}",
+        "pingpace sent={timed_sent} replies={} lost={lost} p50={:.2} p99={:.2} max={:.2} ms late100={:.4} late400={:.4} video_mbps={:.2} sensor_mbps={:.2} bulk_objects={bulk_objects} bulk_mbps={:.2}",
         rtts.len(),
         ms(0.5),
         ms(0.99),
@@ -466,7 +499,8 @@ async fn pingpace(
         over(0.100),
         over(0.400),
         mbps(video_bytes),
-        mbps(sensor_bytes)
+        mbps(sensor_bytes),
+        mbps(bulk_bytes)
     );
     Ok(())
 }

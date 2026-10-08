@@ -45,7 +45,8 @@ LOADS = {
 VARIANTS = {"raw": ["--bench-raw"], "full": []}
 RATE_HZ, WARMUP_S, DURATION_S = 50, 10, 60
 ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-FIELDS = ["sent", "replies", "lost", "p50", "p99", "max", "late100", "late400", "video_mbps", "sensor_mbps"]
+FIELDS = ["sent", "replies", "lost", "p50", "p99", "max", "late100", "late400", "video_mbps", "sensor_mbps",
+          "bulk_objects", "bulk_mbps"]
 log_f = open(OUT / "run.log", "w")
 
 
@@ -81,7 +82,8 @@ def run(load, variant):
         # SIGINT handler ignore SIGINT.
         ssh("pkill -INT -x robot-edge; sleep 1; pkill -KILL -x robot-edge; rm -f /tmp/control-load.log; true")
     m = re.search(r"pingpace sent=(\d+) replies=(\d+) lost=(\d+) p50=([\d.na]+) p99=([\d.na]+) max=([\d.na]+) ms "
-                  r"late100=([\d.]+) late400=([\d.]+) video_mbps=([\d.]+) sensor_mbps=([\d.]+)", r.stdout)
+                  r"late100=([\d.]+) late400=([\d.]+) video_mbps=([\d.]+) sensor_mbps=([\d.]+) "
+                  r"bulk_objects=(\d+) bulk_mbps=([\d.]+)", r.stdout)
     if not m:
         return {"load": load, "variant": variant, "error": (r.stdout + r.stderr)[-300:]}
     t = dict(zip(FIELDS, (float(x) for x in m.groups())))

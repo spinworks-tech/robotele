@@ -174,6 +174,9 @@ pub struct ClientArgs {
     /// Benchmark-only (`--bench`): once the session reaches Operating, hand
     /// the connection to `crate::bench` instead of the interactive loop.
     pub bench: Option<crate::bench::BenchSpec>,
+    /// `--bulk-save-dir`: where each bulk object's latest version is written
+    /// (and an occupancy grid also as a `.pgm` image). `None`: not saved.
+    pub bulk_save_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,6 +381,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         args,
         recorder,
         sensors: Vec::new(),
+        bulk_rx: roboprotocol_core::bulk::BulkReceiver::new(),
     };
 
     // `connect_with_resume_fallback` can leave `conn` already established
@@ -475,6 +479,8 @@ struct Client {
     /// `--record-dir` was never given (see `Cli::recorder_config` in
     /// `main.rs`).
     recorder: roboprotocol_recording::Recorder,
+    /// Reassembles bulk objects from the robot's unidirectional streams.
+    bulk_rx: roboprotocol_core::bulk::BulkReceiver,
     /// One per sensor selected in SESSION_ACCEPT, in the same order as
     /// `hud.sensors`; rebuilt on every SESSION_DESCRIBE.
     sensors: Vec<SensorReceiver>,
@@ -624,6 +630,7 @@ impl Client {
                     self.phase = Phase::AwaitingHello;
                     self.describe_buf.clear();
                     self.video_gate = crate::video::gate::DeltaGate::new();
+                    self.bulk_rx = roboprotocol_core::bulk::BulkReceiver::new();
                     self.session_info = None;
                     self.sensors.clear();
                     self.hud.sensors.clear();
@@ -816,6 +823,9 @@ impl Client {
 
     fn on_stream_readable(&mut self, stream_id: u64) {
         let mut sbuf = vec![0u8; 65535];
+        if roboprotocol_core::bulk::is_bulk_stream(stream_id) {
+            return self.on_bulk_readable(stream_id, &mut sbuf);
+        }
         loop {
             match self.conn.stream_recv(stream_id, &mut sbuf) {
                 // SESSION_DESCRIBE can span several packets, so stream 1 is
@@ -836,6 +846,48 @@ impl Client {
                     break;
                 }
             }
+        }
+    }
+
+    /// Reads a bulk object's stream (docs/13, "Bulk objects").
+    fn on_bulk_readable(&mut self, stream_id: u64, sbuf: &mut [u8]) {
+        loop {
+            match self.conn.stream_recv(stream_id, sbuf) {
+                Ok((len, fin)) => match self.bulk_rx.on_data(stream_id, &sbuf[..len], fin) {
+                    Ok(Some(object)) => self.on_bulk_object(object),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(stream_id, error = %e, "dropping a malformed bulk object"),
+                },
+                Err(quiche::Error::StreamReset(_)) => {
+                    self.bulk_rx.on_reset(stream_id);
+                    break;
+                }
+                Err(quiche::Error::Done) => break,
+                Err(e) => {
+                    tracing::warn!(error = ?e, stream_id, "bulk stream_recv error");
+                    break;
+                }
+            }
+        }
+        self.hud.bulk_stats = self.bulk_rx.stats();
+    }
+
+    fn on_bulk_object(&mut self, object: roboprotocol_core::bulk::BulkObject) {
+        use roboprotocol_core::bulk::{BulkKind, OccupancyGrid};
+        let h = object.header;
+        tracing::info!(kind = h.kind.name(), source = h.source_id, version = h.version, bytes = h.length, "bulk object received");
+        self.hud.bulk_last = Some(format!("{} v{} {} KB", h.kind.name(), h.version, h.length / 1024));
+        let Some(dir) = &self.args.bulk_save_dir else { return };
+        let base = dir.join(format!("{}-{}", h.kind.name(), h.source_id));
+        let grid = (h.kind == BulkKind::OccupancyGrid).then(|| OccupancyGrid::decode(&object.bytes)).flatten();
+        let saved = std::fs::create_dir_all(dir)
+            .and_then(|_| write_atomically(&base.with_extension("bin"), &object.bytes))
+            .and_then(|_| match &grid {
+                Some(g) => write_atomically(&base.with_extension("pgm"), &g.to_pgm()),
+                None => Ok(()),
+            });
+        if let Err(e) = saved {
+            tracing::warn!(error = %e, dir = %dir.display(), "failed to save bulk object");
         }
     }
 
@@ -1369,6 +1421,14 @@ async fn flush_once(conn: &mut quiche::Connection, socket: &UdpSocket) -> Result
     Ok(())
 }
 
+/// Writes via a temporary file and a rename, so a viewer never sees half a
+/// file.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
 fn recording_category_for(category: ChannelBCategory) -> roboprotocol_recording::Category {
     match category {
         ChannelBCategory::Command => roboprotocol_recording::Category::ChannelBCommand,
@@ -1405,6 +1465,11 @@ fn build_quiche_config(args: &ClientArgs) -> Result<quiche::Config> {
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
     config.set_initial_max_streams_bidi(16);
     config.set_initial_max_streams_uni(16);
+    // The robot sends bulk objects on unidirectional streams (docs/13): this
+    // is how much of each it may send ahead of what we've read. Kept small
+    // (see robot-edge's BULK_STREAM_WINDOW) so newer versions of an object
+    // don't pile up behind the one in flight.
+    config.set_initial_max_stream_data_uni(256 * 1024);
     config.enable_dgram(true, 4096, 4096);
     // 0-RTT resumption: lets a reconnect to the same still-running robot-edge
     // skip the full handshake RTT -- only HELLO (Channel C stream 0) is ever

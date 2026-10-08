@@ -159,6 +159,13 @@ impl LossyRateControl {
         self.tokens >= bytes as f64
     }
 
+    /// Tokens available now, after refilling: the bytes of bulk data that
+    /// may follow the lossy datagrams (see `bulk_sender`).
+    pub fn available(&mut self, now: Instant) -> usize {
+        self.has_room(now, 0);
+        self.tokens.max(0.0) as usize
+    }
+
     pub fn consume(&mut self, bytes: usize) {
         self.tokens -= bytes as f64;
     }

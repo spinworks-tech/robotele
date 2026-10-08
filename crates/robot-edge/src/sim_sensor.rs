@@ -265,6 +265,37 @@ fn render(kind: SimSensorKind, descriptor: &SensorDescriptor, scene: &Scene) -> 
     }
 }
 
+/// `--sim-map`: the sim room as an occupancy grid seen from above, `t_s`
+/// seconds in (the walking person moves between versions). Cell size is
+/// `resolution_m`; the grid covers the room with the walls as its border.
+pub fn occupancy_grid(t_s: f32, resolution_m: f32) -> roboprotocol_core::bulk::OccupancyGrid {
+    let (x0, x1) = ROOM_X_M;
+    let (y0, y1) = ROOM_Y_M;
+    let width = ((x1 - x0) / resolution_m).round() as u32;
+    let height = ((y1 - y0) / resolution_m).round() as u32;
+    let scene = Scene::at(t_s);
+    let mut cells = vec![0u8; (width * height) as usize];
+    for row in 0..height {
+        for col in 0..width {
+            let border = row == 0 || col == 0 || row == height - 1 || col == width - 1;
+            let x = x0 + (col as f32 + 0.5) * resolution_m;
+            let y = y0 + (row as f32 + 0.5) * resolution_m;
+            let pillar = scene.pillars.iter().any(|p| (x - p.x).powi(2) + (y - p.y).powi(2) <= p.radius * p.radius);
+            if border || pillar {
+                cells[(row * width + col) as usize] = 100;
+            }
+        }
+    }
+    roboprotocol_core::bulk::OccupancyGrid {
+        width,
+        height,
+        resolution_mm: (resolution_m * 1000.0).round() as u32,
+        origin_x_mm: (x0 * 1000.0) as i32,
+        origin_y_mm: (y0 * 1000.0) as i32,
+        cells,
+    }
+}
+
 /// One frame's elements, ready for `sensor::slice_frame`.
 pub struct SensorFrame {
     pub sensor_id: u8,
@@ -404,6 +435,23 @@ mod tests {
         // Dead centre misses every pillar and meets the wall at 12 m,
         // beyond the 10 m cutoff.
         assert_eq!(img.depth_mm[(h / 2) * w + w / 2], 0);
+    }
+
+    #[test]
+    fn occupancy_grid_marks_walls_and_pillars_and_follows_the_person() {
+        let g = occupancy_grid(0.0, 0.02);
+        assert_eq!((g.width, g.height, g.resolution_mm), (1000, 600, 20));
+        let cell = |g: &roboprotocol_core::bulk::OccupancyGrid, x: f32, y: f32| {
+            let col = ((x - ROOM_X_M.0) / 0.02) as u32;
+            let row = ((y - ROOM_Y_M.0) / 0.02) as u32;
+            g.cells[(row * g.width + col) as usize]
+        };
+        assert_eq!(cell(&g, 3.0, 2.0), 100, "static pillar");
+        assert_eq!(cell(&g, 0.0, 0.0), 0, "the robot's own spot is free");
+        assert_eq!(g.cells[0], 100, "wall");
+        assert_eq!(cell(&g, 4.0, -0.5), 100, "person at x = 4 at t = 0");
+        let later = occupancy_grid(std::f32::consts::PI, 0.02); // the person has walked to x ~ 6
+        assert_eq!(cell(&later, 4.0, -0.5), 0);
     }
 
     #[tokio::test]
