@@ -1085,9 +1085,11 @@ impl Client {
     }
 
     fn on_telemetry(&mut self, frame: &ChannelBFrameData, wire_len: usize) {
-        let now_us = timestamp::now_micros();
-        if frame.timestamp > 0 && now_us > frame.timestamp {
-            self.hud.rtt_ms = Some((now_us - frame.timestamp) as f64 / 1000.0);
+        // QUIC's smoothed RTT, not now - frame.timestamp: the robot's clock
+        // isn't synced to ours (a Pi with no RTC on a network without NTP can
+        // be days off), so a cross-host timestamp difference is meaningless.
+        if let Some(path) = self.conn.path_stats().next() {
+            self.hud.rtt_ms = Some(path.rtt.as_secs_f64() * 1e3);
         }
         let now = std::time::Instant::now();
         self.hud.last_telemetry_at = Some(now);
