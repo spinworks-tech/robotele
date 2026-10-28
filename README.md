@@ -123,6 +123,29 @@ An 8-second clip from the arm reaching for a ball, taken from the recorded Chann
   <img src="screenshots/xgo-lite-recording.gif" alt="An 8-second animated clip of the XGO-Lite V2's arm reaching down toward a blue ball on a table, decoded from a recorded Channel A session with crosshair, fps/kbps, capture_us, and arm x/z/claw overlays burned in." width="480">
 </p>
 
+### Connecting from Windows on an offline network
+
+On a robot network with no internet (such as the Spinworks Wi-Fi), join the laptop to that network and connect to the robot's IP:
+
+```cmd
+.\target\release\operator-console.exe --connect <robot-ip>:4433 --server-name robot-edge --video-backend native --video
+```
+
+**Set the Pi's clock after every boot.** The CM4 has no battery-backed clock, and without internet it can't reach an NTP server, so after a power cycle its clock can be days off. Robot-side timestamps then disagree with the laptop's, which affects recordings (`capture_us`) and any cross-host latency figure. The console's `rtt` line uses QUIC's own round-trip measurement, so it stays correct either way. Copy the laptop's UTC time to the Pi:
+
+```cmd
+:: from cmd
+powershell -Command "$t=(Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'); ssh pi@<robot-ip> \"sudo date -u -s '$t'\""
+```
+
+```powershell
+# from PowerShell
+$t = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+ssh pi@<robot-ip> "sudo date -u -s '$t'"
+```
+
+The time is taken before ssh prompts for a password, so the Pi ends up a few seconds behind. That is close enough for recordings. To check, compare `ssh pi@<robot-ip> date -u` with the laptop's UTC time.
+
 ---
 
 ## Documentation
