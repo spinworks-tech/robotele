@@ -4,9 +4,9 @@
 //! Latest-mode samples leave as datagrams through `pop_datagram`, which the
 //! caller drains after its control datagrams, taking turns with video and
 //! sensor data on the robot (see robot-edge's `feed_lossy`). Reliable
-//! samples go out on one
-//! unidirectional stream at `TOPIC_URGENCY`, below every other stream but
-//! bulk objects. Both share one `RateCap` (`--zenoh-max-mbps`), so forwarded
+//! samples go out on two unidirectional streams (`ReliableLane`): small ones
+//! at `TOPIC_URGENCY`, below every other stream but bulk objects, and large
+//! ones at `TOPIC_LARGE_URGENCY`, with bulk objects. Both share one `RateCap` (`--zenoh-max-mbps`), so forwarded
 //! traffic can't crowd out commands on a weak link: while it binds, latest
 //! samples wait (and newer ones replace them) and reliable bytes wait in the
 //! outbox's backlog, which holds about 2 s at the capped rate.
@@ -14,12 +14,24 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use roboprotocol_core::topic::{reliable_backlog, OutboxStats, RateCap, TopicError, TopicOutbox, TopicSample, TopicStreamReader};
+use roboprotocol_core::topic::{reliable_backlog, OutboxStats, RateCap, ReliableLane, TopicError, TopicOutbox, TopicSample, TopicStreamReader};
 
 use crate::Outgoing;
 
-/// quiche stream urgency (lower first): E-Stop is 0, bulk objects 7.
+/// quiche stream urgency (lower first) of the small reliable lane: below the
+/// control streams (E-Stop 0, the rest quiche's default 3), above bulk
+/// objects (7).
 pub const TOPIC_URGENCY: u8 = 6;
+/// The large reliable lane shares bulk objects' urgency: both are large
+/// data that can wait.
+pub const TOPIC_LARGE_URGENCY: u8 = 7;
+
+fn urgency(lane: ReliableLane) -> u8 {
+    match lane {
+        ReliableLane::Small => TOPIC_URGENCY,
+        ReliableLane::Large => TOPIC_LARGE_URGENCY,
+    }
+}
 
 /// Cap tokens the reliable stream leaves while latest datagrams are
 /// waiting: one full datagram's worth. Without it the stream took every
@@ -36,8 +48,9 @@ pub struct TopicLink {
     outbox: TopicOutbox,
     /// `None`: no cap.
     cap: Option<RateCap>,
-    send_stream: Option<u64>,
-    priority_set: bool,
+    /// Per `ReliableLane`.
+    send_streams: [Option<u64>; 2],
+    priority_set: [bool; 2],
     /// Incoming reliable topic streams (normally just the peer's one).
     readers: HashMap<u64, TopicStreamReader>,
 }
@@ -46,7 +59,7 @@ impl TopicLink {
     /// `max_mbps <= 0` means no cap. The reliable backlog is sized from the
     /// cap (`reliable_backlog`).
     pub fn new(max_mbps: f64) -> Self {
-        Self { outbox: TopicOutbox::with_backlog(reliable_backlog(max_mbps)), cap: RateCap::new(max_mbps, Instant::now()), send_stream: None, priority_set: false, readers: HashMap::new() }
+        Self { outbox: TopicOutbox::with_backlog(reliable_backlog(max_mbps)), cap: RateCap::new(max_mbps, Instant::now()), send_streams: [None; 2], priority_set: [false; 2], readers: HashMap::new() }
     }
 
     pub fn stats(&self) -> OutboxStats {
@@ -79,35 +92,56 @@ impl TopicLink {
         Some(d)
     }
 
-    /// Writes waiting reliable bytes, at most `budget` if given, opening the
-    /// stream with `allocate` the first time. Returns the bytes quiche took.
-    pub fn pump_reliable(&mut self, conn: &mut quiche::Connection, allocate: impl FnOnce() -> u64, budget: Option<usize>) -> usize {
-        if self.outbox.reliable_pending().is_empty() {
+    /// Writes waiting reliable bytes, at most `budget` if given, opening each
+    /// lane's stream with `allocate` the first time. The small lane goes
+    /// first; the large lane only gets budget once the small one has nothing
+    /// waiting (otherwise, under the cap, it would take every token as soon
+    /// as any refilled, as it did to latest datagrams). Returns the bytes
+    /// quiche took.
+    pub fn pump_reliable(&mut self, conn: &mut quiche::Connection, mut allocate: impl FnMut() -> u64, budget: Option<usize>) -> usize {
+        if ReliableLane::ALL.iter().all(|&l| self.outbox.reliable_pending(l).is_empty()) {
             return 0;
         }
         let reserve = if self.outbox.has_datagram() { LATEST_RESERVE } else { 0 };
         let capped = self.cap.as_mut().map(|c| c.available(Instant::now()).saturating_sub(reserve));
         let mut left = budget.unwrap_or(usize::MAX).min(capped.unwrap_or(usize::MAX));
-        if left == 0 {
+        let mut written = 0;
+        for lane in ReliableLane::ALL {
+            if lane == ReliableLane::Large && !self.outbox.reliable_pending(ReliableLane::Small).is_empty() {
+                break;
+            }
+            let n = self.pump_lane(conn, lane, &mut allocate, left);
+            written += n;
+            left -= n;
+        }
+        if let Some(cap) = &mut self.cap {
+            cap.consume(written);
+        }
+        written
+    }
+
+    fn pump_lane(&mut self, conn: &mut quiche::Connection, lane: ReliableLane, allocate: &mut impl FnMut() -> u64, mut left: usize) -> usize {
+        let i = lane as usize;
+        if left == 0 || self.outbox.reliable_pending(lane).is_empty() {
             return 0;
         }
-        let stream_id = *self.send_stream.get_or_insert_with(allocate);
+        let stream_id = *self.send_streams[i].get_or_insert_with(&mut *allocate);
         let mut written = 0;
         while left > 0 {
-            let pending = self.outbox.reliable_pending();
+            let pending = self.outbox.reliable_pending(lane);
             if pending.is_empty() {
                 break;
             }
             let end = pending.len().min(CHUNK).min(left);
             match conn.stream_send(stream_id, &pending[..end], false) {
                 Ok(n) => {
-                    if n > 0 && !self.priority_set {
+                    if n > 0 && !self.priority_set[i] {
                         // Only takes effect once the stream exists, i.e.
                         // after its first write.
-                        let _ = conn.stream_priority(stream_id, TOPIC_URGENCY, false);
-                        self.priority_set = true;
+                        let _ = conn.stream_priority(stream_id, urgency(lane), false);
+                        self.priority_set[i] = true;
                     }
-                    self.outbox.consume_reliable(n);
+                    self.outbox.consume_reliable(lane, n);
                     written += n;
                     left -= n;
                     if n < end {
@@ -116,14 +150,11 @@ impl TopicLink {
                 }
                 Err(quiche::Error::Done) | Err(quiche::Error::StreamLimit) => break,
                 Err(e) => {
-                    tracing::warn!(error = ?e, stream_id, "topic stream_send failed; dropping the waiting reliable samples");
-                    self.outbox.consume_reliable(usize::MAX);
+                    tracing::warn!(error = ?e, stream_id, ?lane, "topic stream_send failed; dropping the waiting reliable samples");
+                    self.outbox.consume_reliable(lane, usize::MAX);
                     break;
                 }
             }
-        }
-        if let Some(cap) = &mut self.cap {
-            cap.consume(written);
         }
         written
     }

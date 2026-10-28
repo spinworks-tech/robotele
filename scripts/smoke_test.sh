@@ -146,11 +146,18 @@ sleep 0.5
 wait_for_log "$ROBOT_LOG" "zenoh topic forwarding negotiated" 1 || fail "robot-edge didn't negotiate topic forwarding"
 "$PROBE" pub "$ROBOT_ZENOH" demo/robot/pose 50 32 100 >/dev/null || fail "publishing demo/robot/pose failed"
 "$PROBE" pub "$ROBOT_ZENOH" demo/robot/secret 5 16 50 >/dev/null || fail "publishing demo/robot/secret failed"
-"$PROBE" pub "$ROBOT_ZENOH" demo/map/grid 3 300000 5 >/dev/null || fail "publishing demo/map/grid failed"
+# Large (300 KB, large lane) and small (small lane) reliable samples at once.
+"$PROBE" pub "$ROBOT_ZENOH" demo/map/grid 3 300000 5 >/dev/null &
+GRID_PUB=$!
+"$PROBE" pub "$ROBOT_ZENOH" demo/map/meta 20 64 20 >/dev/null || fail "publishing demo/map/meta failed"
+wait $GRID_PUB || fail "publishing demo/map/grid failed"
 "$PROBE" pub "$OPERATOR_ZENOH" demo/op/goal 20 16 50 >/dev/null || fail "publishing demo/op/goal failed"
 # Latest mode may drop or supersede a few; reliable mode must deliver all.
 wait_for_count "$WORKDIR/operator-sub.log" "recv demo/robot/pose .*attachment=probe-attachment" 40 5 || fail "latest-mode samples didn't reach the operator's zenoh"
 wait_for_count "$WORKDIR/operator-sub.log" "recv demo/map/grid .*bytes=300000" 3 10 || fail "reliable 300 KB samples didn't all reach the operator's zenoh"
+wait_for_count "$WORKDIR/operator-sub.log" "recv demo/map/meta" 20 5 || fail "small reliable samples didn't all reach the operator's zenoh"
+seqs=$(grep "recv demo/map/meta" "$WORKDIR/operator-sub.log" | grep -oE "seq=[0-9]+" | cut -d= -f2 | tr '\n' ' ')
+[[ "$seqs" == "$(seq -s ' ' 0 19) " ]] || fail "small reliable samples arrived out of order: $seqs"
 wait_for_count "$WORKDIR/robot-sub.log" "recv demo/op/goal" 20 5 || fail "reliable samples didn't all reach the robot's zenoh"
 grep -q "recv demo/robot/secret" "$WORKDIR/operator-sub.log" && fail "the operator republished demo/robot/secret, which it doesn't accept"
 for f in operator-sub robot-sub; do

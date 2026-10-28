@@ -16,13 +16,15 @@
 //!     and latest-wins per key while waiting to be sent. For state that is
 //!     only useful while fresh. A sample larger than one datagram is
 //!     dropped (and counted); use `Reliable` for those.
-//!   - `Reliable`: in order, nothing lost, on one unidirectional stream per
-//!     direction that every reliable topic shares. It starts with
-//!     `TOPIC_STREAM_MAGIC` and `TOPIC_STREAM_VERSION`, then carries
-//!     `len:u32 | sample` frames, and is never finished. Sharing one stream
-//!     means a large sample on one topic delays the others behind it; the
-//!     alternative, a stream per topic, would use up the peer's 16-stream
-//!     limit.
+//!   - `Reliable`: in order per key, nothing lost, on two unidirectional
+//!     streams per direction that every reliable topic shares: one for
+//!     samples up to `SMALL_SAMPLE_MAX`, sent first, and one for larger
+//!     ones, so a map doesn't hold up a goal. A key's samples stay on the
+//!     large stream while it has one waiting there, so they never overtake
+//!     each other. Each stream starts with `TOPIC_STREAM_MAGIC` and
+//!     `TOPIC_STREAM_VERSION`, then carries `len:u32 | sample` frames, and
+//!     is never finished. Two streams rather than one per topic, which
+//!     would use up the peer's 16-stream limit.
 //!
 //! The key is sent with every sample rather than as an id agreed per
 //! session: no handshake, at the cost of the key's length in each datagram.
@@ -214,6 +216,27 @@ impl TopicSample {
     }
 }
 
+/// Largest reliable sample (encoded) that goes on the small lane. Larger
+/// ones take the large lane, so a 300 KB grid can't hold up a goal behind it
+/// on the same stream: with one shared stream and a 2 Mbps cap, small
+/// samples waited 3-4 s behind grids (BABYROS.md, "Real BabyROS nodes").
+pub const SMALL_SAMPLE_MAX: usize = 16 * 1024;
+
+/// Which of the two reliable streams a sample travels on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReliableLane {
+    Small,
+    Large,
+}
+
+impl ReliableLane {
+    pub const ALL: [Self; 2] = [Self::Small, Self::Large];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// What a `TopicOutbox` did with the samples it was given, for logs and the
 /// HUD.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -224,8 +247,22 @@ pub struct OutboxStats {
     /// Too large for one datagram on this connection.
     pub latest_oversize: u64,
     pub reliable_queued: u64,
+    /// Of `reliable_queued`, the ones that went on the large lane.
+    pub reliable_large: u64,
     /// Dropped because the reliable backlog was full.
     pub reliable_dropped: u64,
+}
+
+/// One reliable stream's bytes not yet accepted by the transport.
+#[derive(Default)]
+struct Lane {
+    buf: Vec<u8>,
+    started: bool,
+    /// Bytes ever taken by the transport.
+    consumed: usize,
+    /// Large lane only: (key, end offset in the lane's bytes) per sample not
+    /// yet fully taken, so a key's later samples stay behind it.
+    frames: VecDeque<(String, usize)>,
 }
 
 /// Outgoing forwarded samples for one connection.
@@ -233,10 +270,14 @@ pub struct TopicOutbox {
     /// Tagged datagrams waiting to be sent, newest per key, oldest key first.
     latest: HashMap<String, Vec<u8>>,
     order: VecDeque<String>,
-    /// Reliable stream bytes not yet accepted by quiche, starting with the
-    /// stream header on a fresh connection.
-    reliable: Vec<u8>,
-    reliable_started: bool,
+    /// Reliable bytes per lane, each starting with the stream header on a
+    /// fresh connection.
+    lanes: [Lane; 2],
+    /// Keys with samples still waiting on the large lane, and how many. A
+    /// key's next sample goes on the large lane too while it's listed, so
+    /// samples of one key never overtake each other.
+    large_pending: HashMap<String, usize>,
+    /// Per lane.
     reliable_backlog: usize,
     stats: OutboxStats,
 }
@@ -252,12 +293,13 @@ impl TopicOutbox {
         Self::default()
     }
 
+    /// `reliable_backlog` applies to each lane.
     pub fn with_backlog(reliable_backlog: usize) -> Self {
         Self {
             latest: HashMap::new(),
             order: VecDeque::new(),
-            reliable: Vec::new(),
-            reliable_started: false,
+            lanes: Default::default(),
+            large_pending: HashMap::new(),
             reliable_backlog,
             stats: OutboxStats::default(),
         }
@@ -287,17 +329,24 @@ impl TopicOutbox {
 
     fn push_reliable(&mut self, sample: &TopicSample) {
         let len = sample.encoded_len();
-        if len > MAX_TOPIC_SAMPLE || self.reliable.len() + 4 + len > self.reliable_backlog {
+        let large = len > SMALL_SAMPLE_MAX || self.large_pending.contains_key(&sample.key);
+        let lane = &mut self.lanes[if large { ReliableLane::Large } else { ReliableLane::Small }.index()];
+        if len > MAX_TOPIC_SAMPLE || lane.buf.len() + 4 + len > self.reliable_backlog {
             self.stats.reliable_dropped += 1;
             return;
         }
-        if !self.reliable_started {
-            self.reliable.extend_from_slice(&[TOPIC_STREAM_MAGIC, TOPIC_STREAM_VERSION]);
-            self.reliable_started = true;
+        if !lane.started {
+            lane.buf.extend_from_slice(&[TOPIC_STREAM_MAGIC, TOPIC_STREAM_VERSION]);
+            lane.started = true;
         }
-        self.reliable.extend_from_slice(&(len as u32).to_be_bytes());
-        sample.encode_into(&mut self.reliable);
+        lane.buf.extend_from_slice(&(len as u32).to_be_bytes());
+        sample.encode_into(&mut lane.buf);
         self.stats.reliable_queued += 1;
+        if large {
+            lane.frames.push_back((sample.key.clone(), lane.consumed + lane.buf.len()));
+            *self.large_pending.entry(sample.key.clone()).or_default() += 1;
+            self.stats.reliable_large += 1;
+        }
     }
 
     pub fn has_datagram(&self) -> bool {
@@ -318,14 +367,26 @@ impl TopicOutbox {
         None
     }
 
-    /// Reliable stream bytes waiting to be written.
-    pub fn reliable_pending(&self) -> &[u8] {
-        &self.reliable
+    /// A lane's stream bytes waiting to be written.
+    pub fn reliable_pending(&self, lane: ReliableLane) -> &[u8] {
+        &self.lanes[lane.index()].buf
     }
 
-    /// `n` bytes of `reliable_pending` were accepted by the transport.
-    pub fn consume_reliable(&mut self, n: usize) {
-        self.reliable.drain(..n.min(self.reliable.len()));
+    /// `n` bytes of `reliable_pending(lane)` were accepted by the transport.
+    pub fn consume_reliable(&mut self, lane: ReliableLane, n: usize) {
+        let l = &mut self.lanes[lane.index()];
+        let n = n.min(l.buf.len());
+        l.buf.drain(..n);
+        l.consumed += n;
+        while l.frames.front().is_some_and(|&(_, end)| end <= l.consumed) {
+            let (key, _) = l.frames.pop_front().unwrap();
+            if let Some(count) = self.large_pending.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.large_pending.remove(&key);
+                }
+            }
+        }
     }
 }
 
@@ -461,7 +522,7 @@ mod tests {
         for s in &samples {
             o.push(TopicMode::Reliable, s);
         }
-        let bytes = o.reliable_pending().to_vec();
+        let bytes = o.reliable_pending(ReliableLane::Small).to_vec();
         assert_eq!(bytes[..2], [TOPIC_STREAM_MAGIC, TOPIC_STREAM_VERSION]);
         for chunk in [1, 2, 7, 100, bytes.len()] {
             let mut r = TopicStreamReader::new();
@@ -479,11 +540,64 @@ mod tests {
     fn consumed_reliable_bytes_are_not_resent_and_the_header_goes_once() {
         let mut o = TopicOutbox::new();
         o.push(TopicMode::Reliable, &sample("a", b"1"));
-        let first = o.reliable_pending().len();
-        o.consume_reliable(first);
-        assert!(o.reliable_pending().is_empty());
+        let first = o.reliable_pending(ReliableLane::Small).len();
+        o.consume_reliable(ReliableLane::Small, first);
+        assert!(o.reliable_pending(ReliableLane::Small).is_empty());
         o.push(TopicMode::Reliable, &sample("a", b"2"));
-        assert_eq!(o.reliable_pending()[..4], (sample("a", b"2").encoded_len() as u32).to_be_bytes());
+        assert_eq!(o.reliable_pending(ReliableLane::Small)[..4], (sample("a", b"2").encoded_len() as u32).to_be_bytes());
+    }
+
+    fn read_all(bytes: &[u8]) -> Vec<TopicSample> {
+        let (s, e) = TopicStreamReader::new().push(bytes);
+        assert!(e.is_empty(), "{e:?}");
+        s
+    }
+
+    #[test]
+    fn large_samples_take_the_large_lane_and_small_ones_pass_them() {
+        let mut o = TopicOutbox::new();
+        o.push(TopicMode::Reliable, &sample("map/grid", &[7; 300_000]));
+        o.push(TopicMode::Reliable, &sample("planner/goal", b"g1"));
+        let small = read_all(o.reliable_pending(ReliableLane::Small));
+        let large = read_all(o.reliable_pending(ReliableLane::Large));
+        assert_eq!(small.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(), ["planner/goal"]);
+        assert_eq!(large.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(), ["map/grid"]);
+        assert_eq!((o.stats().reliable_queued, o.stats().reliable_large), (2, 1));
+    }
+
+    #[test]
+    fn a_keys_small_sample_waits_behind_its_large_one() {
+        let mut o = TopicOutbox::new();
+        o.push(TopicMode::Reliable, &sample("cloud", &[1; 40_000]));
+        o.push(TopicMode::Reliable, &sample("cloud", b"tiny")); // same key: must not overtake
+        o.push(TopicMode::Reliable, &sample("goal", b"g")); // other key: small lane
+        assert_eq!(read_all(o.reliable_pending(ReliableLane::Large)).len(), 2);
+        assert_eq!(read_all(o.reliable_pending(ReliableLane::Small)).len(), 1);
+
+        // Half of the large lane taken: "cloud" still has a sample waiting there.
+        let large_len = o.reliable_pending(ReliableLane::Large).len();
+        o.consume_reliable(ReliableLane::Large, large_len / 2);
+        o.push(TopicMode::Reliable, &sample("cloud", b"tiny2"));
+        assert_eq!(o.stats().reliable_large, 3);
+
+        // All taken: "cloud"'s next small sample goes on the small lane again.
+        o.consume_reliable(ReliableLane::Large, usize::MAX);
+        o.push(TopicMode::Reliable, &sample("cloud", b"tiny3"));
+        assert_eq!(o.stats().reliable_large, 3);
+        let small = o.reliable_pending(ReliableLane::Small).to_vec();
+        assert_eq!(read_all(&small).last().unwrap().payload, b"tiny3");
+    }
+
+    #[test]
+    fn each_lane_has_its_own_header_and_backlog() {
+        let mut o = TopicOutbox::with_backlog(50_000);
+        o.push(TopicMode::Reliable, &sample("big", &[0; 40_000]));
+        o.push(TopicMode::Reliable, &sample("big2", &[0; 40_000])); // large lane full
+        o.push(TopicMode::Reliable, &sample("small", b"s")); // small lane unaffected
+        assert_eq!(o.stats().reliable_dropped, 1);
+        for lane in ReliableLane::ALL {
+            assert_eq!(o.reliable_pending(lane)[..2], [TOPIC_STREAM_MAGIC, TOPIC_STREAM_VERSION], "{lane:?}");
+        }
     }
 
     #[test]
@@ -493,7 +607,7 @@ mod tests {
         o.push(TopicMode::Reliable, &sample("a", &[0; 40]));
         assert_eq!(o.stats().reliable_queued, 1);
         assert_eq!(o.stats().reliable_dropped, 1);
-        o.consume_reliable(usize::MAX);
+        o.consume_reliable(ReliableLane::Small, usize::MAX);
         o.push(TopicMode::Reliable, &sample("a", &[0; 40]));
         assert_eq!(o.stats().reliable_queued, 2);
     }
@@ -524,7 +638,7 @@ mod tests {
     fn reader_skips_bad_keys_but_fails_on_a_bad_header_or_length() {
         let mut o = TopicOutbox::new();
         o.push(TopicMode::Reliable, &sample("ok/1", b"1"));
-        let mut bytes = o.reliable_pending().to_vec();
+        let mut bytes = o.reliable_pending(ReliableLane::Small).to_vec();
         let bad = TopicSample { key: "robotele/x/autonomy_goal".into(), attachment: vec![], payload: vec![1] }.encode();
         bytes.extend_from_slice(&(bad.len() as u32).to_be_bytes());
         bytes.extend_from_slice(&bad);

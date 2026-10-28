@@ -370,6 +370,9 @@ Expected behavior while a goal is being published at ~10 Hz:
 ## Forwarding topics
 
 Discussion: [#36](https://github.com/spinworks-tech/robotele/discussions/36).
+For a guide with diagrams (how it works, how to deploy it, troubleshooting), see
+[docs/15 — BabyROS over RoboTele](docs/15-babyros-topic-forwarding.md); this
+section is the reference.
 BabyROS nodes on the operator's PC and on the robot can talk to each other
 without changing any code: each host keeps its own Zenoh, and only the link
 between them goes over RoboProtocol's QUIC session.
@@ -388,13 +391,15 @@ codec works unchanged on the far side.
 | Mode | Carried as | Use for |
 | --- | --- | --- |
 | `latest` | one QUIC datagram per sample; newest per key while waiting; may be lost | small state that only matters while fresh (pose, status). A sample has to fit in one datagram (about 1.4 KB including its key); larger ones are dropped and counted |
-| `reliable` | one QUIC stream per direction, shared by all reliable topics; in order, nothing lost | goals, maps, anything that must arrive or is larger than a datagram |
+| `reliable` | two QUIC streams per direction, shared by all reliable topics: samples up to 16 KB on one, sent first, larger ones on the other; in order per key, nothing lost | goals, maps, anything that must arrive or is larger than a datagram |
 
 Forwarded traffic never gets ahead of control. On the robot, latest-mode
 datagrams take turns with video and sensor data while both are waiting (one
-each), and the reliable stream is below everything but bulk objects. Under
-an uplink overload the reliable stream gets little, because QUIC packets
-carry datagrams first: see "Measured on the CM4" below.
+each). Small reliable samples are below every stream but bulk objects; large
+ones share bulk objects' priority, so a map never holds up a goal. A key's
+samples stay on the large stream while it has one waiting there, so they never
+overtake each other. Under an uplink overload reliable samples get little,
+because QUIC packets carry datagrams first: see "Measured on the CM4" below.
 
 ### Running it
 
@@ -493,8 +498,9 @@ turning multicast scouting off on the PC's nodes, as above.
 - Samples captured before a session is up are discarded when it starts, rather
   than delivered stale.
 - A reliable sample that would overflow the waiting backlog is dropped
-  (counted in the session-end log line); see `--zenoh-max-mbps` for its size. One large sample delays the other
-  reliable topics behind it, since they share a stream.
+  (counted in the session-end log line); see `--zenoh-max-mbps` for its size
+  (each of the two streams has its own). A large sample delays the other large
+  ones behind it, and the small samples of its own key.
 - Each sample carries its key (no per-session topic ids yet), so a long key
   costs bytes in every latest-mode datagram.
 - Not carried: BabyROS `Server`/`Client` (queries), `list_topics` (liveliness),

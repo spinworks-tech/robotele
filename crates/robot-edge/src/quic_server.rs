@@ -334,6 +334,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
                 latest_superseded = t.latest_superseded,
                 latest_oversize = t.latest_oversize,
                 reliable_queued = t.reliable_queued,
+                reliable_large = t.reliable_large,
                 reliable_dropped = t.reliable_dropped,
                 captured,
                 capture_dropped,
