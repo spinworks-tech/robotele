@@ -24,6 +24,7 @@ If you're new here, read in this order:
 | 13 | [Large Sensor Payloads (proposal)](13-large-sensor-payloads.md) | Proposal: carrying point clouds, lidar, radar and depth maps as loss-tolerant sensor slices, with bulk objects on Channel C |
 | 14 | [Protocol Comparison over Wi-Fi](14-protocol-comparison-wifi.md) | Doc 11 on real hardware: the robot's CM4 to an operator laptop over Wi-Fi, all protocols with mTLS, robot-to-operator throughput from 16 B to 1 MB |
 | 15 | [BabyROS over RoboTele](15-babyros-topic-forwarding.md) | Topic forwarding: BabyROS nodes on the operator PC and the robot talk across the QUIC session, each host keeping its own Zenoh. How it works, how to deploy it, diagrams and troubleshooting |
+| 16 | [Sonny OS alongside RoboTele](16-sonny-os-integration.md) | Discussion #10: which integration options work today, Sonny's telemetry forwarded over the QUIC session, and problems found in Sonny's code |
 
 ## Repository map
 
