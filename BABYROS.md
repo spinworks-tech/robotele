@@ -442,19 +442,22 @@ Operator:
 - `--zenoh-local-only` makes robot-edge's Zenoh listen on loopback only, with
   multicast scouting off (see below for why).
 
-BabyROS nodes then connect to their own host's endpoint. Replacing BabyROS's
-config drops the timestamping it turns on by default, so set it again:
+BabyROS nodes then connect to their own host's endpoint, before creating any
+node. `babyros.configure()` starts from a fresh Zenoh config, which drops the
+timestamping BabyROS turns on by default, and in BabyROS 0.1.10 its
+`timestamping_enabled_*` arguments fail with Zenoh 1.10 ("unknown key": they
+set `timestamping/enabled/<mode>`). So set timestamping on the stored config:
 
 ```python
-import zenoh
-from babyros.node import SessionManager
+import babyros
 
-cfg = zenoh.Config()
-cfg.insert_json5("connect/endpoints", '["tcp/127.0.0.1:7448"]')  # 7447 on the robot
-cfg.insert_json5("scouting/multicast/enabled", "false")
-cfg.insert_json5("timestamping/enabled", "true")
-SessionManager.set_session_config(cfg)  # before creating any node
+babyros.configure(connect_endpoints=["tcp/127.0.0.1:7448"],  # 7447 on the robot
+                  scouting_multicast_enabled=False)
+babyros.node.SessionManager.get_session_config().insert_json5("timestamping/enabled", "true")
 ```
+
+BabyROS needs Python 3.11 or 3.12. The CM4's Debian 11 has 3.9; the test used
+`uv python install 3.11` and a venv in the pi user's home.
 
 ### Older builds and plain teleop
 
@@ -498,6 +501,38 @@ turning multicast scouting off on the PC's nodes, as above.
   `TRANSIENT_LOCAL` history for late joiners, and Zenoh timestamps (the robot's
   clock can be days off anyway).
 - Not yet tested with real BabyROS (Python) nodes; `zenoh_probe` stands in for them.
+
+### Real BabyROS nodes
+
+BabyROS 0.1.10 (eclipse-zenoh 1.10.2, telekinesis-datatypes 0.4.6) on both
+sides, `benchmark/babyros/robot_node.py` on the CM4 and `operator_node.py` on
+the laptop. The robot node publishes a pose dict (JSON) and a `Vector3D` at
+20 Hz (latest), and a 500 x 600 uint8 grid (NDAR, 300 KB) and a 2,000-point
+`PointCloud` (Arrow IPC, lz4) every 2 s (reliable). It echoes the operator's
+pings, and checks the operator's goals (a dict holding an array, NDDC, 5 Hz).
+Every payload type decoded correctly on the far side in every run.
+
+| Run | latest round trips back, p50 | reliable round trips back, p50 / p90 | grids | goals checked | Watchdog latched |
+| --- | --- | --- | --- | --- | --- |
+| localhost, no cap | 297/297, 6 ms | 297/297, 6 / 8 ms | 9/9 | 75/75 | – |
+| localhost, cap 2 | 161/298, 23 ms | 281/298, 724 ms / 2.5 s | 8 | 75/75 | – |
+| CM4 Wi-Fi, cap 2 | 259/395, 153 ms | 327/395, 3.3 / 4.5 s | 8 | 92/99 | +14 s |
+| CM4 Wi-Fi, no cap | 352/396, 132 ms | 396/396, 146 / 332 ms | 12 | 99/99 | no |
+| CM4 Wi-Fi, cap 2 | 308/396, 172 ms | 301/396, 4.0 / 6.5 s | 8 | 99/99 | +4 s |
+| CM4 Wi-Fi, no cap | 326/396, 127 ms | 396/396, 150 / 564 ms | 12 | 99/99 | +19 s |
+
+(CM4 runs alternated; ICMP to the robot averaged 30 ms before and 13 ms after.)
+
+- **Uncapped, real BabyROS works across the link:** every reliable sample
+  arrived, in about 150 ms median on the CM4's Wi-Fi.
+- **The 2 Mbps cap is too tight for this workload.** Arrow IPC adds overhead
+  even to small samples, and the robot node offers more than 2 Mbps. While the
+  cap binds, small reliable samples wait behind each 300 KB grid in the shared
+  reliable stream (about 1.2 s per grid at 2 Mbps): reliable latency went from
+  ~150 ms to 3-4 s.
+- **No sign that the cap protected control:** the watchdog latched in both
+  capped runs, once before the operator node had sent anything, and in one
+  uncapped run.
 
 ### Measured on the CM4
 

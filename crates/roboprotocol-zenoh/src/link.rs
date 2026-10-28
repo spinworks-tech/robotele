@@ -21,6 +21,14 @@ use crate::Outgoing;
 /// quiche stream urgency (lower first): E-Stop is 0, bulk objects 7.
 pub const TOPIC_URGENCY: u8 = 6;
 
+/// Cap tokens the reliable stream leaves while latest datagrams are
+/// waiting: one full datagram's worth. Without it the stream took every
+/// token as soon as any refilled, and a latest datagram (which needs room
+/// for a whole one) never got through while a large reliable sample
+/// drained: with real BabyROS nodes on localhost, 661 latest samples were
+/// superseded during 300 KB grids.
+const LATEST_RESERVE: usize = 1500;
+
 /// Bytes handed to one `stream_send` call at most.
 const CHUNK: usize = 16 * 1024;
 
@@ -77,7 +85,8 @@ impl TopicLink {
         if self.outbox.reliable_pending().is_empty() {
             return 0;
         }
-        let capped = self.cap.as_mut().map(|c| c.available(Instant::now()));
+        let reserve = if self.outbox.has_datagram() { LATEST_RESERVE } else { 0 };
+        let capped = self.cap.as_mut().map(|c| c.available(Instant::now()).saturating_sub(reserve));
         let mut left = budget.unwrap_or(usize::MAX).min(capped.unwrap_or(usize::MAX));
         if left == 0 {
             return 0;
