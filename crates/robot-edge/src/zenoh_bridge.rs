@@ -281,10 +281,21 @@ fn inert_sink() -> TelemetrySink {
 /// scouting (still on by default) means most same-LAN setups never need
 /// this; it matters once that's blocked or a specific unicast peer is
 /// wanted instead.
-fn config_with_port(port: u16) -> zenoh::Config {
+///
+/// `local_only` (`--zenoh-local-only`) listens on loopback only and turns
+/// multicast scouting off, so the robot's Zenoh domain stays on the robot:
+/// what topic forwarding (#36) needs, since a domain joined with the
+/// operator's would see every forwarded sample twice.
+fn config_with_port(port: u16, local_only: bool) -> zenoh::Config {
     let mut config = zenoh::Config::default();
-    if let Err(e) = config.insert_json5("listen/endpoints", &format!(r#"["tcp/[::]:{port}"]"#)) {
+    let host = if local_only { "127.0.0.1" } else { "[::]" };
+    if let Err(e) = config.insert_json5("listen/endpoints", &format!(r#"["tcp/{host}:{port}"]"#)) {
         tracing::warn!(error = ?e, port, "failed to set zenoh listen port, falling back to the default (ephemeral) port");
+    }
+    if local_only {
+        if let Err(e) = config.insert_json5("scouting/multicast/enabled", "false") {
+            tracing::warn!(error = ?e, "failed to turn off zenoh multicast scouting");
+        }
     }
     config
 }
@@ -372,19 +383,29 @@ async fn spawn_video(session: &zenoh::Session, robot_id: &str) -> VideoSink {
     VideoSink { critical: critical_tx, delta: Arc::new(delta_tx), subscribed }
 }
 
+/// The sidecar's handles, plus its Zenoh session (`None` if it failed to
+/// open) for the topic forwarder to share.
+pub struct Sidecar {
+    pub telemetry: TelemetrySink,
+    pub command: CommandSink,
+    pub autonomy_goal: AutonomyGoal,
+    pub video: VideoSink,
+    pub session: Option<zenoh::Session>,
+}
+
 /// Opens a Zenoh session and starts the telemetry-publisher and
 /// autonomy-goal-subscriber background tasks. Always returns usable handles:
 /// on any Zenoh failure, logs a warning and returns an inert sink / a goal
 /// that's never asserted, so the caller never needs a fallback branch of its
 /// own.
-pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, CommandSink, AutonomyGoal, VideoSink) {
+pub async fn spawn(robot_id: &str, port: u16, local_only: bool) -> Sidecar {
     let goal = AutonomyGoal::new();
 
-    let session = match zenoh::open(config_with_port(port)).await {
+    let session = match zenoh::open(config_with_port(port, local_only)).await {
         Ok(session) => session,
         Err(e) => {
             tracing::warn!(error = ?e, "zenoh session open failed, Channel C sidecar disabled this run");
-            return (inert_sink(), inert_command_sink(), goal, inert_video_sink());
+            return Sidecar { telemetry: inert_sink(), command: inert_command_sink(), autonomy_goal: goal, video: inert_video_sink(), session: None };
         }
     };
 
@@ -443,12 +464,12 @@ pub async fn spawn(robot_id: &str, port: u16) -> (TelemetrySink, CommandSink, Au
 
     let video = spawn_video(&session, robot_id).await;
 
-    // Keep the session alive for the process lifetime, same reasoning as the
-    // subscriber above -- dropping it would close the whole Zenoh session out
-    // from under the publisher task.
-    std::mem::forget(session);
+    // Kept alive for the process lifetime, same reasoning as the subscriber
+    // above -- dropping the last handle would close the whole Zenoh session
+    // out from under the publisher task. The caller's copy is a clone.
+    std::mem::forget(session.clone());
 
-    (TelemetrySink(tx), CommandSink { tx: cmd_tx, last: None }, goal, video)
+    Sidecar { telemetry: TelemetrySink(tx), command: CommandSink { tx: cmd_tx, last: None }, autonomy_goal: goal, video, session: Some(session) }
 }
 
 #[cfg(test)]

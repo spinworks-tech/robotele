@@ -93,9 +93,17 @@ impl BulkSender {
         }
     }
 
-    fn start(&mut self, conn: &mut quiche::Connection, key: (u8, u8), data: Vec<u8>) {
+    /// Takes the next server-initiated unidirectional stream id for some
+    /// other use (the reliable topic stream, `topic_forward`), so the two
+    /// never pick the same one.
+    pub fn allocate_stream(&mut self) -> u64 {
         let stream_id = self.next_stream_id;
         self.next_stream_id += 4;
+        stream_id
+    }
+
+    fn start(&mut self, conn: &mut quiche::Connection, key: (u8, u8), data: Vec<u8>) {
+        let stream_id = self.allocate_stream();
         // Takes effect once the stream exists, i.e. after the first write;
         // set again then (see `pump`).
         let _ = conn.stream_priority(stream_id, BULK_URGENCY, false);

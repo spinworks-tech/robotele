@@ -367,6 +367,254 @@ Expected behavior while a goal is being published at ~10 Hz:
 - **Connected, E-Stop cleared, deadman not held:** source becomes `SemiAutonomous`,
   and returns to `ActiveImpedanceHold` ~500 ms after the goals stop.
 
+## Forwarding topics
+
+Discussion: [#36](https://github.com/spinworks-tech/robotele/discussions/36).
+For a guide with diagrams (how it works, how to deploy it, troubleshooting), see
+[docs/15 — BabyROS over RoboTele](docs/15-babyros-topic-forwarding.md); this
+section is the reference.
+BabyROS nodes on the operator's PC and on the robot can talk to each other
+without changing any code: each host keeps its own Zenoh, and only the link
+between them goes over RoboProtocol's QUIC session.
+
+```
+ operator PC                                            robot (CM4)
+ BabyROS nodes <-> Zenoh <-> operator-console ==QUIC==> robot-edge <-> Zenoh <-> BabyROS nodes
+                   :7448                        Wi-Fi                 :7447
+```
+
+Each side subscribes to the key expressions it was told to forward, sends the
+samples across, and the other side republishes them on its own Zenoh under the
+same key. The payload and the attachment travel byte for byte, so BabyROS's
+codec works unchanged on the far side.
+
+| Mode | Carried as | Use for |
+| --- | --- | --- |
+| `latest` | one QUIC datagram per sample; newest per key while waiting; may be lost | small state that only matters while fresh (pose, status). A sample has to fit in one datagram (about 1.4 KB including its key); larger ones are dropped and counted |
+| `reliable` | two QUIC streams per direction, shared by all reliable topics: samples up to 16 KB on one, sent first, larger ones on the other; in order per key, nothing lost | goals, maps, anything that must arrive or is larger than a datagram |
+
+Forwarded traffic never gets ahead of control. On the robot, latest-mode
+datagrams take turns with video and sensor data while both are waiting (one
+each). Small reliable samples are below every stream but bulk objects; large
+ones share bulk objects' priority, so a map never holds up a goal. A key's
+samples stay on the large stream while it has one waiting there, so they never
+overtake each other. Under an uplink overload reliable samples get little,
+because QUIC packets carry datagrams first: see "Measured on the CM4" below.
+
+### Running it
+
+Robot:
+
+```bash
+./target/release/robot-edge ... --zenoh-local-only \
+    --zenoh-forward 'latest:robot/pose' --zenoh-forward 'reliable:robot/map/**' \
+    --zenoh-accept 'planner/**'
+```
+
+Operator:
+
+```bash
+./target/release/operator-console --connect <robot-ip>:4433 --server-name robot-edge \
+    --zenoh-forward 'reliable:planner/**' --zenoh-accept 'robot/**'
+```
+
+- `--zenoh-forward MODE:KEY_EXPR` (repeatable) is what *this* side sends.
+- `--zenoh-accept KEY_EXPR` (repeatable) is the allowlist for what the other
+  side sends: a forwarded sample is republished only if one of these includes
+  its key (Zenoh matching, so `planner/**` also covers `planner`). **With no
+  `--zenoh-accept`, nothing is republished.** A rejected key is logged once and
+  counted (`republish_rejected` in the session-end log line).
+- `--zenoh-topics FILE` reads the same rules from a file, alongside any flags:
+
+  ```text
+  # operator side
+  forward reliable planner/**
+  accept robot/**
+  ```
+
+- `--zenoh-max-mbps N` caps what *this* side forwards (latest and reliable
+  together); default **2 Mbps**, `0` for no cap, `max-mbps N` in a topics file.
+  While the cap binds, latest samples wait and newer ones replace them, and
+  reliable samples wait in a backlog that holds about 2 s at the capped rate
+  (at least 1 MB, so a sample up to that size always fits; 4 MB with no cap).
+  A reliable sample that doesn't fit is dropped and counted. It exists because forwarded
+  volume can delay commands on a weak link (see "Measured on the CM4").
+- Any of these turns forwarding on; `--zenoh-bridge` turns it on with no rules.
+- The console opens its own Zenoh session, by default listening on
+  `tcp/127.0.0.1:7448` only, with multicast scouting off (`--zenoh-listen` to
+  change the endpoint, `--zenoh-config FILE` for a full Zenoh config). The HUD
+  shows a `C (zenoh in)` row.
+- `--zenoh-local-only` makes robot-edge's Zenoh listen on loopback only, with
+  multicast scouting off (see below for why).
+
+BabyROS nodes then connect to their own host's endpoint, before creating any
+node. `babyros.configure()` starts from a fresh Zenoh config, which drops the
+timestamping BabyROS turns on by default, and in BabyROS 0.1.10 its
+`timestamping_enabled_*` arguments fail with Zenoh 1.10 ("unknown key": they
+set `timestamping/enabled/<mode>`). So set timestamping on the stored config:
+
+```python
+import babyros
+
+babyros.configure(connect_endpoints=["tcp/127.0.0.1:7448"],  # 7447 on the robot
+                  scouting_multicast_enabled=False)
+babyros.node.SessionManager.get_session_config().insert_json5("timestamping/enabled", "true")
+```
+
+BabyROS needs Python 3.11 or 3.12. The CM4's Debian 11 has 3.9; the test used
+`uv python install 3.11` and a venv in the pi user's home.
+
+### Older builds and plain teleop
+
+Forwarding is negotiated in HELLO (capability bit `TOPIC_FORWARDING`): each side
+sends topic samples only when both have forwarding on. Every combination keeps
+teleoperation working; checked on localhost with the `main` build:
+
+| operator-console | robot-edge | Result |
+| --- | --- | --- |
+| with forwarding | older build, or no forwarding | session and teleop as usual; console logs that the robot doesn't forward topics; nothing sent |
+| older build, or no forwarding | with forwarding | session and teleop as usual; robot logs that the operator doesn't forward topics; nothing sent |
+| with forwarding | with forwarding | topics forwarded both ways |
+
+The older console logs an `InvalidStreamState` warning per bulk object whether
+or not forwarding is involved; that's fixed in this build.
+
+### Keep the two Zenoh domains apart
+
+If the PC's Zenoh can also reach the robot's directly (for example a node with
+default multicast scouting on the same Wi-Fi), every forwarded sample would
+arrive twice and loop between the two sides. robot-edge declares a liveliness
+token `robotele/forwarder/<robot-id>`; while the console can see it on its own
+Zenoh, it **pauses forwarding in both directions** and logs a warning (the HUD
+row shows `PAUSED`). Fix it by running robot-edge with `--zenoh-local-only` and
+turning multicast scouting off on the PC's nodes, as above.
+
+### Rules and limits
+
+- Keys under `robotele/` are never forwarded or republished: they are
+  robot-edge's own, and `robotele/<id>/autonomy_goal` asserts semi-autonomy.
+- Only samples from other Zenoh sessions are forwarded, so a republished sample
+  isn't sent back. Deletes aren't forwarded.
+- Samples captured before a session is up are discarded when it starts, rather
+  than delivered stale.
+- A reliable sample that would overflow the waiting backlog is dropped
+  (counted in the session-end log line); see `--zenoh-max-mbps` for its size
+  (each of the two streams has its own). A large sample delays the other large
+  ones behind it, and the small samples of its own key.
+- Each sample carries its key (no per-session topic ids yet), so a long key
+  costs bytes in every latest-mode datagram.
+- Not carried: BabyROS `Server`/`Client` (queries), `list_topics` (liveliness),
+  `TRANSIENT_LOCAL` history for late joiners, and Zenoh timestamps (the robot's
+  clock can be days off anyway).
+- Not yet tested with real BabyROS (Python) nodes; `zenoh_probe` stands in for them.
+
+### Real BabyROS nodes
+
+BabyROS 0.1.10 (eclipse-zenoh 1.10.2, telekinesis-datatypes 0.4.6) on both
+sides, `benchmark/babyros/robot_node.py` on the CM4 and `operator_node.py` on
+the laptop. The robot node publishes a pose dict (JSON) and a `Vector3D` at
+20 Hz (latest), and a 500 x 600 uint8 grid (NDAR, 300 KB) and a 2,000-point
+`PointCloud` (Arrow IPC, lz4) every 2 s (reliable). It echoes the operator's
+pings, and checks the operator's goals (a dict holding an array, NDDC, 5 Hz).
+Every payload type decoded correctly on the far side in every run.
+
+| Run | latest round trips back, p50 | reliable round trips back, p50 / p90 | grids | goals checked | Watchdog latched |
+| --- | --- | --- | --- | --- | --- |
+| localhost, no cap | 297/297, 6 ms | 297/297, 6 / 8 ms | 9/9 | 75/75 | – |
+| localhost, cap 2 | 161/298, 23 ms | 281/298, 724 ms / 2.5 s | 8 | 75/75 | – |
+| CM4 Wi-Fi, cap 2 | 259/395, 153 ms | 327/395, 3.3 / 4.5 s | 8 | 92/99 | +14 s |
+| CM4 Wi-Fi, no cap | 352/396, 132 ms | 396/396, 146 / 332 ms | 12 | 99/99 | no |
+| CM4 Wi-Fi, cap 2 | 308/396, 172 ms | 301/396, 4.0 / 6.5 s | 8 | 99/99 | +4 s |
+| CM4 Wi-Fi, no cap | 326/396, 127 ms | 396/396, 150 / 564 ms | 12 | 99/99 | +19 s |
+
+(CM4 runs alternated; ICMP to the robot averaged 30 ms before and 13 ms after.)
+
+With the reliable path split into two streams (samples up to 16 KB on one, sent
+first), same nodes, later the same day:
+
+| Run | latest back, p50 | reliable back, p50 / p90 | grids | goals checked | Watchdog latched |
+| --- | --- | --- | --- | --- | --- |
+| localhost, cap 2 | 146/298, 11 ms | 298/298, 19 / 89 ms | 10/10 | 75/75 | – |
+| localhost, no cap | 297/297, 6 ms | 297/297, 6 / 7 ms | 9/9 | 75/75 | – |
+| CM4 Wi-Fi, cap 2 | 300/396, 155 ms | 384/396, 166 / 262 ms | 9 | 96/99 | no |
+| CM4 Wi-Fi, no cap | 347/396, 87 ms | 396/396, 94 / 271 ms | 12 | 99/99 | no |
+| CM4 Wi-Fi, cap 2 | 311/396, 144 ms | 396/396, 159 / 260 ms | 10 | 99/99 | no |
+| CM4 Wi-Fi, no cap | 366/396, 69 ms | 396/396, 73 / 185 ms | 12 | 99/99 | no |
+
+(ICMP averaged 52 ms before and 35 ms after.) Two streams take the cap's
+reliable median on the CM4 from 3-4 s to about 160 ms. Uncapped is still faster
+(about 80 ms) and delivers more grids. No run latched the watchdog this time.
+
+- **Uncapped, real BabyROS works across the link:** every reliable sample
+  arrived, in about 150 ms median on the CM4's Wi-Fi.
+- **The 2 Mbps cap is too tight for this workload.** Arrow IPC adds overhead
+  even to small samples, and the robot node offers more than 2 Mbps. While the
+  cap binds, small reliable samples wait behind each 300 KB grid in the shared
+  reliable stream (about 1.2 s per grid at 2 Mbps): reliable latency went from
+  ~150 ms to 3-4 s.
+- **No sign that the cap protected control:** the watchdog latched in both
+  capped runs, once before the operator node had sent anything, and in one
+  uncapped run.
+
+### Measured on the CM4
+
+2026-10-28, XGO-Lite CM4 at -34 dBm on 2.4 GHz channel 6, laptop also on
+Wi-Fi, robot-edge with `--stub-bridge` (`benchmark/topic_forwarding_wifi.sh`).
+Round trips go laptop -> bridge -> a Zenoh echo on the robot -> bridge ->
+laptop, timed on the laptop only. "Link" is ICMP ping during the run.
+
+| Run | Link avg / max | latest 32 B: back, p50 / p90 | reliable 32 B: back, p50 / p90 | reliable 100 KB at 5 Hz: back, p50 | 300 KB maps to operator | E-Stop latched |
+| --- | --- | --- | --- | --- | --- | --- |
+| idle, good link | 40 / 216 ms | 280/300, 23 / 156 ms | 300/300, 8 / 107 ms | 50/50, 193 ms | 10/10 | no |
+| sim lidar, before the fix below | 104 / 344 ms | **0/300** | 300/300, 164 / 334 ms | 18/50, 6.1 s | 1/10 | yes |
+| sim lidar, no forwarding traffic (control) | – | – | – | – | – | yes, 19 s in |
+| sim lidar, after the fix | 335 / 1,539 ms | 63/300, 489 / 2,185 ms | 294/300, 1.2 / 3.0 s | 8/50, 8.3 s | 0/10 | yes |
+| sim nav cloud | 357 / 1,756 ms | 115/300, 1.2 / 2.2 s | 300/300, 317 ms / 2.0 s | 17/50, 5.7 s | 0/10 | yes |
+| idle again, link now degraded | 137 / 1,035 ms | 283/300, 65 / 318 ms | 300/300, 143 / 475 ms | 4/50, 9.0 s | 10/10 | yes, in the 100 KB phase |
+
+What it shows:
+
+- **On a good link it works:** every reliable sample arrived, small ones in
+  8 ms median, and latest mode lost about 7%, as datagrams on this Wi-Fi do.
+- **Latest mode was starved under sensor load** (0 of 300), because topic
+  datagrams went only when video and sensors had nothing waiting, which with
+  lidar is never. Now they take turns; the robot then sent 67 instead of 1 (the
+  link had also got much worse by then, so the delivered count isn't comparable).
+- **Sim lidar alone latches the watchdog** (control row), as doc 12 found for
+  overload: that isn't forwarding.
+- **Forwarded volume can hurt control on a weak link.** With the link degraded
+  and no sensors, 100 KB reliable samples 5 times a second each way (about
+  4 Mbps per direction) coincided with a watchdog latch; the same phase on the
+  good link didn't. Commands go first into each packet, but they still queue
+  behind forwarded packets in the Wi-Fi driver and the access point. That run
+  was uncapped; `--zenoh-max-mbps` (default 2) now limits this.
+- The link swung from 40 ms to over 300 ms average within 20 minutes, so the
+  rows after the first two are not a clean comparison.
+
+**The cap, A/B.** Later the same day, three alternating pairs with no cap and
+the default 2 Mbps cap (maps every 2 s, 0.5 Hz). Each test phase's start is
+given from the session start: ICMP only 0 s, latest 23 s, reliable 32 B 41 s,
+100 KB at 5 Hz (4 Mbps offered each way) 58 s, maps 71 s.
+
+| Run | Link avg / max | reliable 32 B p50 / p90 | 100 KB back | maps | Watchdog latched at |
+| --- | --- | --- | --- | --- | --- |
+| 1, no cap | 162 / 1,215 ms | – (the laptop lost Wi-Fi) | 0/50 | 0/10 | +25 s |
+| 1, cap 2 | 86 / 452 ms | 48 / 199 ms | 3/50 | 9/10 | +61 s (100 KB) |
+| 2, no cap | 78 / 822 ms | 246 / 1,308 ms | 50/50 | 10/10 | +54 s (32 B) |
+| 2, cap 2 | 69 / 439 ms | 43 / 138 ms | 2/50 | 3/10 | +62 s (100 KB) |
+| 3, no cap | 30 / 332 ms | 50 / 141 ms | 32/50 | 10/10 | +63 s (100 KB) |
+| 3, cap 2 | 108 / 751 ms | 39 / 137 ms | 9/50 | 10/10 | +15 s (ICMP only) |
+
+- The cap holds forwarded traffic to its rate: with 4 Mbps offered, few 100 KB
+  samples came back, as designed (the backlog is 2 s at the cap, 1 MB here).
+- **Inconclusive on control.** That evening the link latched the watchdog with
+  no forwarded traffic at all (run 3 capped, +15 s), and capped and uncapped
+  runs both latched in the 100 KB phase. Showing whether the cap protects
+  commands needs the doc 12 control benchmark (command latency, not one
+  latch flag) on a quieter link.
+- A first capped A/B, before the backlog was sized from the cap, had 0 of 10
+  maps arrive: the fixed 4 MB backlog was 16 s of queue at 2 Mbps.
+
 ## Status of testing
 
 Verified on a real XGO-Lite V2 Pi CM4 with v0.1.2 (stub bridge, real
