@@ -17,6 +17,9 @@ use roboprotocol_core::estop::{EstopDatagram, ESTOP_DATAGRAM_MAGIC, ESTOP_STREAM
 use roboprotocol_core::hello::{self, quantization_tier_bits, task_class_bits, HelloCapabilities, ProtocolVersion};
 use roboprotocol_core::profile::CameraDescriptor;
 use roboprotocol_core::safety::TaskClass;
+use roboprotocol_core::topic::TopicSample;
+use roboprotocol_zenoh::link::TopicLink;
+use roboprotocol_zenoh::Forwarder;
 use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
 
@@ -60,6 +63,9 @@ pub struct ServerArgs {
     pub robot_id: String,
     /// TCP port the Channel C Zenoh sidecar listens on -- see `--zenoh-port`.
     pub zenoh_port: u16,
+    pub zenoh_local_only: bool,
+    /// Topic forwarding rules (#36); `None` leaves forwarding off.
+    pub zenoh_forward: Option<Vec<roboprotocol_zenoh::ForwardRule>>,
     pub tick_hz: u32,
     pub bridge: BridgeConfig,
     pub camera_config: Option<capture::CaptureConfig>,
@@ -160,7 +166,10 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
     // Started once, outside the reconnect loop, same reasoning as `recorder`
     // above: the Zenoh session and its background tasks persist across
     // reconnects. Both handles are cheap to clone into each `Session`.
-    let (telemetry_sink, command_sink, autonomy_goal, video_sink) = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port).await;
+    let sidecar = crate::zenoh_bridge::spawn(&args.robot_id, args.zenoh_port, args.zenoh_local_only).await;
+    let (telemetry_sink, command_sink, autonomy_goal, video_sink) = (sidecar.telemetry, sidecar.command, sidecar.autonomy_goal, sidecar.video);
+    // Same lifetime as the sidecar: lent to each `Session` and taken back.
+    let mut forwarder = start_forwarder(&args, sidecar.session).await;
 
     let sensors: Vec<(SimSensorKind, SensorDescriptor)> = args.sim_sensors.iter().enumerate().map(|(i, &kind)| (kind, kind.descriptor(i as u8))).collect();
 
@@ -255,6 +264,8 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             telemetry_sink: telemetry_sink.clone(),
             command_sink: command_sink.clone(),
             autonomy_goal: autonomy_goal.clone(),
+            forwarder: forwarder.take(),
+            topics: TopicLink::new(),
             phase: Phase::AwaitingHello,
             channel_b_seq: 0,
             estop_seq: 0,
@@ -278,6 +289,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
         };
 
         let result = session.run(&socket, buf).await;
+        forwarder = session.forwarder.take();
         let quic = session.conn.stats();
         let path = session.conn.path_stats().next();
         tracing::info!(
@@ -311,6 +323,22 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
         let bulk = session.bulk.stats();
         if bulk.published > 0 {
             tracing::info!(published = bulk.published, completed = bulk.completed, superseded = bulk.superseded, "bulk objects at session end");
+        }
+        if let Some(f) = &forwarder {
+            let t = session.topics.stats();
+            let [captured, capture_dropped, republished, republish_dropped] = f.stats().snapshot();
+            tracing::info!(
+                latest_sent = t.latest_sent,
+                latest_superseded = t.latest_superseded,
+                latest_oversize = t.latest_oversize,
+                reliable_queued = t.reliable_queued,
+                reliable_dropped = t.reliable_dropped,
+                captured,
+                capture_dropped,
+                republished,
+                republish_dropped,
+                "zenoh topic forwarding at session end (captured/republished are totals since start)"
+            );
         }
         let lossy = session.lossy.stats();
         tracing::info!(
@@ -369,6 +397,10 @@ struct Session {
     /// Channel C sidecar: freshness-gated semi-autonomy goal-in, read once
     /// per safety tick. See zenoh_bridge.rs.
     autonomy_goal: crate::zenoh_bridge::AutonomyGoal,
+    /// Topic forwarding (#36), if on: local Zenoh samples out, the
+    /// operator's forwarded samples republished locally.
+    forwarder: Option<Forwarder>,
+    topics: TopicLink,
     phase: Phase,
     channel_b_seq: u64,
     estop_seq: u64,
@@ -498,6 +530,13 @@ impl Session {
                     self.shut_down(socket, &mut out).await;
                     return Ok(());
                 }
+                Some(sample) = recv_forward(&mut self.forwarder), if self.phase == Phase::Operating => {
+                    self.topics.push(&sample);
+                    while let Some(sample) = self.forwarder.as_mut().and_then(Forwarder::try_recv) {
+                        self.topics.push(&sample);
+                    }
+                    self.flush(socket, &mut out).await?;
+                }
                 _ = map_ticker.tick(), if self.phase == Phase::Operating && self.sim_map.is_some() => {
                     self.publish_sim_map();
                     self.flush(socket, &mut out).await?;
@@ -590,6 +629,12 @@ impl Session {
 
     fn on_stream_readable(&mut self, stream_id: u64) -> Result<()> {
         let mut sbuf = vec![0u8; 65535];
+        if stream_id % 4 == 2 {
+            // Client-initiated unidirectional: only the operator's reliable
+            // topic stream uses these.
+            self.on_topic_stream_readable(stream_id, &mut sbuf);
+            return Ok(());
+        }
         loop {
             match self.conn.stream_recv(stream_id, &mut sbuf) {
                 Ok((len, _fin)) => self.on_stream_data(stream_id, &sbuf[..len])?,
@@ -601,6 +646,33 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn on_topic_stream_readable(&mut self, stream_id: u64, sbuf: &mut [u8]) {
+        loop {
+            match self.conn.stream_recv(stream_id, sbuf) {
+                Ok((len, fin)) => {
+                    let (samples, errors) = self.topics.on_stream_data(stream_id, &sbuf[..len], fin);
+                    for e in errors {
+                        tracing::warn!(stream_id, error = %e, "dropping a forwarded topic sample");
+                    }
+                    if self.phase == Phase::Operating {
+                        if let Some(f) = &self.forwarder {
+                            samples.into_iter().for_each(|s| f.republish(s));
+                        }
+                    }
+                }
+                Err(quiche::Error::StreamReset(_)) => {
+                    self.topics.on_stream_reset(stream_id);
+                    break;
+                }
+                Err(quiche::Error::Done) => break,
+                Err(e) => {
+                    tracing::warn!(error = ?e, stream_id, "topic stream_recv error");
+                    break;
+                }
+            }
+        }
     }
 
     fn on_stream_data(&mut self, stream_id: u64, data: &[u8]) -> Result<()> {
@@ -625,6 +697,12 @@ impl Session {
                 tracing::info!(cached = accept.cached, selected_sensors = ?accept.selected_sensors, "SESSION_ACCEPT received");
                 self.selected_sensors = accept.selected_sensors;
                 self.phase = Phase::Operating;
+                if let Some(f) = &mut self.forwarder {
+                    let stale = f.discard_waiting();
+                    if stale > 0 {
+                        tracing::info!(stale, "discarded zenoh samples captured before the session started");
+                    }
+                }
             }
             ESTOP_STREAM_ID => {
                 if let Some(d) = EstopDatagram::decode(data) {
@@ -805,6 +883,17 @@ impl Session {
         self.bulk.publish(&mut self.conn, header, &payload);
     }
 
+    /// Writes waiting reliable topic samples, within the rate cap's budget
+    /// when that's on. Before bulk objects, which are less urgent.
+    fn pump_topics(&mut self) {
+        let budget = self.lossy_rate.as_mut().map(|r| r.available(Instant::now()));
+        let bulk = &mut self.bulk;
+        let written = self.topics.pump_reliable(&mut self.conn, || bulk.allocate_stream(), budget);
+        if let Some(rate) = &mut self.lossy_rate {
+            rate.consume(written);
+        }
+    }
+
     /// Writes waiting bulk object data, after the lossy datagrams and within
     /// what's left of the rate cap's budget when that's on.
     fn pump_bulk(&mut self) {
@@ -820,7 +909,8 @@ impl Session {
 
     /// Moves lossy datagrams into quiche while its queue is below
     /// `QUICHE_LOSSY_LIMIT`. Control datagrams count toward that limit too,
-    /// so lossy data never gets ahead of them.
+    /// so lossy data never gets ahead of them. Latest-mode topic samples go
+    /// only once video and sensor data have nothing waiting.
     fn feed_lossy(&mut self) {
         while self.conn.dgram_send_queue_len() < QUICHE_LOSSY_LIMIT {
             let now = Instant::now();
@@ -829,7 +919,8 @@ impl Session {
                     break;
                 }
             }
-            let Some(d) = self.lossy.pop(now) else { break };
+            let max_len = self.conn.dgram_max_writable_len().unwrap_or(0);
+            let Some(d) = self.lossy.pop(now).or_else(|| self.topics.pop_datagram(max_len)) else { break };
             if let Some(rate) = &mut self.lossy_rate {
                 rate.consume(d.len());
             }
@@ -874,6 +965,17 @@ impl Session {
             // (see the constant's own doc for why that rules out reusing
             // EstopDatagram{latched:false} for this).
             self.safety.on_channel_b_activity(None, Instant::now());
+            return;
+        }
+        if tag == datagram::DATAGRAM_TAG_TOPIC {
+            match TopicSample::decode(&payload) {
+                Ok(sample) => {
+                    if let Some(f) = &self.forwarder {
+                        f.republish(sample);
+                    }
+                }
+                Err(e) => tracing::debug!(error = %e, "dropping a forwarded topic datagram"),
+            }
             return;
         }
         if tag != datagram::DATAGRAM_TAG_CHANNEL_B {
@@ -1287,6 +1389,7 @@ impl Session {
             // whatever rate the congestion window allows while never
             // queueing more than `QUICHE_LOSSY_LIMIT` deep inside quiche.
             self.feed_lossy();
+            self.pump_topics();
             self.pump_bulk();
             match self.conn.send(out) {
                 Ok((len, send_info)) => {
@@ -1304,6 +1407,37 @@ impl Session {
         }
         Ok(())
     }
+}
+
+async fn recv_forward(forwarder: &mut Option<Forwarder>) -> Option<roboprotocol_zenoh::Outgoing> {
+    match forwarder {
+        Some(f) => f.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Starts topic forwarding on the sidecar's Zenoh session if it was asked
+/// for. Like the sidecar, a failure only disables forwarding.
+async fn start_forwarder(args: &ServerArgs, session: Option<zenoh::Session>) -> Option<Forwarder> {
+    let rules = args.zenoh_forward.as_ref()?;
+    let Some(session) = session else {
+        tracing::warn!("zenoh topic forwarding asked for, but the Zenoh session didn't open; forwarding disabled this run");
+        return None;
+    };
+    let forwarder = match Forwarder::start(session, rules).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "zenoh topic forwarding failed to start; disabled this run");
+            return None;
+        }
+    };
+    if let Err(e) = forwarder.announce(&args.robot_id).await {
+        tracing::warn!(error = %e, "zenoh: couldn't declare the forwarder's presence token; the operator side can't detect joined domains");
+    }
+    if !args.zenoh_local_only {
+        tracing::warn!("zenoh topic forwarding without --zenoh-local-only: if the operator's Zenoh reaches this one directly, the operator side pauses forwarding");
+    }
+    Some(forwarder)
 }
 
 async fn recv_sensor_frames(rx: &mut Option<SensorRx>) -> Vec<SensorFrame> {

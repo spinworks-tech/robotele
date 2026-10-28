@@ -4,6 +4,7 @@ members = [
     "crates/roboprotocol-proto",
     "crates/roboprotocol-core",
     "crates/roboprotocol-recording",
+    "crates/roboprotocol-zenoh",
     "crates/robot-edge",
     "crates/operator-console",
     "oculus/gateway",

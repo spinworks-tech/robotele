@@ -33,6 +33,11 @@ struct Cli {
     robot_id: String,
     /// TCP port the Channel C Zenoh sidecar listens on -- see `--zenoh-port`.
     zenoh_port: u16,
+    /// `--zenoh-local-only`: see `zenoh_bridge::config_with_port`.
+    zenoh_local_only: bool,
+    /// `--zenoh-bridge` / `--zenoh-forward` (#36): forward Zenoh topics
+    /// to and from the operator. `None` leaves forwarding off.
+    zenoh_forward: Option<Vec<roboprotocol_zenoh::ForwardRule>>,
     task_class: TaskClass,
     tick_hz: u32,
     bridge_script: PathBuf,
@@ -102,6 +107,8 @@ impl Cli {
         // firewall rule or a BabyROS node's `connect` endpoint has something
         // stable to target -- see zenoh_bridge::config_with_port.
         let mut zenoh_port = 7447u16;
+        let mut zenoh_local_only = false;
+        let mut zenoh_forward: Option<Vec<roboprotocol_zenoh::ForwardRule>> = None;
         let mut task_class = TaskClass::D;
         let mut tick_hz = 50u32;
         let mut bridge_script = PathBuf::from("xgo_bridge/xgo_bridge.py");
@@ -138,6 +145,14 @@ impl Cli {
                 "--ca" => ca = it.next().context("--ca needs a value")?,
                 "--robot-id" => robot_id = it.next().context("--robot-id needs a value")?,
                 "--zenoh-port" => zenoh_port = it.next().context("--zenoh-port needs a value")?.parse()?,
+                "--zenoh-local-only" => zenoh_local_only = true,
+                "--zenoh-bridge" => {
+                    zenoh_forward.get_or_insert_with(Vec::new);
+                }
+                "--zenoh-forward" => {
+                    let rule = it.next().context("--zenoh-forward needs a value (latest|reliable):KEY_EXPR")?;
+                    zenoh_forward.get_or_insert_with(Vec::new).push(rule.parse().with_context(|| format!("--zenoh-forward {rule}"))?);
+                }
                 "--task-class" => {
                     task_class = match it.next().context("--task-class needs a value")?.as_str() {
                         "B" => TaskClass::B,
@@ -205,6 +220,9 @@ impl Cli {
                     println!(
                         "Usage: robot-edge [--listen ADDR] [--cert PATH] [--key PATH] [--ca PATH]\n  \
                          [--robot-id ID] [--zenoh-port N] [--task-class B|C|D|E] [--tick-hz N]\n  \
+                         [--zenoh-local-only]   (Zenoh on loopback only, no multicast scouting)\n  \
+                         [--zenoh-bridge]   (republish Zenoh samples the operator forwards)\n  \
+                         [--zenoh-forward latest|reliable:KEY_EXPR]...   (forward local Zenoh topics to the operator; implies --zenoh-bridge)\n  \
                          [--bridge-script PATH] [--stub-bridge] [--serial-port PATH] [--watchdog-ms N]\n  \
                          [--estop-watchdog-ms N]\n  \
                          [--camera] [--camera-bin PATH]\n  \
@@ -243,6 +261,8 @@ impl Cli {
             ca,
             robot_id,
             zenoh_port,
+            zenoh_local_only,
+            zenoh_forward,
             task_class,
             tick_hz,
             bridge_script,
@@ -338,6 +358,8 @@ async fn main() -> Result<()> {
         watchdog_threshold_ms: cli.estop_watchdog_ms.unwrap_or_else(|| cli.task_class.watchdog_blackout_ms()),
         robot_id: cli.robot_id,
         zenoh_port: cli.zenoh_port,
+        zenoh_local_only: cli.zenoh_local_only,
+        zenoh_forward: cli.zenoh_forward,
         tick_hz: cli.tick_hz,
         bridge: BridgeConfig {
             python_bin: "python3".to_string(),

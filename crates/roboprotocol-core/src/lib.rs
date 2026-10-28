@@ -22,4 +22,5 @@ pub mod safety;
 pub mod sensor;
 pub mod sizing;
 pub mod timestamp;
+pub mod topic;
 pub mod video;

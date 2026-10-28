@@ -2608,6 +2608,7 @@ dependencies = [
  "roboprotocol-core",
  "roboprotocol-proto",
  "roboprotocol-recording",
+ "roboprotocol-zenoh",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -3394,6 +3395,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "roboprotocol-zenoh"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "quiche",
+ "roboprotocol-core",
+ "tokio",
+ "tracing",
+ "zenoh",
+]
+
+[[package]]
 name = "robot-edge"
 version = "0.1.2"
 dependencies = [
@@ -3403,6 +3416,7 @@ dependencies = [
  "roboprotocol-core",
  "roboprotocol-proto",
  "roboprotocol-recording",
+ "roboprotocol-zenoh",
  "serde",
  "serde_json",
  "tokio",

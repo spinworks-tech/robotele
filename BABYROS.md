@@ -367,6 +367,101 @@ Expected behavior while a goal is being published at ~10 Hz:
 - **Connected, E-Stop cleared, deadman not held:** source becomes `SemiAutonomous`,
   and returns to `ActiveImpedanceHold` ~500 ms after the goals stop.
 
+## Forwarding topics
+
+Discussion: [#36](https://github.com/spinworks-tech/robotele/discussions/36).
+BabyROS nodes on the operator's PC and on the robot can talk to each other
+without changing any code: each host keeps its own Zenoh, and only the link
+between them goes over RoboProtocol's QUIC session.
+
+```
+ operator PC                                            robot (CM4)
+ BabyROS nodes <-> Zenoh <-> operator-console ==QUIC==> robot-edge <-> Zenoh <-> BabyROS nodes
+                   :7448                        Wi-Fi                 :7447
+```
+
+Each side subscribes to the key expressions it was told to forward, sends the
+samples across, and the other side republishes them on its own Zenoh under the
+same key. The payload and the attachment travel byte for byte, so BabyROS's
+codec works unchanged on the far side.
+
+| Mode | Carried as | Use for |
+| --- | --- | --- |
+| `latest` | one QUIC datagram per sample; newest per key while waiting; may be lost | small state that only matters while fresh (pose, status). A sample has to fit in one datagram (about 1.4 KB including its key); larger ones are dropped and counted |
+| `reliable` | one QUIC stream per direction, shared by all reliable topics; in order, nothing lost | goals, maps, anything that must arrive or is larger than a datagram |
+
+Forwarded traffic never gets ahead of control: latest-mode datagrams only go
+once video and sensor data have nothing waiting, and the reliable stream is
+below everything but bulk objects.
+
+### Running it
+
+Robot:
+
+```bash
+./target/release/robot-edge ... --zenoh-local-only \
+    --zenoh-forward 'latest:robot/pose' --zenoh-forward 'reliable:robot/map/**'
+```
+
+Operator:
+
+```bash
+./target/release/operator-console --connect <robot-ip>:4433 --server-name robot-edge \
+    --zenoh-forward 'reliable:planner/**'
+```
+
+- `--zenoh-forward MODE:KEY_EXPR` (repeatable) is what *this* side sends. Samples
+  the other side forwards are always republished. `--zenoh-bridge` turns
+  forwarding on with nothing to send (republish only).
+- The console opens its own Zenoh session, by default listening on
+  `tcp/127.0.0.1:7448` only, with multicast scouting off (`--zenoh-listen` to
+  change the endpoint, `--zenoh-config FILE` for a full Zenoh config). The HUD
+  shows a `C (zenoh in)` row.
+- `--zenoh-local-only` makes robot-edge's Zenoh listen on loopback only, with
+  multicast scouting off (see below for why).
+
+BabyROS nodes then connect to their own host's endpoint. Replacing BabyROS's
+config drops the timestamping it turns on by default, so set it again:
+
+```python
+import zenoh
+from babyros.node import SessionManager
+
+cfg = zenoh.Config()
+cfg.insert_json5("connect/endpoints", '["tcp/127.0.0.1:7448"]')  # 7447 on the robot
+cfg.insert_json5("scouting/multicast/enabled", "false")
+cfg.insert_json5("timestamping/enabled", "true")
+SessionManager.set_session_config(cfg)  # before creating any node
+```
+
+### Keep the two Zenoh domains apart
+
+If the PC's Zenoh can also reach the robot's directly (for example a node with
+default multicast scouting on the same Wi-Fi), every forwarded sample would
+arrive twice and loop between the two sides. robot-edge declares a liveliness
+token `robotele/forwarder/<robot-id>`; while the console can see it on its own
+Zenoh, it **pauses forwarding in both directions** and logs a warning (the HUD
+row shows `PAUSED`). Fix it by running robot-edge with `--zenoh-local-only` and
+turning multicast scouting off on the PC's nodes, as above.
+
+### Rules and limits
+
+- Keys under `robotele/` are never forwarded or republished: they are
+  robot-edge's own, and `robotele/<id>/autonomy_goal` asserts semi-autonomy.
+- Only samples from other Zenoh sessions are forwarded, so a republished sample
+  isn't sent back. Deletes aren't forwarded.
+- Samples captured before a session is up are discarded when it starts, rather
+  than delivered stale.
+- A reliable sample that would push the waiting backlog over 4 MB is dropped
+  (counted in the session-end log line). One large sample delays the other
+  reliable topics behind it, since they share a stream.
+- Each sample carries its key (no per-session topic ids yet), so a long key
+  costs bytes in every latest-mode datagram.
+- Not carried: BabyROS `Server`/`Client` (queries), `list_topics` (liveliness),
+  `TRANSIENT_LOCAL` history for late joiners, and Zenoh timestamps (the robot's
+  clock can be days off anyway).
+- Tested on localhost only (`scripts/smoke_test.sh`), not yet on the CM4 over Wi-Fi.
+
 ## Status of testing
 
 Verified on a real XGO-Lite V2 Pi CM4 with v0.1.2 (stub bridge, real

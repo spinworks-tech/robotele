@@ -215,6 +215,25 @@ pub struct HudState {
     /// Bulk objects (docs/13): the last one received and the running counts.
     pub bulk_last: Option<String>,
     pub bulk_stats: roboprotocol_core::bulk::BulkStats,
+    /// Zenoh topic forwarding (#36), `None` when it's off.
+    pub zenoh: Option<ZenohHud>,
+}
+
+/// Forwarded samples each way, for the channels panel.
+pub struct ZenohHud {
+    /// Samples the robot forwarded, republished here.
+    pub in_rate: RateCounter,
+    /// Local samples sent to the robot.
+    pub out_rate: RateCounter,
+    /// The robot's Zenoh domain is visible from this one, so forwarding is
+    /// paused (it would loop).
+    pub paused: bool,
+}
+
+impl ZenohHud {
+    pub fn new() -> Self {
+        Self { in_rate: RateCounter::new(CHANNEL_STATS_WINDOW), out_rate: RateCounter::new(CHANNEL_STATS_WINDOW), paused: false }
+    }
 }
 
 /// Sensor-slice stats for one sensor's row in the channels panel.
@@ -297,6 +316,7 @@ impl HudState {
             sensors: Vec::new(),
             bulk_last: None,
             bulk_stats: roboprotocol_core::bulk::BulkStats::default(),
+            zenoh: None,
         }
     }
 
@@ -416,7 +436,7 @@ fn draw(f: &mut Frame, hud: &HudState) {
             Constraint::Length(4), // header
             Constraint::Length(3), // e-stop banner
             Constraint::Min(6),    // body
-            Constraint::Length(7 + hud.sensors.len() as u16), // channels panel: one row per sensor, plus bulk
+            Constraint::Length(7 + hud.sensors.len() as u16 + hud.zenoh.is_some() as u16), // channels panel: one row per sensor, plus bulk and zenoh
             Constraint::Length(1), // footer
         ])
         .split(f.area());
@@ -733,7 +753,17 @@ fn draw_channels_panel(f: &mut Frame, area: Rect, hud: &HudState) {
             None => "no object yet".to_string(),
         }),
     ]);
-    let rows = rows.into_iter().chain(hud.sensors.iter().map(|s| sensor_row(s, now))).chain(std::iter::once(bulk_row));
+    let zenoh_row = hud.zenoh.as_ref().map(|z| {
+        let (in_hz, in_bps) = z.in_rate.rates(now);
+        let (out_hz, out_bps) = z.out_rate.rates(now);
+        let note = if z.paused {
+            "PAUSED: robot's Zenoh domain reachable directly".to_string()
+        } else {
+            format!("out {out_hz:.1} Hz {}", fmt_rate(out_bps))
+        };
+        Row::new(vec![Cell::from("C (zenoh in)"), Cell::from(format!("{in_hz:.1}")), Cell::from(fmt_rate(in_bps)), Cell::from("--"), Cell::from(note)])
+    });
+    let rows = rows.into_iter().chain(hud.sensors.iter().map(|s| sensor_row(s, now))).chain(std::iter::once(bulk_row)).chain(zenoh_row);
 
     let table = Table::new(
         rows,

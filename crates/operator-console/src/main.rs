@@ -26,6 +26,8 @@ use crate::quic_client::{ClientArgs, VideoBackend};
 struct Cli {
     /// `--bulk-save-dir`: write each bulk object's latest version here.
     bulk_save_dir: Option<PathBuf>,
+    /// `--zenoh-bridge` and friends (#36); `None` leaves forwarding off.
+    zenoh: Option<quic_client::ZenohArgs>,
     connect: SocketAddr,
     bind: SocketAddr,
     server_name: String,
@@ -102,6 +104,7 @@ impl Cli {
         let mut bench_raw = false;
         let mut bench_warmup_s = 1.0f64;
         let mut bulk_save_dir = None;
+        let mut zenoh: Option<quic_client::ZenohArgs> = None;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -152,6 +155,18 @@ impl Cli {
                 "--record-flush-secs" => record_flush_secs = it.next().context("--record-flush-secs needs a value")?.parse()?,
                 "--bench" => bench_mode = Some(it.next().context("--bench needs a value (pingpong|send|recv|pingpace)")?),
                 "--bulk-save-dir" => bulk_save_dir = Some(PathBuf::from(it.next().context("--bulk-save-dir needs a value")?)),
+                "--zenoh-bridge" => {
+                    zenoh.get_or_insert_with(quic_client::ZenohArgs::default);
+                }
+                "--zenoh-forward" => {
+                    let rule = it.next().context("--zenoh-forward needs a value (latest|reliable):KEY_EXPR")?;
+                    let rule = rule.parse().with_context(|| format!("--zenoh-forward {rule}"))?;
+                    zenoh.get_or_insert_with(quic_client::ZenohArgs::default).rules.push(rule);
+                }
+                "--zenoh-listen" => zenoh.get_or_insert_with(quic_client::ZenohArgs::default).listen = it.next().context("--zenoh-listen needs a value")?,
+                "--zenoh-config" => {
+                    zenoh.get_or_insert_with(quic_client::ZenohArgs::default).config_file = Some(PathBuf::from(it.next().context("--zenoh-config needs a value")?))
+                }
                 "--bench-warmup-s" => bench_warmup_s = it.next().context("--bench-warmup-s needs a value")?.parse()?,
                 "--bench-count" => bench_count = it.next().context("--bench-count needs a value")?.parse()?,
                 "--bench-payload-bytes" => bench_payload_bytes = it.next().context("--bench-payload-bytes needs a value")?.parse()?,
@@ -164,6 +179,7 @@ impl Cli {
                          [--cert PATH] [--key PATH] [--ca PATH] [--task-class B|C|D|E] [--tick-hz N]\n  \
                          [--bulk-save-dir DIR] [--video] [--video-backend ffplay|native] [--video-overlay] [--ffplay-bin PATH]\n  \
                          [--move-stale-ms N] [--observer]\n  \
+                         [--zenoh-bridge] [--zenoh-forward latest|reliable:KEY_EXPR]... [--zenoh-listen ENDPOINT] [--zenoh-config FILE]\n  \
                          [--record-dir PATH] [--record-extra haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
                          [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n  \
@@ -200,7 +216,13 @@ impl Cli {
                          is implemented as an ffplay-specific filter). 'p' (save video frame) only works\n  \
                          with --video-backend native -- ffplay decodes in its own subprocess, so there's\n  \
                          no frame in this process to save; it's a harmless no-op otherwise. Saved PNGs go\n  \
-                         to <--record-dir>/screenshots/ if given, else ./screenshots/."
+                         to <--record-dir>/screenshots/ if given, else ./screenshots/.\n\
+                         --zenoh-bridge opens a Zenoh session on this host (default: listening on\n  \
+                         tcp/127.0.0.1:7448 only, no multicast scouting; --zenoh-listen or a full\n  \
+                         --zenoh-config change that) and republishes the Zenoh samples robot-edge\n  \
+                         forwards. --zenoh-forward (repeatable, implies --zenoh-bridge) forwards local\n  \
+                         samples matching KEY_EXPR to the robot: latest = lossy datagrams, newest per\n  \
+                         key; reliable = in order, nothing lost. See BABYROS.md, \"Forwarding topics\"."
                     );
                     std::process::exit(0);
                 }
@@ -257,6 +279,7 @@ impl Cli {
             record_flush_secs,
             bench,
             bulk_save_dir,
+            zenoh,
         })
     }
 
@@ -333,7 +356,9 @@ fn default_filter() -> tracing_subscriber::EnvFilter {
     tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Zenoh (`--zenoh-bridge`) panics on tokio's current_thread scheduler; one
+// worker thread, as in robot-edge, keeps the main loop on this thread.
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() -> Result<()> {
     let cli = Cli::parse()?;
     init_tracing(cli.headless)?;
@@ -369,6 +394,7 @@ async fn main() -> Result<()> {
         screenshot_dir,
         bench: cli.bench,
         bulk_save_dir: cli.bulk_save_dir,
+        zenoh: cli.zenoh,
     };
 
     // Interactive mode enters the alternate screen inside `ui::Console`

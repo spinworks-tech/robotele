@@ -3,6 +3,7 @@
 //! docs for the shared v0 simplifications (single connection, no Retry,
 //! no connection migration).
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,6 +18,9 @@ use roboprotocol_core::hello::{self, quantization_tier_bits, task_class_bits, He
 use roboprotocol_core::safety::TaskClass;
 use roboprotocol_core::sensor::{AssembledFrame, FrameAssembler, SensorDescriptor, SliceHeader};
 use roboprotocol_core::timestamp;
+use roboprotocol_core::topic::TopicSample;
+use roboprotocol_zenoh::link::TopicLink;
+use roboprotocol_zenoh::Forwarder;
 use roboprotocol_core::video::nal_is_critical;
 use tokio::net::UdpSocket;
 use tokio::process::Child;
@@ -177,7 +181,29 @@ pub struct ClientArgs {
     /// `--bulk-save-dir`: where each bulk object's latest version is written
     /// (and an occupancy grid also as a `.pgm` image). `None`: not saved.
     pub bulk_save_dir: Option<PathBuf>,
+    /// Zenoh topic forwarding (#36); `None` leaves it off.
+    pub zenoh: Option<ZenohArgs>,
 }
+
+/// `--zenoh-bridge`, `--zenoh-forward`, `--zenoh-listen`, `--zenoh-config`.
+#[derive(Debug, Clone)]
+pub struct ZenohArgs {
+    pub rules: Vec<roboprotocol_zenoh::ForwardRule>,
+    /// Ignored when `config_file` is given.
+    pub listen: String,
+    pub config_file: Option<PathBuf>,
+}
+
+impl Default for ZenohArgs {
+    fn default() -> Self {
+        Self { rules: Vec::new(), listen: "tcp/127.0.0.1:7448".to_string(), config_file: None }
+    }
+}
+
+/// Topic datagrams allowed in quiche's datagram queue at once. Commands go
+/// into the same FIFO queue (see robot-edge's `QUICHE_LOSSY_LIMIT`), so
+/// this is how many forwarded samples a command can find ahead of it.
+const TOPIC_DGRAM_QUEUE_LIMIT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -332,6 +358,10 @@ pub async fn run(args: ClientArgs) -> Result<()> {
     };
 
     let recorder = roboprotocol_recording::Recorder::start(args.recording.clone())?;
+    let forwarder = match &args.zenoh {
+        Some(z) => Some(start_forwarder(z).await?),
+        None => None,
+    };
 
     let mut client = Client {
         conn,
@@ -382,7 +412,14 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         recorder,
         sensors: Vec::new(),
         bulk_rx: roboprotocol_core::bulk::BulkReceiver::new(),
+        bulk_streams: HashSet::new(),
+        forwarder,
+        topics: TopicLink::new(),
+        next_uni_stream: FIRST_CLIENT_UNI_STREAM,
     };
+    if client.forwarder.is_some() {
+        client.hud.zenoh = Some(crate::ui::ZenohHud::new());
+    }
 
     // `connect_with_resume_fallback` can leave `conn` already established
     // (0-RTT resumption succeeding, or the bounded fallback's own recv loop
@@ -481,6 +518,15 @@ struct Client {
     recorder: roboprotocol_recording::Recorder,
     /// Reassembles bulk objects from the robot's unidirectional streams.
     bulk_rx: roboprotocol_core::bulk::BulkReceiver,
+    /// Robot unidirectional streams already known to carry a bulk object, so
+    /// a later chunk starting with `TOPIC_STREAM_MAGIC` isn't mistaken for
+    /// the start of a topic stream.
+    bulk_streams: HashSet<u64>,
+    /// Topic forwarding (#36), if on.
+    forwarder: Option<Forwarder>,
+    topics: TopicLink,
+    /// Next client-initiated unidirectional stream: 2, 6, 10, ...
+    next_uni_stream: u64,
     /// One per sensor selected in SESSION_ACCEPT, in the same order as
     /// `hud.sensors`; rebuilt on every SESSION_DESCRIBE.
     sensors: Vec<SensorReceiver>,
@@ -524,8 +570,17 @@ impl Client {
                     self.conn.on_timeout();
                     flush_once(&mut self.conn, socket).await?;
                 }
+                Some(sample) = recv_forward(&mut self.forwarder), if self.phase == Phase::Operating => {
+                    self.on_forward(sample);
+                    while let Some(sample) = self.forwarder.as_mut().and_then(Forwarder::try_recv) {
+                        self.on_forward(sample);
+                    }
+                    self.pump_topics();
+                    flush_once(&mut self.conn, socket).await?;
+                }
                 _ = ticker.tick() => {
                     self.on_tick();
+                    self.pump_topics();
                     flush_once(&mut self.conn, socket).await?;
                     self.console.render(&self.hud);
                 }
@@ -631,6 +686,9 @@ impl Client {
                     self.describe_buf.clear();
                     self.video_gate = crate::video::gate::DeltaGate::new();
                     self.bulk_rx = roboprotocol_core::bulk::BulkReceiver::new();
+                    self.bulk_streams.clear();
+                    self.topics = TopicLink::new();
+                    self.next_uni_stream = FIRST_CLIENT_UNI_STREAM;
                     self.session_info = None;
                     self.sensors.clear();
                     self.hud.sensors.clear();
@@ -684,6 +742,8 @@ impl Client {
         for stream_id in readable {
             self.on_stream_readable(stream_id);
         }
+        // Reading may have returned flow-control credit for the topic stream.
+        self.pump_topics();
 
         let mut dbuf = vec![0u8; MAX_DATAGRAM_SIZE];
         loop {
@@ -849,17 +909,47 @@ impl Client {
         }
     }
 
-    /// Reads a bulk object's stream (docs/13, "Bulk objects").
+    /// Reads one of the robot's unidirectional streams: a bulk object
+    /// (docs/13, "Bulk objects") or the reliable topic stream, told apart by
+    /// the stream's first byte.
     fn on_bulk_readable(&mut self, stream_id: u64, sbuf: &mut [u8]) {
         loop {
             match self.conn.stream_recv(stream_id, sbuf) {
-                Ok((len, fin)) => match self.bulk_rx.on_data(stream_id, &sbuf[..len], fin) {
-                    Ok(Some(object)) => self.on_bulk_object(object),
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!(stream_id, error = %e, "dropping a malformed bulk object"),
-                },
+                Ok((len, fin)) => {
+                    let data = &sbuf[..len];
+                    let is_topic = self.topics.is_reading(stream_id)
+                        || (!self.bulk_streams.contains(&stream_id) && data.first() == Some(&roboprotocol_core::topic::TOPIC_STREAM_MAGIC));
+                    if is_topic {
+                        let (samples, errors) = self.topics.on_stream_data(stream_id, data, fin);
+                        for e in errors {
+                            tracing::warn!(stream_id, error = %e, "dropping a forwarded topic sample");
+                        }
+                        samples.into_iter().for_each(|s| self.republish(s));
+                        if fin {
+                            break;
+                        }
+                        continue;
+                    }
+                    if fin {
+                        self.bulk_streams.remove(&stream_id);
+                    } else {
+                        self.bulk_streams.insert(stream_id);
+                    }
+                    match self.bulk_rx.on_data(stream_id, data, fin) {
+                        Ok(Some(object)) => self.on_bulk_object(object),
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(stream_id, error = %e, "dropping a malformed bulk object"),
+                    }
+                    if fin {
+                        // quiche forgets a stream once its FIN is read; reading
+                        // it again fails with InvalidStreamState.
+                        break;
+                    }
+                }
                 Err(quiche::Error::StreamReset(_)) => {
                     self.bulk_rx.on_reset(stream_id);
+                    self.bulk_streams.remove(&stream_id);
+                    self.topics.on_stream_reset(stream_id);
                     break;
                 }
                 Err(quiche::Error::Done) => break,
@@ -870,6 +960,55 @@ impl Client {
             }
         }
         self.hud.bulk_stats = self.bulk_rx.stats();
+    }
+
+    /// Puts a sample the robot forwarded on the local Zenoh session.
+    fn republish(&mut self, sample: TopicSample) {
+        if self.phase != Phase::Operating {
+            return;
+        }
+        let Some(f) = &self.forwarder else { return };
+        if let Some(z) = &mut self.hud.zenoh {
+            z.in_rate.record(std::time::Instant::now(), sample.encoded_len());
+        }
+        f.republish(sample);
+    }
+
+    /// A local Zenoh sample to send to the robot.
+    fn on_forward(&mut self, sample: roboprotocol_zenoh::Outgoing) {
+        if let Some(z) = &mut self.hud.zenoh {
+            z.out_rate.record(std::time::Instant::now(), sample.sample.encoded_len());
+        }
+        self.topics.push(&sample);
+    }
+
+    /// Moves waiting topic samples into quiche: datagrams only while its
+    /// datagram queue is short (see `TOPIC_DGRAM_QUEUE_LIMIT`), and the
+    /// reliable stream as far as flow control allows.
+    fn pump_topics(&mut self) {
+        if self.forwarder.is_none() || self.phase != Phase::Operating {
+            return;
+        }
+        if let (Some(z), Some(f)) = (&mut self.hud.zenoh, &self.forwarder) {
+            z.paused = f.is_paused();
+        }
+        while self.topics.has_datagram() && self.conn.dgram_send_queue_len() < TOPIC_DGRAM_QUEUE_LIMIT {
+            let max_len = self.conn.dgram_max_writable_len().unwrap_or(0);
+            let Some(d) = self.topics.pop_datagram(max_len) else { break };
+            if let Err(e) = self.conn.dgram_send(&d) {
+                tracing::debug!(error = ?e, "dropping a topic datagram quiche refused");
+            }
+        }
+        let next = &mut self.next_uni_stream;
+        self.topics.pump_reliable(
+            &mut self.conn,
+            || {
+                let id = *next;
+                *next += 4;
+                id
+            },
+            None,
+        );
     }
 
     fn on_bulk_object(&mut self, object: roboprotocol_core::bulk::BulkObject) {
@@ -934,6 +1073,10 @@ impl Client {
                         })
                         .collect();
                     self.hud.sensors = info.sensors.iter().map(|d| SensorHud::new(d.label.clone())).collect();
+                    if let Some(f) = &mut self.forwarder {
+                        f.discard_waiting();
+                        f.pause_while_visible(&info.robot_id);
+                    }
                     self.session_info = Some(info);
                     self.phase = Phase::Operating;
                     self.hud.phase = ConnPhase::Operating;
@@ -1035,6 +1178,10 @@ impl Client {
                 }
             }
             datagram::DATAGRAM_TAG_SENSOR_SLICE if self.phase == Phase::Operating => self.on_sensor_slice(&payload),
+            datagram::DATAGRAM_TAG_TOPIC => match TopicSample::decode(&payload) {
+                Ok(sample) => self.republish(sample),
+                Err(e) => tracing::debug!(error = %e, "dropping a forwarded topic datagram"),
+            },
             _ => {}
         }
     }
@@ -1387,6 +1534,31 @@ impl Client {
         self.hud.command_rate.record(std::time::Instant::now(), bytes.len());
         self.hud.command_last_seq = self.channel_b_seq;
     }
+}
+
+/// Client-initiated unidirectional stream ids are 2 mod 4 (RFC 9000 §2.1).
+const FIRST_CLIENT_UNI_STREAM: u64 = 2;
+
+async fn recv_forward(forwarder: &mut Option<Forwarder>) -> Option<roboprotocol_zenoh::Outgoing> {
+    match forwarder {
+        Some(f) => f.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Opens this host's Zenoh session and starts forwarding. Unlike the
+/// robot's sidecar this is fatal: forwarding was asked for explicitly.
+async fn start_forwarder(z: &ZenohArgs) -> Result<Forwarder> {
+    let config = match &z.config_file {
+        Some(path) => roboprotocol_zenoh::config_from_file(path)?,
+        None => roboprotocol_zenoh::isolated_config(&z.listen)?,
+    };
+    let session = roboprotocol_zenoh::open_session(config).await?;
+    match &z.config_file {
+        Some(path) => tracing::info!(config = %path.display(), "zenoh session open"),
+        None => tracing::info!(listen = %z.listen, "zenoh session open (no multicast scouting: connect nodes to this endpoint)"),
+    }
+    Forwarder::start(session, &z.rules).await
 }
 
 async fn recv_input(input: &mut Option<InputReader>) -> Option<TeleopInput> {

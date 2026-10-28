@@ -1,0 +1,19 @@
+[package]
+name = "roboprotocol-zenoh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+roboprotocol-core = { path = "../roboprotocol-core" }
+# Same major version as robot-edge's sidecar and the eclipse-zenoh Python
+# bindings BabyROS uses.
+zenoh = "1"
+quiche = "0.22"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+anyhow = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

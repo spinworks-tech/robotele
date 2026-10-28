@@ -9,6 +9,8 @@
 #      frames on the operator -- the lidar's descriptor also makes
 #      SESSION_DESCRIBE span more than one packet
 #   2c. a bulk object (docs/13, --sim-map) arrives whole on its own stream
+#   2d. Zenoh topic forwarding (#36): samples published on each side's own
+#      Zenoh are republished on the other side's, in latest and reliable mode
 #   3. the watchdog E-Stop latches within the Class D threshold (400ms) once
 #      the operator link goes silent
 #
@@ -25,13 +27,19 @@ WORKDIR="$(mktemp -d)"
 ROBOT_LOG="$WORKDIR/robot-edge.log"
 OPERATOR_LOG="$WORKDIR/operator-console.log"
 PORT="${SMOKE_TEST_PORT:-14433}"
+# Each side's own Zenoh session, for the topic forwarding check.
+ROBOT_ZENOH="tcp/127.0.0.1:$((PORT + 1))"
+OPERATOR_ZENOH="tcp/127.0.0.1:$((PORT + 2))"
+PROBE=./target/debug/examples/zenoh_probe
 
 ROBOT_PID=""
 OPERATOR_PID=""
+SUB_PIDS=()
 
 cleanup() {
     [[ -n "$ROBOT_PID" ]] && kill -9 "$ROBOT_PID" 2>/dev/null
     [[ -n "$OPERATOR_PID" ]] && kill -9 "$OPERATOR_PID" 2>/dev/null
+    for pid in "${SUB_PIDS[@]}"; do kill -9 "$pid" 2>/dev/null; done
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -72,6 +80,7 @@ wait_for_log() {
 
 echo "== building workspace =="
 cargo build --workspace --quiet || fail "cargo build failed"
+cargo build --quiet -p roboprotocol-zenoh --example zenoh_probe || fail "building zenoh_probe failed"
 
 echo "== generating dev certs =="
 CERT_DIR="$WORKDIR/certs"
@@ -83,6 +92,8 @@ setsid ./target/debug/robot-edge \
     --cert "$CERT_DIR/robot/robot.crt" --key "$CERT_DIR/robot/robot.key" --ca "$CERT_DIR/dev-ca/ca.crt" \
     --stub-bridge --robot-id smoke_test \
     --sim-sensor lidar --sim-sensor radar --sim-map 1 \
+    --zenoh-port $((PORT + 1)) --zenoh-local-only \
+    --zenoh-forward 'latest:demo/robot/**' --zenoh-forward 'reliable:demo/map/**' \
     > "$ROBOT_LOG" 2>&1 < /dev/null &
 ROBOT_PID=$!
 disown
@@ -92,6 +103,7 @@ setsid ./target/debug/operator-console \
     --connect "127.0.0.1:$PORT" --server-name robot-edge \
     --cert "$CERT_DIR/operator/operator.crt" --key "$CERT_DIR/operator/operator.key" --ca "$CERT_DIR/dev-ca/ca.crt" \
     --headless \
+    --zenoh-listen "$OPERATOR_ZENOH" --zenoh-forward 'reliable:demo/op/**' \
     > "$OPERATOR_LOG" 2>&1 < /dev/null &
 OPERATOR_PID=$!
 disown
@@ -114,6 +126,28 @@ echo "== waiting for a bulk object (sim map) =="
 wait_for_log "$OPERATOR_LOG" "bulk object received" 10 || fail "operator-console never received a bulk object"
 echo "  ok: bulk object received"
 
+echo "== forwarding zenoh topics both ways =="
+"$PROBE" sub "$OPERATOR_ZENOH" 'demo/**' > "$WORKDIR/operator-sub.log" 2>&1 &
+SUB_PIDS+=($!)
+disown
+"$PROBE" sub "$ROBOT_ZENOH" 'demo/**' > "$WORKDIR/robot-sub.log" 2>&1 &
+SUB_PIDS+=($!)
+disown
+wait_for_log "$WORKDIR/operator-sub.log" "subscribed" 5 && wait_for_log "$WORKDIR/robot-sub.log" "subscribed" 5 || fail "zenoh_probe subscribers didn't start"
+sleep 0.5
+"$PROBE" pub "$ROBOT_ZENOH" demo/robot/pose 50 32 100 >/dev/null || fail "publishing demo/robot/pose failed"
+"$PROBE" pub "$ROBOT_ZENOH" demo/map/grid 3 300000 5 >/dev/null || fail "publishing demo/map/grid failed"
+"$PROBE" pub "$OPERATOR_ZENOH" demo/op/goal 20 16 50 >/dev/null || fail "publishing demo/op/goal failed"
+# Latest mode may drop or supersede a few; reliable mode must deliver all.
+wait_for_count "$WORKDIR/operator-sub.log" "recv demo/robot/pose .*attachment=probe-attachment" 40 5 || fail "latest-mode samples didn't reach the operator's zenoh"
+wait_for_count "$WORKDIR/operator-sub.log" "recv demo/map/grid .*bytes=300000" 3 10 || fail "reliable 300 KB samples didn't all reach the operator's zenoh"
+wait_for_count "$WORKDIR/robot-sub.log" "recv demo/op/goal" 20 5 || fail "reliable samples didn't all reach the robot's zenoh"
+for f in operator-sub robot-sub; do
+    dups=$(grep "^recv" "$WORKDIR/$f.log" | sort | uniq -d | wc -l)
+    [[ "$dups" -eq 0 ]] || fail "$f received $dups duplicate samples (a forwarding loop?)"
+done
+echo "  ok: zenoh topics forwarded both ways, no duplicates"
+
 echo "== killing operator-console to trigger the watchdog =="
 kill -9 "$OPERATOR_PID" 2>/dev/null
 OPERATOR_PID=""
@@ -124,4 +158,4 @@ wait_for_log "$ROBOT_LOG" "E-Stop latched" 3 || fail "watchdog never latched E-S
 echo "  ok: watchdog E-Stop latched after operator link silence"
 
 echo
-echo "PASS: HELLO -> SESSION_DESCRIBE/ACCEPT -> sensor slices -> bulk objects -> Channel B -> watchdog E-Stop all verified"
+echo "PASS: HELLO -> SESSION_DESCRIBE/ACCEPT -> sensor slices -> bulk objects -> zenoh topics -> Channel B -> watchdog E-Stop all verified"
