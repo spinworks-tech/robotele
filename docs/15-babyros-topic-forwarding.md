@@ -23,8 +23,9 @@ and the raw measurements. Background is in discussion
   multicast scouting on the PC), or samples would loop. The console detects that
   case and pauses forwarding.
 - **Measured on the XGO-Lite's CM4 over 2.4 GHz Wi-Fi, with real BabyROS 0.1.10
-  nodes:** every payload type decodes on the far side, and with no rate cap every
-  reliable round trip arrived (median about 150 ms).
+  nodes:** every payload type decodes on the far side, and every reliable round
+  trip arrived with a median of 73-94 ms uncapped, about 160 ms under the default
+  2 Mbps cap.
 
 ## How it works
 
@@ -291,15 +292,17 @@ degraded Wi-Fi link, 100 KB reliable samples five times a second in each directi
 uncapped, coincided with the robot's watchdog latching. It also has a cost, and on
 the CM4 its benefit to control isn't shown yet:
 
-| Real BabyROS workload, CM4 Wi-Fi, one stream (before the split) | Reliable back | Reliable p50 |
-| --- | --- | --- |
-| no cap | 396/396 | about 150 ms |
-| 2 Mbps cap | 301-327/396 | 3-4 s |
+| Real BabyROS workload, CM4 Wi-Fi | Reliable back | Reliable p50 | Grids |
+| --- | --- | --- | --- |
+| one reliable stream, no cap | 396/396 | about 150 ms | 12 |
+| one reliable stream, 2 Mbps cap | 301-327/396 | 3-4 s | 8 |
+| two reliable streams, no cap | 396/396 | 73-94 ms | 12 |
+| two reliable streams, 2 Mbps cap | 384-396/396 | 159-166 ms | 9-10 |
 
-With the reliable path split into two streams, the same workload under the 2 Mbps cap
-on localhost went from a 724 ms median to 19 ms. Full numbers, including the runs
-where the watchdog latched with no forwarded traffic at all, are in
-[BABYROS.md](../BABYROS.md), "Measured on the CM4" and "Real BabyROS nodes".
+Two streams made the cap affordable: a map no longer holds up the small samples
+behind it. The cap still costs some latency and grids next to no cap. Full numbers,
+including earlier runs where the watchdog latched with no forwarded traffic at all,
+are in [BABYROS.md](../BABYROS.md), "Measured on the CM4" and "Real BabyROS nodes".
 
 Rule of thumb: keep the total you forward each way well under what the link carries
 next to video. On the CM4's 2.4 GHz Wi-Fi, doc 14 measured RoboTele's datagram

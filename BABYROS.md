@@ -529,6 +529,22 @@ Every payload type decoded correctly on the far side in every run.
 
 (CM4 runs alternated; ICMP to the robot averaged 30 ms before and 13 ms after.)
 
+With the reliable path split into two streams (samples up to 16 KB on one, sent
+first), same nodes, later the same day:
+
+| Run | latest back, p50 | reliable back, p50 / p90 | grids | goals checked | Watchdog latched |
+| --- | --- | --- | --- | --- | --- |
+| localhost, cap 2 | 146/298, 11 ms | 298/298, 19 / 89 ms | 10/10 | 75/75 | – |
+| localhost, no cap | 297/297, 6 ms | 297/297, 6 / 7 ms | 9/9 | 75/75 | – |
+| CM4 Wi-Fi, cap 2 | 300/396, 155 ms | 384/396, 166 / 262 ms | 9 | 96/99 | no |
+| CM4 Wi-Fi, no cap | 347/396, 87 ms | 396/396, 94 / 271 ms | 12 | 99/99 | no |
+| CM4 Wi-Fi, cap 2 | 311/396, 144 ms | 396/396, 159 / 260 ms | 10 | 99/99 | no |
+| CM4 Wi-Fi, no cap | 366/396, 69 ms | 396/396, 73 / 185 ms | 12 | 99/99 | no |
+
+(ICMP averaged 52 ms before and 35 ms after.) Two streams take the cap's
+reliable median on the CM4 from 3-4 s to about 160 ms. Uncapped is still faster
+(about 80 ms) and delivers more grids. No run latched the watchdog this time.
+
 - **Uncapped, real BabyROS works across the link:** every reliable sample
   arrived, in about 150 ms median on the CM4's Wi-Fi.
 - **The 2 Mbps cap is too tight for this workload.** Arrow IPC adds overhead
