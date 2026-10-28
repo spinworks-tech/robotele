@@ -358,6 +358,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
     };
 
     let recorder = roboprotocol_recording::Recorder::start(args.recording.clone())?;
+    let max_mbps = args.zenoh.as_ref().map_or(0.0, |z| z.topics.max_mbps);
     let forwarder = match &args.zenoh {
         Some(z) => Some(start_forwarder(z).await?),
         None => None,
@@ -414,12 +415,12 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         bulk_rx: roboprotocol_core::bulk::BulkReceiver::new(),
         bulk_streams: HashSet::new(),
         forwarder,
-        topics: TopicLink::new(),
+        topics: TopicLink::new(max_mbps),
         topics_negotiated: false,
         next_uni_stream: FIRST_CLIENT_UNI_STREAM,
     };
     if client.forwarder.is_some() {
-        client.hud.zenoh = Some(crate::ui::ZenohHud::new());
+        client.hud.zenoh = Some(crate::ui::ZenohHud::new(max_mbps));
     }
 
     // `connect_with_resume_fallback` can leave `conn` already established
@@ -692,7 +693,7 @@ impl Client {
                     self.video_gate = crate::video::gate::DeltaGate::new();
                     self.bulk_rx = roboprotocol_core::bulk::BulkReceiver::new();
                     self.bulk_streams.clear();
-                    self.topics = TopicLink::new();
+                    self.topics = TopicLink::new(self.args.zenoh.as_ref().map_or(0.0, |z| z.topics.max_mbps));
                     self.topics_negotiated = false;
                     self.next_uni_stream = FIRST_CLIENT_UNI_STREAM;
                     self.session_info = None;

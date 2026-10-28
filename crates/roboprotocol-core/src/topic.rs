@@ -32,6 +32,7 @@
 //! binaries move the bytes through quiche.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 /// First byte of a reliable topic stream. Bulk object streams start with
 /// `bulk::BULK_FORMAT` (1) instead, which is how a receiver tells the two
@@ -42,8 +43,70 @@ pub const TOPIC_STREAM_VERSION: u8 = 1;
 /// without bound.
 pub const MAX_TOPIC_SAMPLE: usize = 16 * 1024 * 1024;
 /// Reliable bytes a sender keeps waiting for flow-control credit before it
-/// drops new samples instead.
+/// drops new samples instead, when forwarding isn't capped.
 pub const DEFAULT_RELIABLE_BACKLOG: usize = 4 * 1024 * 1024;
+/// With a `RateCap`, the reliable backlog holds this long at the capped rate:
+/// a fixed 4 MB at 2 Mbps was 16 s of queue, so on the CM4 300 KB maps sat
+/// behind stale samples and none arrived.
+pub const CAPPED_BACKLOG_SECS: f64 = 2.0;
+/// ...but never less than this, so a sample up to this size always fits.
+pub const MIN_RELIABLE_BACKLOG: usize = 1024 * 1024;
+
+/// The reliable backlog for a cap of `max_mbps` (0: no cap).
+pub fn reliable_backlog(max_mbps: f64) -> usize {
+    if max_mbps.is_nan() || max_mbps <= 0.0 {
+        return DEFAULT_RELIABLE_BACKLOG;
+    }
+    ((max_mbps * 1e6 / 8.0 * CAPPED_BACKLOG_SECS) as usize).max(MIN_RELIABLE_BACKLOG)
+}
+/// Default cap on forwarded bytes per direction, in megabits per second.
+/// On the CM4's 2.4 GHz Wi-Fi about 4 Mbps of forwarded traffic each way,
+/// on a degraded link, coincided with a watchdog latch (BABYROS.md,
+/// "Measured on the CM4"); half that leaves room for commands and video.
+pub const DEFAULT_MAX_MBPS: f64 = 2.0;
+/// How much a `RateCap` lets through at once after an idle spell.
+const CAP_BURST: Duration = Duration::from_millis(50);
+/// A burst always admits at least one full datagram.
+const CAP_MIN_BURST_BYTES: f64 = 1500.0;
+
+/// A token bucket on forwarded bytes: refills at the configured rate, holds
+/// at most `CAP_BURST` worth.
+#[derive(Debug, Clone)]
+pub struct RateCap {
+    bytes_per_sec: f64,
+    burst: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl RateCap {
+    /// `None` for `mbps <= 0` (no cap).
+    pub fn new(mbps: f64, now: Instant) -> Option<Self> {
+        if mbps.is_nan() || mbps <= 0.0 {
+            return None;
+        }
+        let bytes_per_sec = mbps * 1e6 / 8.0;
+        let burst = (bytes_per_sec * CAP_BURST.as_secs_f64()).max(CAP_MIN_BURST_BYTES);
+        Some(Self { bytes_per_sec, burst, tokens: burst, last: now })
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let dt = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + dt * self.bytes_per_sec).min(self.burst);
+        self.last = now;
+    }
+
+    /// Bytes that may be sent now.
+    pub fn available(&mut self, now: Instant) -> usize {
+        self.refill(now);
+        self.tokens.max(0.0) as usize
+    }
+
+    pub fn consume(&mut self, n: usize) {
+        self.tokens -= n as f64;
+    }
+}
+
 /// Keys under this prefix belong to robot-edge's own Zenoh sidecar
 /// (`robotele/<id>/autonomy_goal` and so on), so a forwarded sample may not
 /// use one: otherwise the operator's side could assert an autonomy goal
@@ -433,6 +496,28 @@ mod tests {
         o.consume_reliable(usize::MAX);
         o.push(TopicMode::Reliable, &sample("a", &[0; 40]));
         assert_eq!(o.stats().reliable_queued, 2);
+    }
+
+    #[test]
+    fn the_reliable_backlog_follows_the_cap() {
+        assert_eq!(reliable_backlog(0.0), DEFAULT_RELIABLE_BACKLOG);
+        assert_eq!(reliable_backlog(2.0), MIN_RELIABLE_BACKLOG, "2 s at 2 Mbps is 500 KB, under the floor");
+        assert_eq!(reliable_backlog(20.0), 5_000_000);
+    }
+
+    #[test]
+    fn rate_cap_holds_the_rate_after_its_burst() {
+        let t0 = Instant::now();
+        assert!(RateCap::new(0.0, t0).is_none(), "0 means no cap");
+        let mut cap = RateCap::new(2.0, t0).unwrap(); // 250,000 B/s, 12,500 B burst
+        assert_eq!(cap.available(t0), 12_500);
+        cap.consume(12_500);
+        assert_eq!(cap.available(t0), 0);
+        assert_eq!(cap.available(t0 + Duration::from_millis(20)), 5_000);
+        // An idle spell refills only up to the burst.
+        assert_eq!(cap.available(t0 + Duration::from_secs(10)), 12_500);
+        // A tiny rate still admits one full datagram per burst.
+        assert_eq!(RateCap::new(0.01, t0).unwrap().available(t0), 1_500);
     }
 
     #[test]

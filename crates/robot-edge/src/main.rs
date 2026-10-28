@@ -158,6 +158,10 @@ impl Cli {
                     let key_expr = it.next().context("--zenoh-accept needs a key expression")?;
                     zenoh_forward.get_or_insert_with(Default::default).add_accept(&key_expr).context("--zenoh-accept")?;
                 }
+                "--zenoh-max-mbps" => {
+                    let value = it.next().context("--zenoh-max-mbps needs a value")?;
+                    zenoh_forward.get_or_insert_with(Default::default).set_max_mbps(&value).context("--zenoh-max-mbps")?;
+                }
                 "--zenoh-topics" => {
                     let path = PathBuf::from(it.next().context("--zenoh-topics needs a file")?);
                     zenoh_forward.get_or_insert_with(Default::default).add_file(&path).context("--zenoh-topics")?;
@@ -233,7 +237,8 @@ impl Cli {
                          [--zenoh-bridge]   (turn on topic forwarding; implied by the next three)\n  \
                          [--zenoh-forward latest|reliable:KEY_EXPR]...   (forward local Zenoh topics to the operator)\n  \
                          [--zenoh-accept KEY_EXPR]...   (republish the operator's forwarded topics matching this; none = accept nothing)\n  \
-                         [--zenoh-topics FILE]   (forward/accept rules, one per line: `forward latest KEY_EXPR`, `accept KEY_EXPR`)\n  \
+                         [--zenoh-topics FILE]   (forward/accept rules, one per line: `forward latest KEY_EXPR`, `accept KEY_EXPR`, `max-mbps N`)\n  \
+                         [--zenoh-max-mbps N]   (cap on forwarded traffic to the operator; default 2, 0 = no cap)\n  \
                          [--bridge-script PATH] [--stub-bridge] [--serial-port PATH] [--watchdog-ms N]\n  \
                          [--estop-watchdog-ms N]\n  \
                          [--camera] [--camera-bin PATH]\n  \

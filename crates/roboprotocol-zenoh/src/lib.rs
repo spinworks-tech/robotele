@@ -80,14 +80,32 @@ impl FromStr for ForwardRule {
 /// forward latest robot/pose
 /// forward reliable robot/map/**
 /// accept planner/**
+/// max-mbps 2
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ForwardConfig {
     pub forward: Vec<ForwardRule>,
     pub accept: Vec<String>,
+    /// Cap on forwarded bytes this side sends (`--zenoh-max-mbps`); 0 for
+    /// none.
+    pub max_mbps: f64,
+}
+
+impl Default for ForwardConfig {
+    fn default() -> Self {
+        Self { forward: Vec::new(), accept: Vec::new(), max_mbps: roboprotocol_core::topic::DEFAULT_MAX_MBPS }
+    }
 }
 
 impl ForwardConfig {
+    /// Sets `--zenoh-max-mbps`.
+    pub fn set_max_mbps(&mut self, value: &str) -> Result<()> {
+        let mbps: f64 = value.parse().map_err(|_| anyhow!("expected a number of Mbps, got {value:?}"))?;
+        anyhow::ensure!(mbps.is_finite() && mbps >= 0.0, "max Mbps must be 0 (no cap) or more, got {value}");
+        self.max_mbps = mbps;
+        Ok(())
+    }
+
     /// Adds one `--zenoh-accept` key expression.
     pub fn add_accept(&mut self, key_expr: &str) -> Result<()> {
         zenoh::key_expr::KeyExpr::try_from(key_expr).map_err(|e| anyhow!("bad key expression {key_expr:?}: {e}"))?;
@@ -109,7 +127,8 @@ impl ForwardConfig {
                 [] => Ok(()),
                 ["forward", mode, key_expr] => format!("{mode}:{key_expr}").parse().map(|r| self.forward.push(r)),
                 ["accept", key_expr] => self.add_accept(key_expr),
-                _ => Err(anyhow!("expected `forward latest|reliable KEY_EXPR` or `accept KEY_EXPR`")),
+                ["max-mbps", value] => self.set_max_mbps(value),
+                _ => Err(anyhow!("expected `forward latest|reliable KEY_EXPR`, `accept KEY_EXPR` or `max-mbps N`")),
             };
             added.with_context(|| format!("line {}: {line:?}", n + 1))?;
         }
@@ -174,6 +193,10 @@ impl Forwarder {
         }
         for k in &accept {
             tracing::info!(key_expr = %k, "accepting forwarded zenoh topic");
+        }
+        match config.max_mbps {
+            0.0 => tracing::warn!("zenoh: forwarded traffic is not capped (--zenoh-max-mbps 0); a large topic can delay commands on a weak link"),
+            mbps => tracing::info!(mbps, "zenoh: forwarded traffic capped per direction"),
         }
         let (outgoing_tx, outgoing_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (republish_tx, mut republish_rx) = mpsc::channel::<TopicSample>(CHANNEL_DEPTH);
@@ -369,7 +392,7 @@ mod tests {
     }
 
     fn config(forward: &[&str], accept: &[&str]) -> ForwardConfig {
-        let mut c = ForwardConfig { forward: forward.iter().map(|r| r.parse().unwrap()).collect(), accept: vec![] };
+        let mut c = ForwardConfig { forward: forward.iter().map(|r| r.parse().unwrap()).collect(), ..Default::default() };
         accept.iter().for_each(|a| c.add_accept(a).unwrap());
         c
     }
@@ -379,7 +402,10 @@ mod tests {
         let mut c = ForwardConfig::default();
         c.add_text("# robot side\nforward latest robot/pose\n\n  forward reliable robot/map/**  # maps\naccept planner/**\n").unwrap();
         assert_eq!(c, config(&["latest:robot/pose", "reliable:robot/map/**"], &["planner/**"]));
-        for bad in ["forward robot/pose", "forward bulk a", "accept", "accept /a", "subscribe a"] {
+        assert_eq!(c.max_mbps, roboprotocol_core::topic::DEFAULT_MAX_MBPS);
+        c.add_text("max-mbps 0.5").unwrap();
+        assert_eq!(c.max_mbps, 0.5);
+        for bad in ["forward robot/pose", "forward bulk a", "accept", "accept /a", "subscribe a", "max-mbps -1", "max-mbps fast", "max-mbps inf"] {
             let err = ForwardConfig::default().add_text(&format!("accept ok\n{bad}")).unwrap_err();
             assert!(format!("{err:#}").contains("line 2"), "{bad}: {err:#}");
         }

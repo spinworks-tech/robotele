@@ -265,7 +265,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             command_sink: command_sink.clone(),
             autonomy_goal: autonomy_goal.clone(),
             forwarder: forwarder.take(),
-            topics: TopicLink::new(),
+            topics: TopicLink::new(args.zenoh_forward.as_ref().map_or(0.0, |c| c.max_mbps)),
             topics_negotiated: false,
             topic_turn: false,
             phase: Phase::AwaitingHello,

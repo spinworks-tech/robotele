@@ -228,11 +228,13 @@ pub struct ZenohHud {
     /// The robot's Zenoh domain is visible from this one, so forwarding is
     /// paused (it would loop).
     pub paused: bool,
+    /// `--zenoh-max-mbps`; 0 for no cap.
+    pub max_mbps: f64,
 }
 
 impl ZenohHud {
-    pub fn new() -> Self {
-        Self { in_rate: RateCounter::new(CHANNEL_STATS_WINDOW), out_rate: RateCounter::new(CHANNEL_STATS_WINDOW), paused: false }
+    pub fn new(max_mbps: f64) -> Self {
+        Self { in_rate: RateCounter::new(CHANNEL_STATS_WINDOW), out_rate: RateCounter::new(CHANNEL_STATS_WINDOW), paused: false, max_mbps }
     }
 }
 
@@ -759,7 +761,10 @@ fn draw_channels_panel(f: &mut Frame, area: Rect, hud: &HudState) {
         let note = if z.paused {
             "PAUSED: robot's Zenoh domain reachable directly".to_string()
         } else {
-            format!("out {out_hz:.1} Hz {}", fmt_rate(out_bps))
+            match z.max_mbps {
+                0.0 => format!("out {out_hz:.1} Hz {}, no cap", fmt_rate(out_bps)),
+                cap => format!("out {out_hz:.1} Hz {}, cap {cap} Mbps", fmt_rate(out_bps)),
+            }
         };
         Row::new(vec![Cell::from("C (zenoh in)"), Cell::from(format!("{in_hz:.1}")), Cell::from(fmt_rate(in_bps)), Cell::from("--"), Cell::from(note)])
     });

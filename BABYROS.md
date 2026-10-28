@@ -427,6 +427,13 @@ Operator:
   accept robot/**
   ```
 
+- `--zenoh-max-mbps N` caps what *this* side forwards (latest and reliable
+  together); default **2 Mbps**, `0` for no cap, `max-mbps N` in a topics file.
+  While the cap binds, latest samples wait and newer ones replace them, and
+  reliable samples wait in a backlog that holds about 2 s at the capped rate
+  (at least 1 MB, so a sample up to that size always fits; 4 MB with no cap).
+  A reliable sample that doesn't fit is dropped and counted. It exists because forwarded
+  volume can delay commands on a weak link (see "Measured on the CM4").
 - Any of these turns forwarding on; `--zenoh-bridge` turns it on with no rules.
 - The console opens its own Zenoh session, by default listening on
   `tcp/127.0.0.1:7448` only, with multicast scouting off (`--zenoh-listen` to
@@ -482,8 +489,8 @@ turning multicast scouting off on the PC's nodes, as above.
   isn't sent back. Deletes aren't forwarded.
 - Samples captured before a session is up are discarded when it starts, rather
   than delivered stale.
-- A reliable sample that would push the waiting backlog over 4 MB is dropped
-  (counted in the session-end log line). One large sample delays the other
+- A reliable sample that would overflow the waiting backlog is dropped
+  (counted in the session-end log line); see `--zenoh-max-mbps` for its size. One large sample delays the other
   reliable topics behind it, since they share a stream.
 - Each sample carries its key (no per-session topic ids yet), so a long key
   costs bytes in every latest-mode datagram.
@@ -522,10 +529,34 @@ What it shows:
   and no sensors, 100 KB reliable samples 5 times a second each way (about
   4 Mbps per direction) coincided with a watchdog latch; the same phase on the
   good link didn't. Commands go first into each packet, but they still queue
-  behind forwarded packets in the Wi-Fi driver and the access point. Keep large
-  forwarded topics infrequent; a rate cap on forwarded traffic is the next step.
+  behind forwarded packets in the Wi-Fi driver and the access point. That run
+  was uncapped; `--zenoh-max-mbps` (default 2) now limits this.
 - The link swung from 40 ms to over 300 ms average within 20 minutes, so the
   rows after the first two are not a clean comparison.
+
+**The cap, A/B.** Later the same day, three alternating pairs with no cap and
+the default 2 Mbps cap (maps every 2 s, 0.5 Hz). Each test phase's start is
+given from the session start: ICMP only 0 s, latest 23 s, reliable 32 B 41 s,
+100 KB at 5 Hz (4 Mbps offered each way) 58 s, maps 71 s.
+
+| Run | Link avg / max | reliable 32 B p50 / p90 | 100 KB back | maps | Watchdog latched at |
+| --- | --- | --- | --- | --- | --- |
+| 1, no cap | 162 / 1,215 ms | – (the laptop lost Wi-Fi) | 0/50 | 0/10 | +25 s |
+| 1, cap 2 | 86 / 452 ms | 48 / 199 ms | 3/50 | 9/10 | +61 s (100 KB) |
+| 2, no cap | 78 / 822 ms | 246 / 1,308 ms | 50/50 | 10/10 | +54 s (32 B) |
+| 2, cap 2 | 69 / 439 ms | 43 / 138 ms | 2/50 | 3/10 | +62 s (100 KB) |
+| 3, no cap | 30 / 332 ms | 50 / 141 ms | 32/50 | 10/10 | +63 s (100 KB) |
+| 3, cap 2 | 108 / 751 ms | 39 / 137 ms | 9/50 | 10/10 | +15 s (ICMP only) |
+
+- The cap holds forwarded traffic to its rate: with 4 Mbps offered, few 100 KB
+  samples came back, as designed (the backlog is 2 s at the cap, 1 MB here).
+- **Inconclusive on control.** That evening the link latched the watchdog with
+  no forwarded traffic at all (run 3 capped, +15 s), and capped and uncapped
+  runs both latched in the 100 KB phase. Showing whether the cap protects
+  commands needs the doc 12 control benchmark (command latency, not one
+  latch flag) on a quieter link.
+- A first capped A/B, before the backlog was sized from the cap, had 0 of 10
+  maps arrive: the fixed 4 MB backlog was 16 s of queue at 2 Mbps.
 
 ## Status of testing
 

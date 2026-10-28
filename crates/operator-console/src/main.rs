@@ -167,6 +167,10 @@ impl Cli {
                     let key_expr = it.next().context("--zenoh-accept needs a key expression")?;
                     zenoh.get_or_insert_with(quic_client::ZenohArgs::default).topics.add_accept(&key_expr).context("--zenoh-accept")?;
                 }
+                "--zenoh-max-mbps" => {
+                    let value = it.next().context("--zenoh-max-mbps needs a value")?;
+                    zenoh.get_or_insert_with(quic_client::ZenohArgs::default).topics.set_max_mbps(&value).context("--zenoh-max-mbps")?;
+                }
                 "--zenoh-topics" => {
                     let path = PathBuf::from(it.next().context("--zenoh-topics needs a file")?);
                     zenoh.get_or_insert_with(quic_client::ZenohArgs::default).topics.add_file(&path).context("--zenoh-topics")?;
@@ -188,7 +192,7 @@ impl Cli {
                          [--bulk-save-dir DIR] [--video] [--video-backend ffplay|native] [--video-overlay] [--ffplay-bin PATH]\n  \
                          [--move-stale-ms N] [--observer]\n  \
                          [--zenoh-bridge] [--zenoh-forward latest|reliable:KEY_EXPR]... [--zenoh-accept KEY_EXPR]...\n  \
-                         [--zenoh-topics FILE] [--zenoh-listen ENDPOINT] [--zenoh-config FILE]\n  \
+                         [--zenoh-topics FILE] [--zenoh-max-mbps N] [--zenoh-listen ENDPOINT] [--zenoh-config FILE]\n  \
                          [--record-dir PATH] [--record-extra haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
                          [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n  \
@@ -234,7 +238,9 @@ impl Cli {
                          lost. --zenoh-accept (repeatable) republishes the robot's forwarded samples whose\n  \
                          key it matches; with none, nothing is republished. --zenoh-topics FILE reads the\n  \
                          same rules from a file, one per line (`forward latest KEY_EXPR`, `accept KEY_EXPR`,\n  \
-                         # comments). Each of these implies --zenoh-bridge. See BABYROS.md, \"Forwarding topics\"."
+                         `max-mbps N`, # comments). --zenoh-max-mbps caps what this side forwards (default\n  \
+                         2 Mbps, 0 = no cap) so a large topic can't crowd out commands on a weak link.\n  \
+                         Each of these implies --zenoh-bridge. See BABYROS.md, \"Forwarding topics\"."
                     );
                     std::process::exit(0);
                 }
