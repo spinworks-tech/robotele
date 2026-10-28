@@ -300,7 +300,9 @@ the CM4 its benefit to control isn't shown yet:
 | two reliable streams, 2 Mbps cap | 384-396/396 | 159-166 ms | 9-10 |
 
 Two streams made the cap affordable: a map no longer holds up the small samples
-behind it. The cap still costs some latency and grids next to no cap. Full numbers,
+behind it. The cap still costs some latency and grids next to no cap. **The default
+stays at 2 Mbps** as a safety margin for weak links, since its cost is now small; use
+`--zenoh-max-mbps 0` on a link known to have room. Full numbers,
 including earlier runs where the watchdog latched with no forwarded traffic at all,
 are in [BABYROS.md](../BABYROS.md), "Measured on the CM4" and "Real BabyROS nodes".
 
