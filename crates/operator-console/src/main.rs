@@ -161,7 +161,15 @@ impl Cli {
                 "--zenoh-forward" => {
                     let rule = it.next().context("--zenoh-forward needs a value (latest|reliable):KEY_EXPR")?;
                     let rule = rule.parse().with_context(|| format!("--zenoh-forward {rule}"))?;
-                    zenoh.get_or_insert_with(quic_client::ZenohArgs::default).rules.push(rule);
+                    zenoh.get_or_insert_with(quic_client::ZenohArgs::default).topics.forward.push(rule);
+                }
+                "--zenoh-accept" => {
+                    let key_expr = it.next().context("--zenoh-accept needs a key expression")?;
+                    zenoh.get_or_insert_with(quic_client::ZenohArgs::default).topics.add_accept(&key_expr).context("--zenoh-accept")?;
+                }
+                "--zenoh-topics" => {
+                    let path = PathBuf::from(it.next().context("--zenoh-topics needs a file")?);
+                    zenoh.get_or_insert_with(quic_client::ZenohArgs::default).topics.add_file(&path).context("--zenoh-topics")?;
                 }
                 "--zenoh-listen" => zenoh.get_or_insert_with(quic_client::ZenohArgs::default).listen = it.next().context("--zenoh-listen needs a value")?,
                 "--zenoh-config" => {
@@ -179,7 +187,8 @@ impl Cli {
                          [--cert PATH] [--key PATH] [--ca PATH] [--task-class B|C|D|E] [--tick-hz N]\n  \
                          [--bulk-save-dir DIR] [--video] [--video-backend ffplay|native] [--video-overlay] [--ffplay-bin PATH]\n  \
                          [--move-stale-ms N] [--observer]\n  \
-                         [--zenoh-bridge] [--zenoh-forward latest|reliable:KEY_EXPR]... [--zenoh-listen ENDPOINT] [--zenoh-config FILE]\n  \
+                         [--zenoh-bridge] [--zenoh-forward latest|reliable:KEY_EXPR]... [--zenoh-accept KEY_EXPR]...\n  \
+                         [--zenoh-topics FILE] [--zenoh-listen ENDPOINT] [--zenoh-config FILE]\n  \
                          [--record-dir PATH] [--record-extra haptic,action]\n  \
                          [--record-max-segment-mb N] [--record-max-segment-secs N]\n  \
                          [--record-budget-mb N] [--record-video-budget-mb N] [--record-flush-secs N]\n  \
@@ -219,10 +228,13 @@ impl Cli {
                          to <--record-dir>/screenshots/ if given, else ./screenshots/.\n\
                          --zenoh-bridge opens a Zenoh session on this host (default: listening on\n  \
                          tcp/127.0.0.1:7448 only, no multicast scouting; --zenoh-listen or a full\n  \
-                         --zenoh-config change that) and republishes the Zenoh samples robot-edge\n  \
-                         forwards. --zenoh-forward (repeatable, implies --zenoh-bridge) forwards local\n  \
-                         samples matching KEY_EXPR to the robot: latest = lossy datagrams, newest per\n  \
-                         key; reliable = in order, nothing lost. See BABYROS.md, \"Forwarding topics\"."
+                         --zenoh-config change that) for topic forwarding with a robot-edge that has it\n  \
+                         on too. --zenoh-forward (repeatable) forwards local samples matching KEY_EXPR to\n  \
+                         the robot: latest = lossy datagrams, newest per key; reliable = in order, nothing\n  \
+                         lost. --zenoh-accept (repeatable) republishes the robot's forwarded samples whose\n  \
+                         key it matches; with none, nothing is republished. --zenoh-topics FILE reads the\n  \
+                         same rules from a file, one per line (`forward latest KEY_EXPR`, `accept KEY_EXPR`,\n  \
+                         # comments). Each of these implies --zenoh-bridge. See BABYROS.md, \"Forwarding topics\"."
                     );
                     std::process::exit(0);
                 }

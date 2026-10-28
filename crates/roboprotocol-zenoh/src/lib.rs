@@ -68,6 +68,55 @@ impl FromStr for ForwardRule {
     }
 }
 
+/// What a side forwards and what it accepts from the peer: the
+/// `--zenoh-forward` and `--zenoh-accept` flags, plus any `--zenoh-topics`
+/// files. Accepting is an allowlist: a sample from the peer is republished
+/// only if an `accept` key expression includes its key, so with none,
+/// nothing is.
+///
+/// A topics file has one rule per line; `#` starts a comment:
+///
+/// ```text
+/// forward latest robot/pose
+/// forward reliable robot/map/**
+/// accept planner/**
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForwardConfig {
+    pub forward: Vec<ForwardRule>,
+    pub accept: Vec<String>,
+}
+
+impl ForwardConfig {
+    /// Adds one `--zenoh-accept` key expression.
+    pub fn add_accept(&mut self, key_expr: &str) -> Result<()> {
+        zenoh::key_expr::KeyExpr::try_from(key_expr).map_err(|e| anyhow!("bad key expression {key_expr:?}: {e}"))?;
+        self.accept.push(key_expr.to_string());
+        Ok(())
+    }
+
+    /// Adds the rules in a topics file (see the type's docs).
+    pub fn add_file(&mut self, path: &std::path::Path) -> Result<()> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        self.add_text(&text).with_context(|| format!("in {}", path.display()))
+    }
+
+    fn add_text(&mut self, text: &str) -> Result<()> {
+        for (n, line) in text.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let added = match words[..] {
+                [] => Ok(()),
+                ["forward", mode, key_expr] => format!("{mode}:{key_expr}").parse().map(|r| self.forward.push(r)),
+                ["accept", key_expr] => self.add_accept(key_expr),
+                _ => Err(anyhow!("expected `forward latest|reliable KEY_EXPR` or `accept KEY_EXPR`")),
+            };
+            added.with_context(|| format!("line {}: {line:?}", n + 1))?;
+        }
+        Ok(())
+    }
+}
+
 /// A local sample on its way to the peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outgoing {
@@ -85,16 +134,24 @@ pub struct ForwardStats {
     pub republished: AtomicU64,
     /// Not republished: the channel was full or forwarding was paused.
     pub republish_dropped: AtomicU64,
+    /// Not republished: no `accept` key expression includes the key.
+    pub republish_rejected: AtomicU64,
 }
 
 impl ForwardStats {
-    pub fn snapshot(&self) -> [u64; 4] {
-        [&self.captured, &self.capture_dropped, &self.republished, &self.republish_dropped].map(|c| c.load(Ordering::Relaxed))
+    pub fn snapshot(&self) -> [u64; 5] {
+        [&self.captured, &self.capture_dropped, &self.republished, &self.republish_dropped, &self.republish_rejected].map(|c| c.load(Ordering::Relaxed))
     }
 }
 
+/// Distinct rejected keys warned about, so a peer forwarding many keys
+/// can't flood the log.
+const MAX_REJECTED_KEYS_LOGGED: usize = 32;
+
 pub struct Forwarder {
     session: zenoh::Session,
+    accept: Vec<zenoh::key_expr::KeyExpr<'static>>,
+    rejected_logged: std::sync::Mutex<std::collections::HashSet<String>>,
     outgoing_rx: mpsc::Receiver<Outgoing>,
     republish_tx: mpsc::Sender<TopicSample>,
     paused: Arc<AtomicBool>,
@@ -103,9 +160,21 @@ pub struct Forwarder {
 }
 
 impl Forwarder {
-    /// Declares a subscriber per rule and starts the republishing task.
-    /// Fails if a subscriber can't be declared.
-    pub async fn start(session: zenoh::Session, rules: &[ForwardRule]) -> Result<Self> {
+    /// Declares a subscriber per forward rule and starts the republishing
+    /// task. Fails if a subscriber can't be declared.
+    pub async fn start(session: zenoh::Session, config: &ForwardConfig) -> Result<Self> {
+        let rules = &config.forward;
+        let accept = config
+            .accept
+            .iter()
+            .map(|k| zenoh::key_expr::KeyExpr::try_from(k.clone()).map_err(|e| anyhow!("bad key expression {k:?}: {e}")))
+            .collect::<Result<Vec<_>>>()?;
+        if accept.is_empty() {
+            tracing::warn!("zenoh: no --zenoh-accept key expressions, so nothing the peer forwards will be republished here");
+        }
+        for k in &accept {
+            tracing::info!(key_expr = %k, "accepting forwarded zenoh topic");
+        }
         let (outgoing_tx, outgoing_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (republish_tx, mut republish_rx) = mpsc::channel::<TopicSample>(CHANNEL_DEPTH);
         let paused = Arc::new(AtomicBool::new(false));
@@ -157,7 +226,7 @@ impl Forwarder {
             });
         }
 
-        Ok(Self { session, outgoing_rx, republish_tx, paused, stats, watcher: None })
+        Ok(Self { session, accept, rejected_logged: Default::default(), outgoing_rx, republish_tx, paused, stats, watcher: None })
     }
 
     /// The next local sample to send to the peer.
@@ -176,8 +245,23 @@ impl Forwarder {
         std::iter::from_fn(|| self.try_recv()).count()
     }
 
-    /// Puts a sample the peer forwarded on the local session. Never blocks.
+    /// Whether an `accept` key expression includes `key`.
+    pub fn accepts(&self, key: &str) -> bool {
+        let Ok(key) = zenoh::key_expr::KeyExpr::try_from(key) else { return false };
+        self.accept.iter().any(|a| a.includes(&key))
+    }
+
+    /// Puts a sample the peer forwarded on the local session, if `accepts`
+    /// allows its key. Never blocks.
     pub fn republish(&self, sample: TopicSample) {
+        if !self.accepts(&sample.key) {
+            self.stats.republish_rejected.fetch_add(1, Ordering::Relaxed);
+            let mut logged = self.rejected_logged.lock().unwrap();
+            if logged.len() < MAX_REJECTED_KEYS_LOGGED && logged.insert(sample.key.clone()) {
+                tracing::warn!(key = %sample.key, "zenoh: the peer forwarded a key no --zenoh-accept includes; not republishing it");
+            }
+            return;
+        }
         if self.paused.load(Ordering::Relaxed) || self.republish_tx.try_send(sample).is_err() {
             self.stats.republish_dropped.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -284,6 +368,23 @@ mod tests {
         assert!("latest:".parse::<ForwardRule>().is_err(), "empty key expression");
     }
 
+    fn config(forward: &[&str], accept: &[&str]) -> ForwardConfig {
+        let mut c = ForwardConfig { forward: forward.iter().map(|r| r.parse().unwrap()).collect(), accept: vec![] };
+        accept.iter().for_each(|a| c.add_accept(a).unwrap());
+        c
+    }
+
+    #[test]
+    fn topics_files_parse_forward_and_accept_lines() {
+        let mut c = ForwardConfig::default();
+        c.add_text("# robot side\nforward latest robot/pose\n\n  forward reliable robot/map/**  # maps\naccept planner/**\n").unwrap();
+        assert_eq!(c, config(&["latest:robot/pose", "reliable:robot/map/**"], &["planner/**"]));
+        for bad in ["forward robot/pose", "forward bulk a", "accept", "accept /a", "subscribe a"] {
+            let err = ForwardConfig::default().add_text(&format!("accept ok\n{bad}")).unwrap_err();
+            assert!(format!("{err:#}").contains("line 2"), "{bad}: {err:#}");
+        }
+    }
+
     #[test]
     fn isolated_config_builds() {
         isolated_config("tcp/127.0.0.1:7448").unwrap();
@@ -312,7 +413,7 @@ mod tests {
     async fn forwards_remote_samples_with_attachment_but_not_its_own_republishes() {
         // `node` is a BabyROS node; `bridge` is the forwarder's session on the same host.
         let (node, bridge) = linked_pair().await;
-        let mut fwd = Forwarder::start(bridge, &["reliable:demo/**".parse().unwrap()]).await.unwrap();
+        let mut fwd = Forwarder::start(bridge, &config(&["reliable:demo/**"], &["demo/**"])).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         node.put("demo/a", vec![1u8, 2, 3]).attachment(b"codec".to_vec()).await.unwrap();
@@ -333,9 +434,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn only_accepted_keys_are_republished() {
+        let (node, bridge) = linked_pair().await;
+        let fwd = Forwarder::start(bridge, &config(&[], &["planner/**", "robot/pose"])).await.unwrap();
+        assert!(fwd.accepts("planner/goal") && fwd.accepts("planner/a/b") && fwd.accepts("robot/pose"));
+        assert!(!fwd.accepts("robot/pose/x") && !fwd.accepts("other") && !fwd.accepts("plannerx"));
+        assert!(fwd.accepts("planner"), "Zenoh's `**` also matches zero chunks");
+
+        let sub = node.declare_subscriber("**").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        fwd.republish(TopicSample { key: "other/x".into(), attachment: vec![], payload: vec![1] });
+        fwd.republish(TopicSample { key: "planner/goal".into(), attachment: vec![], payload: vec![2] });
+        let got = tokio::time::timeout(Duration::from_secs(3), sub.recv_async()).await.unwrap().unwrap();
+        assert_eq!(got.key_expr().as_str(), "planner/goal", "the rejected sample must not arrive first");
+        let [_, _, republished, _, rejected] = fwd.stats().snapshot();
+        assert_eq!((republished, rejected), (1, 1));
+
+        let none = Forwarder::start(isolated().await, &config(&[], &[])).await.unwrap();
+        assert!(!none.accepts("planner/goal"), "no accept rules: nothing is accepted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn reserved_keys_are_not_forwarded() {
         let (node, bridge) = linked_pair().await;
-        let mut fwd = Forwarder::start(bridge, &["latest:**".parse().unwrap()]).await.unwrap();
+        let mut fwd = Forwarder::start(bridge, &config(&["latest:**"], &[])).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         node.put("robotele/xgo/autonomy_goal", vec![1u8]).await.unwrap();
         node.put("ok", vec![2u8]).await.unwrap();
@@ -346,12 +468,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn operator_pauses_while_the_robots_token_is_visible() {
         let (robot_side, operator_side) = linked_pair().await;
-        let robot = Forwarder::start(robot_side, &[]).await.unwrap();
+        let robot = Forwarder::start(robot_side, &config(&[], &[])).await.unwrap();
         robot.announce("xgo").await.unwrap();
 
-        let mut joined = Forwarder::start(operator_side, &[]).await.unwrap();
+        let mut joined = Forwarder::start(operator_side, &config(&[], &["**"])).await.unwrap();
         joined.pause_while_visible("xgo");
-        let mut separate = Forwarder::start(isolated().await, &[]).await.unwrap();
+        let mut separate = Forwarder::start(isolated().await, &config(&[], &["**"])).await.unwrap();
         separate.pause_while_visible("xgo");
 
         // The first check can run before the token has propagated; the next

@@ -32,6 +32,11 @@ pub mod capability_bits {
     pub const FLEXFEC_SUPPORT: u64 = 1 << 1;
     pub const ROS2_BRIDGE: u64 = 1 << 2;
     pub const CONNECTION_MIGRATION: u64 = 1 << 3;
+    /// Forwarded pub/sub topics (`crate::topic`, spinworks-tech/robotele#36):
+    /// set by an endpoint whose forwarder is on. Each side sends topic
+    /// samples only when both set it, so neither wastes the link on a peer
+    /// that would drop them.
+    pub const TOPIC_FORWARDING: u64 = 1 << 4;
 }
 
 /// `supported_task_classes` bit assignments (DESIGN.md §1.2.2: "Bit 0=Class

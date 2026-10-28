@@ -93,17 +93,25 @@ setsid ./target/debug/robot-edge \
     --stub-bridge --robot-id smoke_test \
     --sim-sensor lidar --sim-sensor radar --sim-map 1 \
     --zenoh-port $((PORT + 1)) --zenoh-local-only \
-    --zenoh-forward 'latest:demo/robot/**' --zenoh-forward 'reliable:demo/map/**' \
+    --zenoh-forward 'latest:demo/robot/**' --zenoh-forward 'reliable:demo/map/**' --zenoh-accept 'demo/op/**' \
     > "$ROBOT_LOG" 2>&1 < /dev/null &
 ROBOT_PID=$!
 disown
+
+# The operator side takes its rules from a file. It doesn't accept
+# demo/robot/secret, which the robot forwards anyway.
+cat > "$WORKDIR/operator-topics" <<'TOPICS'
+forward reliable demo/op/**   # goals to the robot
+accept demo/robot/pose
+accept demo/map/**
+TOPICS
 
 echo "== starting operator-console (--headless) =="
 setsid ./target/debug/operator-console \
     --connect "127.0.0.1:$PORT" --server-name robot-edge \
     --cert "$CERT_DIR/operator/operator.crt" --key "$CERT_DIR/operator/operator.key" --ca "$CERT_DIR/dev-ca/ca.crt" \
     --headless \
-    --zenoh-listen "$OPERATOR_ZENOH" --zenoh-forward 'reliable:demo/op/**' \
+    --zenoh-listen "$OPERATOR_ZENOH" --zenoh-topics "$WORKDIR/operator-topics" \
     > "$OPERATOR_LOG" 2>&1 < /dev/null &
 OPERATOR_PID=$!
 disown
@@ -135,18 +143,21 @@ SUB_PIDS+=($!)
 disown
 wait_for_log "$WORKDIR/operator-sub.log" "subscribed" 5 && wait_for_log "$WORKDIR/robot-sub.log" "subscribed" 5 || fail "zenoh_probe subscribers didn't start"
 sleep 0.5
+wait_for_log "$ROBOT_LOG" "zenoh topic forwarding negotiated" 1 || fail "robot-edge didn't negotiate topic forwarding"
 "$PROBE" pub "$ROBOT_ZENOH" demo/robot/pose 50 32 100 >/dev/null || fail "publishing demo/robot/pose failed"
+"$PROBE" pub "$ROBOT_ZENOH" demo/robot/secret 5 16 50 >/dev/null || fail "publishing demo/robot/secret failed"
 "$PROBE" pub "$ROBOT_ZENOH" demo/map/grid 3 300000 5 >/dev/null || fail "publishing demo/map/grid failed"
 "$PROBE" pub "$OPERATOR_ZENOH" demo/op/goal 20 16 50 >/dev/null || fail "publishing demo/op/goal failed"
 # Latest mode may drop or supersede a few; reliable mode must deliver all.
 wait_for_count "$WORKDIR/operator-sub.log" "recv demo/robot/pose .*attachment=probe-attachment" 40 5 || fail "latest-mode samples didn't reach the operator's zenoh"
 wait_for_count "$WORKDIR/operator-sub.log" "recv demo/map/grid .*bytes=300000" 3 10 || fail "reliable 300 KB samples didn't all reach the operator's zenoh"
 wait_for_count "$WORKDIR/robot-sub.log" "recv demo/op/goal" 20 5 || fail "reliable samples didn't all reach the robot's zenoh"
+grep -q "recv demo/robot/secret" "$WORKDIR/operator-sub.log" && fail "the operator republished demo/robot/secret, which it doesn't accept"
 for f in operator-sub robot-sub; do
     dups=$(grep "^recv" "$WORKDIR/$f.log" | sort | uniq -d | wc -l)
     [[ "$dups" -eq 0 ]] || fail "$f received $dups duplicate samples (a forwarding loop?)"
 done
-echo "  ok: zenoh topics forwarded both ways, no duplicates"
+echo "  ok: zenoh topics forwarded both ways, only accepted keys republished, no duplicates"
 
 echo "== killing operator-console to trigger the watchdog =="
 kill -9 "$OPERATOR_PID" 2>/dev/null

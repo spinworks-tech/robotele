@@ -14,7 +14,7 @@ use roboprotocol_core::action_trigger::{TriggerDedup, ACTION_TRIGGER_STREAM_ID};
 use roboprotocol_core::camera_control::{CameraControlDedup, CAMERA_CONTROL_STREAM_ID};
 use roboprotocol_core::datagram;
 use roboprotocol_core::estop::{EstopDatagram, ESTOP_DATAGRAM_MAGIC, ESTOP_STREAM_ID, ESTOP_STREAM_URGENCY};
-use roboprotocol_core::hello::{self, quantization_tier_bits, task_class_bits, HelloCapabilities, ProtocolVersion};
+use roboprotocol_core::hello::{self, capability_bits, quantization_tier_bits, task_class_bits, HelloCapabilities, ProtocolVersion};
 use roboprotocol_core::profile::CameraDescriptor;
 use roboprotocol_core::safety::TaskClass;
 use roboprotocol_core::topic::TopicSample;
@@ -65,7 +65,7 @@ pub struct ServerArgs {
     pub zenoh_port: u16,
     pub zenoh_local_only: bool,
     /// Topic forwarding rules (#36); `None` leaves forwarding off.
-    pub zenoh_forward: Option<Vec<roboprotocol_zenoh::ForwardRule>>,
+    pub zenoh_forward: Option<roboprotocol_zenoh::ForwardConfig>,
     pub tick_hz: u32,
     pub bridge: BridgeConfig,
     pub camera_config: Option<capture::CaptureConfig>,
@@ -266,6 +266,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             autonomy_goal: autonomy_goal.clone(),
             forwarder: forwarder.take(),
             topics: TopicLink::new(),
+            topics_negotiated: false,
             phase: Phase::AwaitingHello,
             channel_b_seq: 0,
             estop_seq: 0,
@@ -326,7 +327,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
         }
         if let Some(f) = &forwarder {
             let t = session.topics.stats();
-            let [captured, capture_dropped, republished, republish_dropped] = f.stats().snapshot();
+            let [captured, capture_dropped, republished, republish_dropped, republish_rejected] = f.stats().snapshot();
             tracing::info!(
                 latest_sent = t.latest_sent,
                 latest_superseded = t.latest_superseded,
@@ -337,6 +338,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
                 capture_dropped,
                 republished,
                 republish_dropped,
+                republish_rejected,
                 "zenoh topic forwarding at session end (captured/republished are totals since start)"
             );
         }
@@ -401,6 +403,10 @@ struct Session {
     /// operator's forwarded samples republished locally.
     forwarder: Option<Forwarder>,
     topics: TopicLink,
+    /// Both sides advertised `TOPIC_FORWARDING` in HELLO: only then are
+    /// local samples sent (an older or forwarding-less console would drop
+    /// them).
+    topics_negotiated: bool,
     phase: Phase,
     channel_b_seq: u64,
     estop_seq: u64,
@@ -531,9 +537,12 @@ impl Session {
                     return Ok(());
                 }
                 Some(sample) = recv_forward(&mut self.forwarder), if self.phase == Phase::Operating => {
-                    self.topics.push(&sample);
-                    while let Some(sample) = self.forwarder.as_mut().and_then(Forwarder::try_recv) {
-                        self.topics.push(&sample);
+                    // Drained either way, so the channel doesn't fill up.
+                    let samples = std::iter::once(sample).chain(std::iter::from_fn(|| self.forwarder.as_mut().and_then(Forwarder::try_recv)));
+                    if self.topics_negotiated {
+                        samples.for_each(|s| self.topics.push(&s));
+                    } else {
+                        samples.for_each(drop);
                     }
                     self.flush(socket, &mut out).await?;
                 }
@@ -618,7 +627,7 @@ impl Session {
     }
 
     fn send_hello(&mut self) -> Result<()> {
-        let caps = local_hello_capabilities(self.task_class);
+        let caps = local_hello_capabilities(self.task_class, self.forwarder.is_some());
         let bytes = hello_handler::encode_hello(&caps);
         match self.conn.stream_send(0, &bytes, false) {
             Ok(_) => Ok(()),
@@ -679,10 +688,17 @@ impl Session {
         match stream_id {
             0 if self.phase == Phase::AwaitingHello => {
                 let peer_caps = hello_handler::decode_hello(data)?;
-                let local_caps = local_hello_capabilities(self.task_class);
+                let local_caps = local_hello_capabilities(self.task_class, self.forwarder.is_some());
                 match hello::negotiate(&local_caps, &peer_caps) {
-                    Ok(_negotiated) => {
+                    Ok(negotiated) => {
                         tracing::info!("HELLO negotiated successfully");
+                        self.topics_negotiated = negotiated.capability_bitmask & capability_bits::TOPIC_FORWARDING != 0;
+                        if self.forwarder.is_some() {
+                            match self.topics_negotiated {
+                                true => tracing::info!("zenoh topic forwarding negotiated with the operator"),
+                                false => tracing::info!("the operator doesn't forward zenoh topics; not sending any this session"),
+                            }
+                        }
                         self.phase = Phase::AwaitingSessionAccept;
                         self.send_session_describe()?;
                     }
@@ -1419,12 +1435,12 @@ async fn recv_forward(forwarder: &mut Option<Forwarder>) -> Option<roboprotocol_
 /// Starts topic forwarding on the sidecar's Zenoh session if it was asked
 /// for. Like the sidecar, a failure only disables forwarding.
 async fn start_forwarder(args: &ServerArgs, session: Option<zenoh::Session>) -> Option<Forwarder> {
-    let rules = args.zenoh_forward.as_ref()?;
+    let config = args.zenoh_forward.as_ref()?;
     let Some(session) = session else {
         tracing::warn!("zenoh topic forwarding asked for, but the Zenoh session didn't open; forwarding disabled this run");
         return None;
     };
-    let forwarder = match Forwarder::start(session, rules).await {
+    let forwarder = match Forwarder::start(session, config).await {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "zenoh topic forwarding failed to start; disabled this run");
@@ -1454,7 +1470,7 @@ async fn recv_video(rx: &mut Option<VideoRx>) -> Option<(u32, Vec<u8>)> {
     }
 }
 
-fn local_hello_capabilities(task_class: TaskClass) -> HelloCapabilities {
+fn local_hello_capabilities(task_class: TaskClass, topic_forwarding: bool) -> HelloCapabilities {
     let task_class_bit = match task_class {
         TaskClass::B => task_class_bits::CLASS_B,
         TaskClass::C => task_class_bits::CLASS_C,
@@ -1466,7 +1482,7 @@ fn local_hello_capabilities(task_class: TaskClass) -> HelloCapabilities {
         // No TDPA/FlexFEC/ROS2/connection-migration support in v0 -- see
         // the plan's explicit deferral list. This hardware also has no
         // haptic sensing at all, so TDPA is N/A, not just unimplemented.
-        capability_bitmask: 0,
+        capability_bitmask: if topic_forwarding { capability_bits::TOPIC_FORWARDING } else { 0 },
         supported_task_classes: task_class_bit,
         supported_quantization_tiers: quantization_tier_bits::STANDARD,
         max_control_rate_hz: 50,

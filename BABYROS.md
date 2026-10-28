@@ -400,19 +400,32 @@ Robot:
 
 ```bash
 ./target/release/robot-edge ... --zenoh-local-only \
-    --zenoh-forward 'latest:robot/pose' --zenoh-forward 'reliable:robot/map/**'
+    --zenoh-forward 'latest:robot/pose' --zenoh-forward 'reliable:robot/map/**' \
+    --zenoh-accept 'planner/**'
 ```
 
 Operator:
 
 ```bash
 ./target/release/operator-console --connect <robot-ip>:4433 --server-name robot-edge \
-    --zenoh-forward 'reliable:planner/**'
+    --zenoh-forward 'reliable:planner/**' --zenoh-accept 'robot/**'
 ```
 
-- `--zenoh-forward MODE:KEY_EXPR` (repeatable) is what *this* side sends. Samples
-  the other side forwards are always republished. `--zenoh-bridge` turns
-  forwarding on with nothing to send (republish only).
+- `--zenoh-forward MODE:KEY_EXPR` (repeatable) is what *this* side sends.
+- `--zenoh-accept KEY_EXPR` (repeatable) is the allowlist for what the other
+  side sends: a forwarded sample is republished only if one of these includes
+  its key (Zenoh matching, so `planner/**` also covers `planner`). **With no
+  `--zenoh-accept`, nothing is republished.** A rejected key is logged once and
+  counted (`republish_rejected` in the session-end log line).
+- `--zenoh-topics FILE` reads the same rules from a file, alongside any flags:
+
+  ```text
+  # operator side
+  forward reliable planner/**
+  accept robot/**
+  ```
+
+- Any of these turns forwarding on; `--zenoh-bridge` turns it on with no rules.
 - The console opens its own Zenoh session, by default listening on
   `tcp/127.0.0.1:7448` only, with multicast scouting off (`--zenoh-listen` to
   change the endpoint, `--zenoh-config FILE` for a full Zenoh config). The HUD
@@ -433,6 +446,21 @@ cfg.insert_json5("scouting/multicast/enabled", "false")
 cfg.insert_json5("timestamping/enabled", "true")
 SessionManager.set_session_config(cfg)  # before creating any node
 ```
+
+### Older builds and plain teleop
+
+Forwarding is negotiated in HELLO (capability bit `TOPIC_FORWARDING`): each side
+sends topic samples only when both have forwarding on. Every combination keeps
+teleoperation working; checked on localhost with the `main` build:
+
+| operator-console | robot-edge | Result |
+| --- | --- | --- |
+| with forwarding | older build, or no forwarding | session and teleop as usual; console logs that the robot doesn't forward topics; nothing sent |
+| older build, or no forwarding | with forwarding | session and teleop as usual; robot logs that the operator doesn't forward topics; nothing sent |
+| with forwarding | with forwarding | topics forwarded both ways |
+
+The older console logs an `InvalidStreamState` warning per bulk object whether
+or not forwarding is involved; that's fixed in this build.
 
 ### Keep the two Zenoh domains apart
 

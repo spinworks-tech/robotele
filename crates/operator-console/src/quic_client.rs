@@ -188,7 +188,7 @@ pub struct ClientArgs {
 /// `--zenoh-bridge`, `--zenoh-forward`, `--zenoh-listen`, `--zenoh-config`.
 #[derive(Debug, Clone)]
 pub struct ZenohArgs {
-    pub rules: Vec<roboprotocol_zenoh::ForwardRule>,
+    pub topics: roboprotocol_zenoh::ForwardConfig,
     /// Ignored when `config_file` is given.
     pub listen: String,
     pub config_file: Option<PathBuf>,
@@ -196,7 +196,7 @@ pub struct ZenohArgs {
 
 impl Default for ZenohArgs {
     fn default() -> Self {
-        Self { rules: Vec::new(), listen: "tcp/127.0.0.1:7448".to_string(), config_file: None }
+        Self { topics: Default::default(), listen: "tcp/127.0.0.1:7448".to_string(), config_file: None }
     }
 }
 
@@ -415,6 +415,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         bulk_streams: HashSet::new(),
         forwarder,
         topics: TopicLink::new(),
+        topics_negotiated: false,
         next_uni_stream: FIRST_CLIENT_UNI_STREAM,
     };
     if client.forwarder.is_some() {
@@ -525,6 +526,10 @@ struct Client {
     /// Topic forwarding (#36), if on.
     forwarder: Option<Forwarder>,
     topics: TopicLink,
+    /// Both sides advertised `TOPIC_FORWARDING` in HELLO: only then are
+    /// local samples sent (an older or forwarding-less robot-edge would drop
+    /// them).
+    topics_negotiated: bool,
     /// Next client-initiated unidirectional stream: 2, 6, 10, ...
     next_uni_stream: u64,
     /// One per sensor selected in SESSION_ACCEPT, in the same order as
@@ -688,6 +693,7 @@ impl Client {
                     self.bulk_rx = roboprotocol_core::bulk::BulkReceiver::new();
                     self.bulk_streams.clear();
                     self.topics = TopicLink::new();
+                    self.topics_negotiated = false;
                     self.next_uni_stream = FIRST_CLIENT_UNI_STREAM;
                     self.session_info = None;
                     self.sensors.clear();
@@ -770,7 +776,7 @@ impl Client {
     }
 
     fn send_hello(&mut self) {
-        let caps = local_hello_capabilities(self.task_class);
+        let caps = local_hello_capabilities(self.task_class, self.forwarder.is_some());
         let bytes = hello_handler::encode_hello(&caps);
         if let Err(e) = self.conn.stream_send(0, &bytes, false) {
             if !matches!(e, quiche::Error::Done) {
@@ -976,6 +982,9 @@ impl Client {
 
     /// A local Zenoh sample to send to the robot.
     fn on_forward(&mut self, sample: roboprotocol_zenoh::Outgoing) {
+        if !self.topics_negotiated {
+            return;
+        }
         if let Some(z) = &mut self.hud.zenoh {
             z.out_rate.record(std::time::Instant::now(), sample.sample.encoded_len());
         }
@@ -1034,10 +1043,17 @@ impl Client {
         match stream_id {
             0 if self.phase == Phase::AwaitingHello => match hello_handler::decode_hello(data) {
                 Ok(peer_caps) => {
-                    let local_caps = local_hello_capabilities(self.task_class);
+                    let local_caps = local_hello_capabilities(self.task_class, self.forwarder.is_some());
                     match hello::negotiate(&local_caps, &peer_caps) {
-                        Ok(_negotiated) => {
+                        Ok(negotiated) => {
                             tracing::info!("HELLO negotiated successfully");
+                            self.topics_negotiated = negotiated.capability_bitmask & hello::capability_bits::TOPIC_FORWARDING != 0;
+                            if self.forwarder.is_some() {
+                                match self.topics_negotiated {
+                                    true => tracing::info!("zenoh topic forwarding negotiated with the robot"),
+                                    false => tracing::warn!("this robot-edge doesn't forward zenoh topics (older build, or no --zenoh-bridge); teleoperation works as usual"),
+                                }
+                            }
                             self.phase = Phase::AwaitingSessionDescribe;
                             self.hud.phase = ConnPhase::AwaitingSessionDescribe;
                         }
@@ -1558,7 +1574,7 @@ async fn start_forwarder(z: &ZenohArgs) -> Result<Forwarder> {
         Some(path) => tracing::info!(config = %path.display(), "zenoh session open"),
         None => tracing::info!(listen = %z.listen, "zenoh session open (no multicast scouting: connect nodes to this endpoint)"),
     }
-    Forwarder::start(session, &z.rules).await
+    Forwarder::start(session, &z.topics).await
 }
 
 async fn recv_input(input: &mut Option<InputReader>) -> Option<TeleopInput> {
@@ -1611,7 +1627,7 @@ fn recording_category_for(category: ChannelBCategory) -> roboprotocol_recording:
     }
 }
 
-fn local_hello_capabilities(task_class: TaskClass) -> HelloCapabilities {
+fn local_hello_capabilities(task_class: TaskClass, topic_forwarding: bool) -> HelloCapabilities {
     let task_class_bit = match task_class {
         TaskClass::B => task_class_bits::CLASS_B,
         TaskClass::C => task_class_bits::CLASS_C,
@@ -1620,8 +1636,8 @@ fn local_hello_capabilities(task_class: TaskClass) -> HelloCapabilities {
     };
     HelloCapabilities {
         protocol_version: ProtocolVersion::new(1, 0),
-        // v0: no capabilities advertised yet -- see robot-edge's matching comment.
-        capability_bitmask: 0,
+        // Only topic forwarding so far -- see robot-edge's matching comment.
+        capability_bitmask: if topic_forwarding { hello::capability_bits::TOPIC_FORWARDING } else { 0 },
         supported_task_classes: task_class_bit,
         supported_quantization_tiers: quantization_tier_bits::STANDARD,
         max_control_rate_hz: 50,
