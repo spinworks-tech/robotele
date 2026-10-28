@@ -267,6 +267,7 @@ pub async fn run(args: ServerArgs, profile: RobotProfile, cameras: Vec<CameraDes
             forwarder: forwarder.take(),
             topics: TopicLink::new(),
             topics_negotiated: false,
+            topic_turn: false,
             phase: Phase::AwaitingHello,
             channel_b_seq: 0,
             estop_seq: 0,
@@ -407,6 +408,9 @@ struct Session {
     /// local samples sent (an older or forwarding-less console would drop
     /// them).
     topics_negotiated: bool,
+    /// Whose turn it is in `feed_lossy`: a topic datagram's, or video and
+    /// sensors'.
+    topic_turn: bool,
     phase: Phase,
     channel_b_seq: u64,
     estop_seq: u64,
@@ -925,8 +929,12 @@ impl Session {
 
     /// Moves lossy datagrams into quiche while its queue is below
     /// `QUICHE_LOSSY_LIMIT`. Control datagrams count toward that limit too,
-    /// so lossy data never gets ahead of them. Latest-mode topic samples go
-    /// only once video and sensor data have nothing waiting.
+    /// so lossy data never gets ahead of them. Latest-mode topic samples and
+    /// video/sensor datagrams take turns while both are waiting: giving
+    /// topics only what video and sensors left starved them completely on
+    /// the CM4 with sim lidar running (0 of 300 delivered), since the
+    /// sensors always have something waiting. A topic outbox holds at most
+    /// one datagram per key, so its turns are bounded.
     fn feed_lossy(&mut self) {
         while self.conn.dgram_send_queue_len() < QUICHE_LOSSY_LIMIT {
             let now = Instant::now();
@@ -936,7 +944,10 @@ impl Session {
                 }
             }
             let max_len = self.conn.dgram_max_writable_len().unwrap_or(0);
-            let Some(d) = self.lossy.pop(now).or_else(|| self.topics.pop_datagram(max_len)) else { break };
+            let topic_first = self.topic_turn;
+            let d = if topic_first { self.topics.pop_datagram(max_len) } else { None };
+            let Some(d) = d.or_else(|| self.lossy.pop(now)).or_else(|| self.topics.pop_datagram(max_len)) else { break };
+            self.topic_turn = !topic_first;
             if let Some(rate) = &mut self.lossy_rate {
                 rate.consume(d.len());
             }

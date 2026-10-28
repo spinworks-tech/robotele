@@ -390,9 +390,11 @@ codec works unchanged on the far side.
 | `latest` | one QUIC datagram per sample; newest per key while waiting; may be lost | small state that only matters while fresh (pose, status). A sample has to fit in one datagram (about 1.4 KB including its key); larger ones are dropped and counted |
 | `reliable` | one QUIC stream per direction, shared by all reliable topics; in order, nothing lost | goals, maps, anything that must arrive or is larger than a datagram |
 
-Forwarded traffic never gets ahead of control: latest-mode datagrams only go
-once video and sensor data have nothing waiting, and the reliable stream is
-below everything but bulk objects.
+Forwarded traffic never gets ahead of control. On the robot, latest-mode
+datagrams take turns with video and sensor data while both are waiting (one
+each), and the reliable stream is below everything but bulk objects. Under
+an uplink overload the reliable stream gets little, because QUIC packets
+carry datagrams first: see "Measured on the CM4" below.
 
 ### Running it
 
@@ -488,7 +490,42 @@ turning multicast scouting off on the PC's nodes, as above.
 - Not carried: BabyROS `Server`/`Client` (queries), `list_topics` (liveliness),
   `TRANSIENT_LOCAL` history for late joiners, and Zenoh timestamps (the robot's
   clock can be days off anyway).
-- Tested on localhost only (`scripts/smoke_test.sh`), not yet on the CM4 over Wi-Fi.
+- Not yet tested with real BabyROS (Python) nodes; `zenoh_probe` stands in for them.
+
+### Measured on the CM4
+
+2026-10-28, XGO-Lite CM4 at -34 dBm on 2.4 GHz channel 6, laptop also on
+Wi-Fi, robot-edge with `--stub-bridge` (`benchmark/topic_forwarding_wifi.sh`).
+Round trips go laptop -> bridge -> a Zenoh echo on the robot -> bridge ->
+laptop, timed on the laptop only. "Link" is ICMP ping during the run.
+
+| Run | Link avg / max | latest 32 B: back, p50 / p90 | reliable 32 B: back, p50 / p90 | reliable 100 KB at 5 Hz: back, p50 | 300 KB maps to operator | E-Stop latched |
+| --- | --- | --- | --- | --- | --- | --- |
+| idle, good link | 40 / 216 ms | 280/300, 23 / 156 ms | 300/300, 8 / 107 ms | 50/50, 193 ms | 10/10 | no |
+| sim lidar, before the fix below | 104 / 344 ms | **0/300** | 300/300, 164 / 334 ms | 18/50, 6.1 s | 1/10 | yes |
+| sim lidar, no forwarding traffic (control) | – | – | – | – | – | yes, 19 s in |
+| sim lidar, after the fix | 335 / 1,539 ms | 63/300, 489 / 2,185 ms | 294/300, 1.2 / 3.0 s | 8/50, 8.3 s | 0/10 | yes |
+| sim nav cloud | 357 / 1,756 ms | 115/300, 1.2 / 2.2 s | 300/300, 317 ms / 2.0 s | 17/50, 5.7 s | 0/10 | yes |
+| idle again, link now degraded | 137 / 1,035 ms | 283/300, 65 / 318 ms | 300/300, 143 / 475 ms | 4/50, 9.0 s | 10/10 | yes, in the 100 KB phase |
+
+What it shows:
+
+- **On a good link it works:** every reliable sample arrived, small ones in
+  8 ms median, and latest mode lost about 7%, as datagrams on this Wi-Fi do.
+- **Latest mode was starved under sensor load** (0 of 300), because topic
+  datagrams went only when video and sensors had nothing waiting, which with
+  lidar is never. Now they take turns; the robot then sent 67 instead of 1 (the
+  link had also got much worse by then, so the delivered count isn't comparable).
+- **Sim lidar alone latches the watchdog** (control row), as doc 12 found for
+  overload: that isn't forwarding.
+- **Forwarded volume can hurt control on a weak link.** With the link degraded
+  and no sensors, 100 KB reliable samples 5 times a second each way (about
+  4 Mbps per direction) coincided with a watchdog latch; the same phase on the
+  good link didn't. Commands go first into each packet, but they still queue
+  behind forwarded packets in the Wi-Fi driver and the access point. Keep large
+  forwarded topics infrequent; a rate cap on forwarded traffic is the next step.
+- The link swung from 40 ms to over 300 ms average within 20 minutes, so the
+  rows after the first two are not a clean comparison.
 
 ## Status of testing
 

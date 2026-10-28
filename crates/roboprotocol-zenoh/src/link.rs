@@ -2,8 +2,9 @@
 //! the same way by `robot-edge` and `operator-console`.
 //!
 //! Latest-mode samples leave as datagrams through `pop_datagram`, which the
-//! caller drains only after its own control and media datagrams, so they
-//! never queue ahead of those. Reliable samples go out on one
+//! caller drains after its control datagrams, taking turns with video and
+//! sensor data on the robot (see robot-edge's `feed_lossy`). Reliable
+//! samples go out on one
 //! unidirectional stream at `TOPIC_URGENCY`, below every other stream but
 //! bulk objects.
 
